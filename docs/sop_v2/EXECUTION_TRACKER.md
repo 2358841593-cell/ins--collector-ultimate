@@ -28,8 +28,8 @@
 
 > 决策（客户拍板）：Modash-first 降低 IG 请求量后，**IG 采集走登录态 Chrome（CDP）唯一通道，instagrapi 私有 API 完全退役**（不作快通道保留，冷登录烧号太狠）。参考实现 `browser-cdp-lab`。此 track 与 R0 紧耦合。
 
-- [ ] **B0-1** 采集后端接口抽象：定义 `Collector` 协议（profile/posts/comments 三方法，产出与 `_compact_media` 同构 dict）；`BrowserCollector` 为唯一运行时实现（instagrapi 历史 scan cache 结构作 golden 参照，不再运行）
-- [ ] **B0-2** `BrowserCollector`：连登录态 Chrome（CDP）读 `/{handle}/` profile+bio+链接 → 同构 dict（最稳，先做这一层跑通端到端）
+- [~] **B0-1** 采集后端接口抽象：`scripts/browser_collect.py` 起 `BrowserCollector` 雏形（fetch_profile 已实现）；正式 `Collector` 协议（三方法）待抽出
+- [x] **B0-2** `BrowserCollector.fetch_profile`：登录态浏览器会话调 web_profile_info（web app 同款端点，非 instagrapi），og:description 中英 locale 回退。**实测 @annascountryhome 18,525 粉丝/类目/bio/external_url 全部同构拿到**，零烧号
 - [ ] **B0-3** `BrowserCollector` 近帖采集：滚动读帖网格 + 逐帖 caption/like/comment/media_type/play_count/置顶标记（补齐 --v2-collect 的 30 帖窗口）
 - [ ] **B0-4** `BrowserCollector` 评论采集：开帖展开滚动读评论（Top/Recent 采样口径对齐；量小可接受慢）
 - [ ] **B0-5** `discover.py` 采集层切到 `Collector` 接口（Stage1 发现改由 Modash Handle 池注入 + Stage2 回扫走 BrowserCollector）；stage3-6 零改动验证（产出结构与 golden 参照同构测试）
