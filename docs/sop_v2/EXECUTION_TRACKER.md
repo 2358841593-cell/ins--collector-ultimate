@@ -1,6 +1,7 @@
 # SOP V2 最终执行清单（开发追踪表）
 
-版本：1.0 ｜ 日期：2026-07-14 ｜ 分支：`sop-v2-dev`
+版本：1.1 ｜ 日期：2026-07-14 ｜ 分支：`sop-v2-dev`
+（v1.1 = 新增 B0 浏览器采集后端 track，IG 采集通道从私有 API 改为登录态浏览器；参考 `browser-cdp-lab`）
 **这是后续开发、修复与测试的唯一执行入口。** 每项任务的完整设计、阈值口径与验收标准见 [`DEV_EXECUTION_CHECKLIST.md`](DEV_EXECUTION_CHECKLIST.md)（v1.3.1，经三轮多视角对抗校验，共修订 67 处），此表只列"做什么、在哪做、什么算完成"。
 
 执行环境（本机）：
@@ -22,7 +23,21 @@
 - [ ] **E0-4** Modash 浏览器通道冒烟：驱动 yibo profile 只读打开 Modash 用量页，记录五个余额桶**当前剩余量**基线（2026-07-14 只读核对时为：Profiles 剩 1310/1500、Emails & Exports 剩 929/1000、Monitoring 剩 298/400、Fans profiles 剩 6000/6000、linked accounts 剩 5/6，见主文档 §1.4；若数字变动以本次实读为新基线），作为后续所有 canary 的对照起点
 - [ ] **E0-5** 操作机功能同步决策（**需负责人拍板**）：`--warm-only`、独立 run 日志、`reports/run-audits/`、`config/sop_v2.toml`、`config/modash_cost_policy.toml` 只在操作机存在——能拿到文件则拷贝回推（走 R0-6），拿不到则在本仓库按 v1.3.1 口径重建（工作量小，且 sop_v2.toml 本来就要按 §2.5 重写）
 
+## B0 浏览器采集后端（IG 采集通道从私有 API 改为登录态浏览器；详见 §1.6/§2.6）
+
+> 决策：Modash-first 降低 IG 请求量后，IG 采集默认走登录态 Chrome（CDP），instagrapi 保留为可选快通道。参考实现 `browser-cdp-lab`。此 track 重塑 R0（见下方注记）。
+
+- [ ] **B0-1** 采集后端接口抽象：定义 `Collector` 协议（profile/posts/comments 三方法，产出与 `_compact_media` 同构 dict）；instagrapi 现逻辑封装为 `ApiCollector`（零行为变化）
+- [ ] **B0-2** `BrowserCollector`：驱动登录态 Chrome（CDP）读 `/{handle}/` profile+bio+链接 → 同构 dict（最稳，先做这一层跑通端到端）
+- [ ] **B0-3** `BrowserCollector` 近帖采集：滚动读帖网格 + 逐帖 caption/like/comment/media_type/play_count/置顶标记（补齐 --v2-collect 的 30 帖窗口）
+- [ ] **B0-4** `BrowserCollector` 评论采集：开帖展开滚动读评论（Top/Recent 采样口径与 API 对齐；量小可接受慢）
+- [ ] **B0-5** `discover.py --collector browser|api`（默认 browser）；stage3-6 零改动验证（同一候选两后端产出结构一致性测试）
+- [ ] **B0-6** CDP 启动器增强：吸收 lab 的多实例管理 + `.run/pids` 追踪 + ready 检查进 `start_instagram_cdp.zsh`；节奏拟人化（随机停顿、限速、单 profile 低并发）
+- [ ] **B0-7** 反爬健壮性：DOM 选择器容错 + 版面变更告警 + 失败转 Review（不误判 Exclude）；登录态失效检测（跳登录页即停该 profile）
+
 ## R0 认证与采集基础（与 P0 并行；详见 v1.3.1 §3 R0 表）
+
+> **B0 重塑注记**：采纳浏览器优先后，R0-1/2/3/5 的对象从"私有 API 暖 session"改为"登录态 Chrome profile"（存活性更高、运维更简单）；冷登录/TOTP/烧号防护降级为 instagrapi 快通道专用。健康池门槛"≥5 暖 Session"改为"≥N 个登录态 Chrome profile"（N 待定）。下表任务名保留，执行时按此对象调整。
 
 - [ ] **R0-1** `scripts/pool_health.py` 账号池分诊（失败原因分类；每账号至多一次轻量验证、challenge/429 即停；报告零凭证）
 - [ ] **R0-2** 代理/IP 一致性固化（session 元数据记录建立出口；预检不一致拒跑；**统一 README 等文档中 `--no-proxy` 示例口径**）
@@ -80,11 +95,13 @@
 ## 建议执行顺序（并行轨道）
 
 ```
-轨道一(采集/运维): E0-2/3 → R0-1/2/3(等账号) → R0-4/5/7 → R0-8
+轨道一(采集/运维): E0-2/3 → B0-1..7(浏览器采集,登录态 Chrome) 与 R0-1/2/3/5(按 B0 重塑) → R0-4/7/8
 轨道二(离线规则):  E0-1/5 → P0-1/2 → P0-3/4/5/6/7(可并行) → P0-8/9 → P0-11/12/13
-轨道三(采集改造):  P0-10(依赖 P0-1 的 config; 在线验证依赖轨道一)
+轨道三(采集改造):  P0-10(依赖 P0-1 的 config + B0-5 的后端接口; 在线验证依赖轨道一)
 汇合:             P1 全部 → RB-0..8 首批 → P2
 ```
+
+> 决策待确认（不阻塞离线轨）：instagrapi 是**保留为可选快通道**（默认此方案）还是**完全退役**。若完全退役，R0 的冷登录/TOTP/烧号防护整块可删，B0 成为唯一 IG 采集路径。
 
 ## 外部待办（阻塞标记）
 

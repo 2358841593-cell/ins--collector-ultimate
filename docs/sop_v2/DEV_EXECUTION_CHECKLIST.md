@@ -1,6 +1,6 @@
 # SOP V2 开发执行清单（代码实证版）
 
-版本：1.3.1（v1.1 = 五视角对抗校验修订 42 条；v1.2 = 合入操作机初跑实证、R0 修复阶段、Modash 真实余额；v1.2.1 = 三视角校验修订 14 条；v1.3 = 合入 Modash Discovery 浏览器实测，发现层改为 Modash-first 双通道；v1.3.1 = 双视角校验修订 11 条：Handle 池注入接口补全、两源命中承接、发现层降级口径、docx 引用消歧）
+版本：1.3.1（v1.1 = 五视角对抗校验修订 42 条；v1.2 = 合入操作机初跑实证、R0 修复阶段、Modash 真实余额；v1.2.1 = 三视角校验修订 14 条；v1.3 = 合入 Modash Discovery 浏览器实测，发现层改为 Modash-first 双通道；v1.3.1 = 双视角校验修订 11 条：Handle 池注入接口补全、两源命中承接、发现层降级口径、docx 引用消歧；v1.4 = IG 采集通道决策浏览器优先（§1.6/§2.6，Collector 后端接口，参考 browser-cdp-lab），B0 track，重塑 R0）
 日期：2026-07-14
 规则源：`Instagram红人筛选SOP标准确认书_客户版.docx`（Client-Facing V2.0，2026-07-13）
 实证源：`FULL_INITIAL_RUN_REPORT_20260714.md` + 证据包（3 次在线 run 原始产物）+ `MODASH_FUNCTIONS_COST_REPORT.md`（客户账号只读核对）
@@ -90,6 +90,25 @@
 - **数量漏斗目标**：结果页 100-300 → 基础降噪 50-100 → IG Profile/近帖 30-50 → 内容/评论深扫 15-30 → Profile Report 10-20 → Include 1-10 不凑数。与 Profiles 预算纪律（轮≤20/账期≤110）自洽。
 - **对认证问题的意义**：Modash 前置大幅降低 Instagram 候选量与请求压力（初跑 tagged 噪声实证：5 取 5 全出局），但批量近 15-30 帖 + 评论语义仍必须走稳定 IG 采集——**R0 不因此降级**；证据不足仍只能 Review，不能因 Modash 指标好而 Include。
 - **内部口径更新**：`ARCHITECTURE.md` 原"Modash 不是默认发现器"边界与客户 SOP §12（Discovery 为步骤 1）及本实测结论不一致 → 随 R0-6 文档回推一并修订为"Modash-first 发现 + Instagram 证据主源"。
+
+### 1.6 IG 采集通道决策：浏览器优先（v1.4 新增，来源 `browser-cdp-lab` 参考实现）
+
+**背景**：代码核实——当前 IG 数据 100% 走 instagrapi 私有 API（discover.py 的 `user_info_by_username_v1`/`user_medias_v1`/`media_comments`/`search_users`/`fbsearch_suggested_profiles`/`media_likers`/`chaining`）；Playwright 浏览器仅用于站外核验（`verify_browser.py` 打开 bio 聚合页/Amazon，不登录 IG）；CDP 仅用于 Cookie 导出（`export_browser_cookies.py`）。初跑悖论：**网页 Chrome 登录态存活，私有 API session 死亡（22/22）**——两条独立认证通道。
+
+**决策**：Modash-first 将 IG 请求量降一个量级后，把 **IG 采集默认通道从私有 API 改为登录态浏览器（CDP）**。理由：绕开私有 API 风控墙（初跑的实际死因）、复用存活的网页会话、低频场景速度非约束（"挂着跑"即可）。instagrapi **保留为可选快通道**（会话健康时用于批量评论等浏览器最慢的场景），不删除。
+
+**参考实现**：`browser-cdp-lab`（shell 拥有 Chrome 生命周期、Playwright 仅 `connectOverCDP` 观察、`open -n` 独立实例防 shell 退出带走进程、`.run/pids` 追踪、ready 检查）。本项目 `start_instagram_cdp.zsh` 已是同款模式（且多一层端口 owner-profile 校验）；吸收 lab 的**多实例管理 + PID 文件 + lib 配置单测**即可，无需另起炉灶。lab 的 `.run/x-audit/` 已实证登录态抓 X profile。
+
+**可行性（按数据需求）**：Profile/bio/粉丝/链接 = 完全可替代（最稳）；近帖/caption/赞评 = 可替代（较慢，Reels play_count 页面可见）；评论语义 = 可替代（最慢，量小可接受）；发现 tagged/关键词 = 较难，**但已由 Modash 承担可忽略**。真实代价：DOM 解析比 API JSON 脆（IG 改版需维护）、慢。
+
+**设计（后端接口隔离，不动骨架）**：新增 `browser_collect` 采集后端，驱动登录态 Chrome（CDP）读页面，**产出与 instagrapi `_compact_media`/profile 完全同构的候选 dict/posts 结构**；discover.py stage3-6（漏斗/评分/评论分析，纯逻辑）零改动。采集后端选择由旗标控制（`--collector browser|api`），默认 browser。
+
+**对 R0 的重塑**：浏览器优先后不再"非要"把 cookie 转私有 API 暖 session。R0 的目标从"恢复私有 API 账号池"转为"维护 N 个登录态 Chrome profile"：
+- R0-1/2/3/5（分诊/代理一致/会话重建/保活）**改为面向 Chrome profile 而非私有 API session**——登录态 Chrome 存活性远高，运维更简单；
+- 冷登录/TOTP/烧号防护那套机器**降级为 instagrapi 快通道专用**（仅在明确启用 `--collector api` 时相关）；
+- 健康池门槛"≥5 暖 Session"改为"≥N 个登录态 Chrome profile"（N 待定，浏览器并发低、单 profile 吞吐低，可能需要 profile 数 ≥ 并发目标）。
+
+详见 §2.6 与执行清单 B0 track。
 
 ---
 
@@ -220,6 +239,18 @@ BatchManifest: batch_id, sop_version, campaign_track, config_sha256,
 | graph | 图谱来源未走完整审计→封顶 Review |
 | brand_account | 非个人 creator→Exclude；医生/诊所→项目默认 Review（偏离 docx §4 默认，待批示）[CONFLICT-医生诊所] |
 | modash_budget | 引用 modash_cost_policy.toml：Profile 每轮≤20/每日≤30/账期≤110/保留 80%；导出只限 shortlist，**每轮≤20/每日≤30/保留 80%（≤129 行余量）**；**禁止大池 Bulk save，Save 仅限 shortlist 级且先 canary**；邮箱解锁=0；Monitoring=0；Influential Fans 仅 preview（≤30）且保留≥90%、不新增 linked accounts；新动作先 canary；付费动作全部记台账（run/handle/action_id/时间），重跑不得重复扣费 |
+| collector | 默认 browser（登录态 Chrome/CDP）；api（instagrapi）为可选快通道；节奏参数（单 profile 并发、请求间随机停顿区间、每 profile 每日上限）入 config；登录态失效（跳登录页）即停该 profile 转 Review |
+
+### 2.6 采集后端接口（Collector 协议，B0 track）
+
+```python
+class Collector(Protocol):        # ApiCollector / BrowserCollector 两实现，同一契约
+    def fetch_profile(handle) -> dict        # 与现 user_info 同构：followers/bio/bio_links/external_url/category/is_verified/...
+    def fetch_posts(handle, n) -> list[dict] # 与 _compact_media 同构：pk/caption_text/media_type/like/comment/sponsor_tags/play_count/pinned/taken_at
+    def fetch_comments(post, sampling) -> list[dict]  # 与现评论采集同构，供 _analyze_comments
+```
+
+原则：discover.py stage3-6 只依赖上述**同构 dict**，不知道也不关心后端是浏览器还是 API（后端选择由 `--collector` 旗标决定）。`ApiCollector` 是现有 instagrapi 逻辑的零行为封装（回归基准）；`BrowserCollector` 驱动登录态 Chrome 读页面 DOM 产出同构结果。B0-5 的核心验收：同一候选两后端产出的候选 dict 关键字段一致（结构一致性测试）。
 
 ---
 
