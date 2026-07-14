@@ -1,0 +1,51 @@
+# ── 虚拟环境 / 缓存（可重建，不入库）──
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+.pytest_cache/
+.coverage
+.claude/
+.codex/
+
+# ── 运行时中间产物（最终样例见 samples/）──
+data/runs/*
+!data/runs/.gitkeep
+data/session/*
+!data/session/.gitkeep
+data/modash/*
+!data/modash/.gitkeep
+logs/
+output/
+
+# ── 本地累计数据库 / 公开账号派生库（可重建，不公开）──
+data/discovery.db*
+data/pod_accounts.json
+data/pod_accounts.json.bak-*
+
+# ── 新版批次输入 / 人工回填 / 交付产物（只保留目录说明）──
+data/source/*
+!data/source/README.md
+data/batches/*
+!data/batches/README.md
+data/manual_evidence/*
+!data/manual_evidence/README.md
+reports/deliveries/*
+!reports/deliveries/README.md
+
+# ── 真实样例、历史归档与本地设计参考（不进入公开工程）──
+samples/*
+!samples/README.md
+archive/
+docs/archive/
+docs/design-refs/
+
+# ── 账号凭证：仅本地，不入库（安全） ──
+#   凭证留在本机 .secrets/，运行时读取；克隆后用 scripts/import_pool.py 重新导入
+.secrets/
+secrets*.enc
+*.tgz.enc
+
+# ── 只提交代码、配置、文档、测试和目录 README ──
+# 真实候选数据、客户交付件、截图、数据库、日志和浏览器状态均仅留本机。

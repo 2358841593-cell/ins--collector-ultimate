@@ -1,0 +1,122 @@
+# Seed 配置：品牌账号、hashtag、关键词
+
+[brands]
+# 品牌/竞品账号，从这些账号被 tag 的帖子提取作者（实测最优源：~30% 通过率，垂类对口）
+# 扩充：护肤设备 + 美妆护肤 + Amazon 导购聚合号 —— 这些品牌的合作创作者更可能有 Amazon 橱窗
+handles = [
+    # 护肤/红光设备（核心竞品）
+    "currentbody",
+    "solawave",
+    "therabody",
+    "omniluxled",
+    "theraface",
+    "drdennisgross",
+    "shopmegamind",
+    # 护肤/美妆（Amazon 热卖、创作者带货多）
+    "cerave",
+    "glowrecipe",
+    "kosas",
+    "mariobadescu",
+    "theinkeylist",
+    # 客户真实品牌（NanoLeaf 智能家居灯光）—— 反查其合作/带货创作者
+    # 注意：NanoLeaf 属智能家居/科技垂类，与护肤赛道识别不同 → 见下方赛道决策
+    "nanoleaf",
+    "nanoleafhome",
+]
+
+[hashtags]
+# 从这些 hashtag 的 top/recent feed 中发现候选 creator
+tags = [
+    # Amazon 导购类
+    "amazonfinds",
+    "amazonskincare",
+    "amazonmusthaves",
+    "amazonbeauty",
+    "amazonfavorites",
+    # 产品/设备类
+    "ledmask",
+    "redlighttherapy",
+    "beautydevice",
+    # 护肤类
+    "skincareroutine",
+    "antiaging",
+    "skincare",
+    "glassskin",
+]
+
+[keywords]
+# 用于匹配 caption 内容的关键词
+brand_product = [
+    "currentbody",
+    "solawave",
+    "therabody",
+    "led mask",
+    "red light therapy",
+    "beauty device",
+    # 客户 NanoLeaf 护肤线（红光/LED 面罩，与上面竞品同品类）
+    "nanoleaf",
+    "led face mask",
+    "light therapy mask",
+    "photobiomodulation",
+]
+shopping_intent = [
+    "amazon finds",
+    "amazon storefront",
+    "amazon must haves",
+    "link in bio",
+    "shop my",
+]
+skincare_authority = [
+    "skin barrier",
+    "wavelength",
+    "irradiance",
+    "niacinamide",
+    "retinol",
+]
+
+[filters]
+min_followers = 10_000
+max_followers = 150_000
+max_sponsored_ratio = 0.40
+min_product_rec_ratio = 0.20
+
+[filters.engagement_benchmarks]
+# Micro tier: 10K-100K followers
+micro_reels_min = 3.0
+micro_static_min = 1.8
+# Mid tier: 100K-150K followers
+mid_reels_min = 1.5
+mid_static_min = 1.5
+
+[collection]
+per_source = 15
+candidate_posts = 20
+comments_per_post = 25
+top_posts_for_comments = 4
+sleep_seconds = 5
+
+[discovery]
+# 关键词用户搜索（search_users 只匹配 用户名/昵称，不搜 bio）——
+# 所以用"会出现在 handle/昵称里"的词：amazon finds 类聚合号 + 护肤词
+keyword_search_queries = [
+    "amazonfinds",
+    "amazonfavorites",
+    "amazonmusthaves",
+    "skincarefinds",
+    "shopmyskincare",
+    "skincare",
+    "ledmask",
+    "estheticianskincare",
+]
+# Lookalike 种子：用「已确认有 Amazon 橱窗 + 对口护肤」的创作者做种子
+# （比皮肤科医生 drculver 强——Amazon Finds 型创作者的"相似账号"才是同类带货号）
+lookalike_seeds = [
+    "ann.applesweet",
+    "carolleecalling",
+    "skincarewithtash",
+    "isabellawears__",
+    # 飞轮：本轮浏览器已核实带 Amazon 橱窗的优质号 —— 从确认好号扩散更易命中带货号
+    "kerriful",          # 已核实 amazon.ca/shop/kerriful
+    "hollie.decruz",     # 已核实 amazon.co.uk/shop/hollie.decruz/list
+    "samanthakatew",     # amazon_finds 型、对口、评论真实(medium)
+]

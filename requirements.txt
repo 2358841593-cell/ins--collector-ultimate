@@ -1,0 +1,7 @@
+# 2.18.5+ 修复 Instagram CAA/Bloks send_login_request null-payload 404；
+# 锁定已回归版本，避免登录协议变化被无感升级带入生产。
+instagrapi==2.18.7
+openpyxl>=3.1.0
+playwright>=1.40
+networkx>=3.0
+Pillow>=10.0
