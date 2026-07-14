@@ -28,78 +28,196 @@
 
 ---
 
-## 系统架构：数据如何一层层"提纯"
+## 完整架构与端到端流程
 
-数据自上而下流动，每一层都在"提纯"。**账号池是地基**（决定能否稳定、不烧号地采集）；
-发现层用 Instagram 自家社交图谱扩散（命中率远高于关键词硬搜）；后续逐层筛选、分析、评分、核验，最终汇成一个 Excel。
+下图同时标出**当前已经稳定运行的主链路**与**SOP V2 的增量目标**。阅读顺序从上到下：
+任务与账号通道 → 发现采集 → 当前筛选 → 多源证据 → V2 决策 → 交付 → 客户反馈回流。
 
 ```mermaid
-flowchart TD
-    SEED["🌱 种子源：品牌账号 / 关键词 / Lookalike 相似号"]
-
-    subgraph ACQ["🔑 采集层 · account_pool.py"]
-        L1{"三级登录"}
-        L1 -->|"① 优先"| L2["缓存会话 暖恢复"]
-        L1 -->|"②"| L3["完整浏览器 Cookie"]
-        L1 -->|"③ 兜底"| L4["密码+TOTP 冷登录"]
-        L2 --> ROT["轮换 + cooldown + 烧号防护<br/>每号一生只冷登录一次"]
-        L3 --> ROT
-        L4 --> ROT
+flowchart TB
+    subgraph INPUT["1. 任务、配置与种子"]
+        direction TB
+        TASK["客户任务<br/>产品 / 市场 / Paid 或 Gifting"]
+        CONFIG["config/seeds.toml<br/>品牌、关键词、阈值"]
+        APPROVED["客户已批准红人<br/>下一批 Lookalike 种子"]
     end
 
-    subgraph DISC["🌐 发现层 · discover_graph.py"]
-        D1["品牌反查 usertag / mention"]
-        D2["Lookalike fbsearch + 多跳 chaining"]
-        D1 --> DC["候选池"]
-        D2 --> DC
-        DC --> DG["图中心性 PageRank / 特征向量"]
+    subgraph AUTH["2. 身份与采集通道（本机安全边界）"]
+        direction TB
+        LOCAL[".secrets/account_pool.json<br/>凭据仅留本机"]:::security
+        LOGIN{"account_pool.py<br/>恢复优先级"}:::decision
+        WARM["① 暖 Session<br/>data/session/"]:::security
+        COOKIE["② 完整浏览器 Cookie<br/>private + public jar"]:::security
+        COLD["③ 密码 + TOTP<br/>一次性最后兜底"]:::risk
+        BROWSER["普通 Chrome<br/>或独立 CDP Chrome"]:::external
+        EXPORT["Cookie 导出器<br/>CDP / macOS profile"]:::security
+        BOOT["instagram_session.py<br/>全量注入 + 暖复载验证"]:::security
+        ROTATE["账号轮换 / cooldown<br/>失败隔离 / 请求节流"]:::stable
+
+        LOCAL --> LOGIN
+        LOGIN -->|"优先"| WARM
+        LOGIN -->|"暖会话失效"| COOKIE
+        LOGIN -->|"两者均失效"| COLD
+        BROWSER --> EXPORT --> BOOT --> COOKIE
+        WARM --> ROTATE
+        COOKIE --> ROTATE
+        COLD --> ROTATE
     end
 
-    subgraph FUN["🔻 筛选层 · 多级漏斗"]
-        F1{"粉丝 1万–15万?"}
-        F2{"有 Amazon 橱窗?"}
-        F3{"非品牌号 且 恰饭≤40%?"}
-        F1 -->|"是"| F2
-        F2 -->|"是"| F3
+    subgraph DISCOVERY["3. Instagram 发现与原始采集（稳定核心）"]
+        direction TB
+        SOURCES["品牌 tagged / mention<br/>产品与竞品关键词 / Lookalike"]:::stable
+        LINEAR["discover.py<br/>线性生产管道"]:::stable
+        GRAPH["discover_graph.py<br/>多跳扩散 / PageRank / 索引"]:::stable
+        CANDIDATES["候选池<br/>handle 去重 + discovery source"]:::stable
+        COLLECT["profile + bio links<br/>近帖 / Reels / 评论 / 来源证据"]:::stable
+
+        SOURCES --> LINEAR --> CANDIDATES
+        SOURCES --> GRAPH --> CANDIDATES
+        CANDIDATES --> COLLECT
     end
 
-    XCL["✗ 排除"]
-    ANA["🔬 分析层<br/>赛道对口度×系数 · 权威信号(成分/波长) · 评论防刷(水军/互赞团)"]
-    SCORE["📊 评分层 · 玻璃盒<br/>加权综合 + score_breakdown → 纳入/待核验/排除"]
-    VERIFY["✅ 核验层 · verify_browser.py<br/>真浏览器穿透 Amazon 橱窗 + 截图存证"]
+    subgraph CORE["4. 当前筛选、分析与可复用资产（稳定核心）"]
+        direction TB
+        BASIC_GATE{"现有基础门槛<br/>私密 / 粉丝 / 品牌号 / 赞助"}:::decision
+        EARLY_EXCLUDE["当前排除记录<br/>reason + source"]:::risk
+        CONTENT["内容相关性与专业度<br/>Amazon / 成分 / 设备规格"]:::stable
+        COMMENTS["评论信任分析<br/>购买意图 / bot / pod / 低质比例"]:::stable
+        CURRENT_SCORE["现有可解释评分<br/>score_breakdown"]:::stable
+        VERIFY["verify_browser.py<br/>bio 聚合页 / Amazon / 截图"]:::stable
+        CACHE["scan cache / JSON / CSV<br/>离线重跑输入"]:::storage
+        POD["pod_accounts.json<br/>本地水军与互赞团库"]:::storage
+        DB["discovery.db<br/>Tier 1 / Tier 2 / FTS5 / runs"]:::storage
+        CURRENT_DELIVERY["当前交付链<br/>Excel + HTML 审计报告"]:::stable
 
-    subgraph DB["💾 数据层 · discovery.db"]
-        T1["基本库 Tier1 所有爬过的"] -->|"达门槛晋升"| T2["高质量库 Tier2 电商对口精英"]
-        POD["水军库 pod_accounts"]
+        COLLECT --> BASIC_GATE
+        BASIC_GATE -->|"未通过"| EARLY_EXCLUDE
+        BASIC_GATE -->|"通过"| CONTENT --> COMMENTS --> CURRENT_SCORE
+        POD -.->|"过滤已知低质账号"| COMMENTS
+        CURRENT_SCORE --> VERIFY --> CURRENT_DELIVERY
+        CURRENT_SCORE --> CACHE --> DB
+        VERIFY --> DB
     end
 
-    OUT["📦 交付 · export_xlsx.py<br/>单一 Excel：验收建议 + 证据 + 评分依据"]
+    subgraph EVIDENCE["5. 多源证据合同（V2 增量接入点）"]
+        direction TB
+        IG_EVIDENCE["Instagram 原始值<br/>profile / posts / comments"]:::stable
+        MODASH["Modash 定向补数<br/>Fake / ER / Country / Audience"]:::external
+        BROWSER_EVIDENCE["浏览器证据<br/>Storefront / LTK / 页面时间"]:::external
+        MANUAL["人工证据<br/>Raw Skin / VO / 风险 / 实际报价"]:::external
+        FIELD["FieldEvidence<br/>value + raw + source + time + evidence"]:::planned
 
-    SEED --> L1
-    ROT --> D1
-    ROT --> D2
-    DG --> F1
-    F1 -->|"否"| XCL
-    F2 -->|"否"| XCL
-    F3 -->|"否"| XCL
-    F3 -->|"是 → review"| ANA
-    POD -.->|"命中→略过"| ANA
-    ANA --> SCORE
-    SCORE --> VERIFY
-    VERIFY --> T1
-    T2 --> OUT
+        IG_EVIDENCE --> FIELD
+        MODASH --> FIELD
+        BROWSER_EVIDENCE --> FIELD
+        MANUAL --> FIELD
+    end
+
+    subgraph SOPV2["6. SOP V2 决策引擎（目标架构，待增量开发）"]
+        direction TB
+        TRACK{"Campaign Track<br/>Paid / Gifting"}:::decision
+        HARD_GATES["严格硬门槛<br/>国家 / Fake / General ER / 赞助 / SHEIN-Temu"]:::planned
+        GATE_EXCLUDE["Exclude<br/>硬红线 + 证据"]:::risk
+        AF_SCORE["A-F 六模块 100 分<br/>N/A 分母归一化"]:::planned
+        AI_SCORE["AI Vetting Score<br/>1-10 + 9.5 特殊封顶"]:::planned
+        FIXED_REVIEW{"固定待补项?<br/>Modash / 评论 / Storefront / VO / 报价"}:::decision
+        ROUTE{"五池互斥路由"}:::decision
+        INCLUDE_YES["Include<br/>With Storefront"]:::planned
+        INCLUDE_NO["Include<br/>Without Storefront"]:::planned
+        PRIORITY["Priority Review"]:::planned
+        REVIEW["Review"]:::planned
+
+        FIELD --> TRACK --> HARD_GATES
+        HARD_GATES -->|"命中红线"| GATE_EXCLUDE
+        HARD_GATES -->|"全部通过"| AF_SCORE --> AI_SCORE --> FIXED_REVIEW
+        FIXED_REVIEW -->|"有固定待补项"| PRIORITY
+        FIXED_REVIEW -->|"证据完整"| ROUTE
+        ROUTE --> INCLUDE_YES
+        ROUTE --> INCLUDE_NO
+        ROUTE --> PRIORITY
+        ROUTE --> REVIEW
+    end
+
+    subgraph DELIVERY["7. 批次审计与客户交付"]
+        direction TB
+        MANIFEST["Batch Manifest<br/>SOP / config / source SHA-256"]:::planned
+        EVIDENCE_INDEX["Evidence Index<br/>字段 / Gate / Score 可追溯"]:::planned
+        XLSX["五池 XLSX<br/>Summary + Data Dictionary"]:::planned
+        HTML["自包含 HTML<br/>审计与新旧评分对照"]:::planned
+        LOCAL_OUTPUT["reports/deliveries/<br/>本地交付目录，不进公开仓库"]:::storage
+    end
+
+    subgraph FEEDBACK["8. 客户反馈与下一批优化"]
+        direction TB
+        HERMAN["Herman Approval<br/>Herman's Feedback"]:::external
+        IMPORT["按 batch_id + handle 回导"]:::planned
+        POSITIVE["批准者<br/>回流 Lookalike 种子"]:::planned
+        NEGATIVE["拒绝者<br/>保留负向标签与原因"]:::planned
+        RULE_CHANGE["仅客户明确确认<br/>才修改下一版 config / SOP"]:::planned
+    end
+
+    TASK --> SOURCES
+    CONFIG --> SOURCES
+    APPROVED --> SOURCES
+    ROTATE --> LINEAR
+    ROTATE --> GRAPH
+
+    CACHE --> IG_EVIDENCE
+    VERIFY --> BROWSER_EVIDENCE
+    FIELD --> EVIDENCE_INDEX
+
+    INCLUDE_YES --> XLSX
+    INCLUDE_NO --> XLSX
+    PRIORITY --> XLSX
+    REVIEW --> XLSX
+    GATE_EXCLUDE --> XLSX
+    TRACK --> MANIFEST
+    FIELD --> MANIFEST
+    EVIDENCE_INDEX --> XLSX
+    EVIDENCE_INDEX --> HTML
+    XLSX --> LOCAL_OUTPUT
+    HTML --> LOCAL_OUTPUT
+
+    XLSX --> HERMAN --> IMPORT
+    IMPORT --> POSITIVE --> APPROVED
+    IMPORT --> NEGATIVE --> RULE_CHANGE --> CONFIG
+
+    BOUNDARY["系统边界<br/>不发送邮件/DM，不执行 Gift/Campaign/Payment<br/>内容监控项目保持独立，Modash 失败不阻断 Instagram 主流程"]:::boundary
+    BOUNDARY -.-> AUTH
+    BOUNDARY -.-> EVIDENCE
+    BOUNDARY -.-> DELIVERY
+
+    subgraph LEGEND["图例"]
+        direction TB
+        LEGEND_STABLE["蓝色：已稳定运行"]:::stable
+        LEGEND_SECURITY["绿色：本机登录安全链"]:::security
+        LEGEND_PLANNED["橙色虚线：SOP V2 待开发"]:::planned
+        LEGEND_EXTERNAL["紫色：外部或人工证据"]:::external
+        LEGEND_STORAGE["灰色：本地数据与产物"]:::storage
+    end
+
+    classDef stable fill:#E8F1FF,stroke:#2563EB,color:#0F172A,stroke-width:1.5px;
+    classDef security fill:#ECFDF3,stroke:#16A34A,color:#0F172A,stroke-width:1.5px;
+    classDef planned fill:#FFF7ED,stroke:#EA580C,color:#0F172A,stroke-width:1.5px,stroke-dasharray:5 3;
+    classDef external fill:#F5F3FF,stroke:#7C3AED,color:#0F172A,stroke-width:1.5px;
+    classDef storage fill:#F8FAFC,stroke:#64748B,color:#0F172A,stroke-width:1.5px;
+    classDef decision fill:#FEF3C7,stroke:#D97706,color:#0F172A,stroke-width:1.5px;
+    classDef risk fill:#FEF2F2,stroke:#DC2626,color:#0F172A,stroke-width:1.5px;
+    classDef boundary fill:#FFFFFF,stroke:#334155,color:#0F172A,stroke-width:2px,stroke-dasharray:3 3;
 ```
 
-| 层 | 干什么 | 关键产物 |
-|----|--------|----------|
-| 🔑 采集 | 账号池三级登录 + 轮换 + 烧号防护（每号只冷登录一次） | 稳定的私有 API 通道 |
-| 🌐 发现 | 品牌反查 / Lookalike / 多跳 / 图中心性 | 候选池 + 社区影响力排序 |
-| 🔻 筛选 | 粉丝区间 / Amazon 橱窗 / 恰饭饱和度 多级漏斗 | 砍掉明显不合适 |
-| 🔬 分析 | 赛道对口度 / 权威信号 / 评论防刷（水军·互赞团） | 真实性判定 |
-| 📊 评分 | 加权综合 + score_breakdown（玻璃盒，逐项可复核） | 纳入 / 待核验 / 排除 |
-| ✅ 核验 | Playwright 真浏览器穿透 Amazon 橱窗 + 截图 | 证据链 |
-| 💾 数据 | 两层库（基本 / 高质量）+ 水军库，跨 run 去重 | 可累积资产 |
-| 📦 交付 | 单一 Excel：验收建议 + 证据 + 评分依据 | 客户交付件 |
+图中橙色虚线节点是目标能力，不代表已经完成；当前完成度以
+[`docs/sop_v2/REQUIREMENTS_CHECKLIST.md`](docs/sop_v2/REQUIREMENTS_CHECKLIST.md) 的状态列为准。
+
+| 阶段 | 主要实现 | 当前状态 | 关键产物 |
+|---|---|---|---|
+| 身份与采集通道 | `account_pool.py`、`instagram_session.py`、CDP/普通 Chrome Cookie 导出 | 已稳定 | 可轮换的私有 API Client、暖 Session |
+| 发现与采集 | `discover.py`、`discover_graph.py` | 已稳定 | 去重候选、profile、帖子、评论、来源证据 |
+| 当前筛选与评分 | 现有漏斗、评论防刷、`score_breakdown` | 已稳定 | scan cache、当前候选/排除结果 |
+| 浏览器与数据资产 | `verify_browser.py`、`discovery.db`、`pod_accounts.json` | 已稳定 | Storefront 证据、两层库、水军库 |
+| 多源证据合同 | Instagram + Modash + 浏览器 + 人工/报价 | 部分/待开发 | `FieldEvidence`、Evidence Index |
+| SOP V2 决策 | 严格 Gates、A-F 100 分、五池互斥路由 | 待开发 | GateResult、AI Vetting Score、五池结果 |
+| 交付与反馈 | 五池 XLSX、HTML、Manifest、Herman 回导 | 部分/待开发 | 可审计交付包、下一批种子与反馈标签 |
 
 ---
 
