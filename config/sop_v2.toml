@@ -1,0 +1,236 @@
+# Instagram 红人筛选 SOP V2 —— 规则单一事实源
+# 规则源：Instagram红人筛选SOP标准确认书_客户版.docx（Client-Facing V2.0，2026-07-13）
+# 口径详解与依据：docs/sop_v2/DEV_EXECUTION_CHECKLIST.md §2.5
+# 分档一律半开区间消除恰值歧义；[CONFLICT-*] 项见 §5 冲突台账，初跑用此口径，客户确认后才改。
+# 所有阈值集中于此，规则模块（gates/scoring/routing）零硬编码。
+
+sop_version = "Client-Facing V2.0 (2026-07-13)"
+
+# ── 活动轨道与粉丝档 ──────────────────────────────────────────────
+[track]
+# 每批必须显式指定 campaign_track，不按粉丝数猜
+[track.paid]
+min_followers = 10000      # 含边界
+max_followers = 150000     # 含边界
+[track.gifting]
+standard_min = 5000        # 5K–<30K 标准池
+standard_max = 30000       # 不含（<30000）
+priority_min = 30000       # 30K–50K 优秀候选 → Priority Review
+priority_max = 50000       # 含边界；>50000 不进 Gifting
+
+# ── 国家门槛 ──────────────────────────────────────────────────────
+[country]
+tier1 = ["US", "CA", "UK", "DE", "IT", "FR", "ES"]
+tier2 = ["NL", "BE", "CH", "SE"]     # 客户已确认可 Include
+require_creator_equals_top_audience = true   # 不一致 → Exclude
+
+# ── Modash 数值硬门槛 ─────────────────────────────────────────────
+[modash_gates]
+fake_pct_exclude_at = 25.0     # >=25 Exclude（恰 25 淘汰）；<25 过
+general_er_exclude_at = 2.0    # <=2 Exclude（恰 2 淘汰）；>2 过
+# 核心字段缺任一 → 固定 Review（项目默认名单，待客户确认，见 §5 C7）
+core_fields = ["fake_pct", "general_er", "creator_country", "top_audience_country"]
+
+# ── 受众质量分流（E 模块相关的路由触发）────────────────────────────
+[audience]
+target_share_full = 50.0       # 目标国合计 >=50 满分
+target_share_partial = 35.0    # [35,50) 部分分；<35 → Review（不被高分覆盖）
+language_min_share = 50.0       # Top Audience Language 匹配市场主语言且 >=50%；否则/缺失 → Review
+
+# ── 赞助饱和度 ────────────────────────────────────────────────────
+[sponsorship]
+window_posts = 15
+healthy_below = 30.0           # <30% 过
+review_lo = 30.0               # [30,40] 含两端 → Review
+review_hi = 40.0
+# >40 Exclude
+
+# ── SHEIN/Temu 合作红线 ──────────────────────────────────────────
+[shein_temu]
+lookback_months = 12           # 回看 12 个月 + Modash 全部可见历史
+# 仅合作语境命中（日期未知但命中仍 Exclude；普通提及不淘汰）
+partnership_contexts = ["paid partnership", "sponsored", "#ad", "gifted", "ambassador"]
+brands = ["shein", "temu"]
+
+# ── Storefront 双轨 ──────────────────────────────────────────────
+[storefront]
+# confirmed_yes / confirmed_no 均可 Include；unknown → Review
+active_within_months = 3       # 近 3 个月更新视为活跃
+require_min_products = false
+require_min_categories = false
+
+# ── 可采集性分流 ─────────────────────────────────────────────────
+[collectability]
+# 私密/不可读 → Exclude(private_account)；临时失败重试，耗尽 → Review 不误杀
+retry_max = 2
+retry_cooldown_seconds = 30
+
+# ── 评论采样与低质分档 ───────────────────────────────────────────
+[comments]
+sample_top = 10                # 互动最高 10
+sample_recent = 10             # + 最近 10
+per_post_max = 10              # 每帖 <=10 条
+min_valid_sample = 20          # 有效样本 <20 → 固定 Review
+# 高意图评论满分双条件：>=5 条 且 >=15%
+high_intent_min_count = 5
+high_intent_min_ratio = 15.0
+# 低质评论分档（半开区间，分 3 分）[CONFLICT-低质恰值，见 §5 C5]
+low_quality_bands = [
+  { max = 25.0, score = 3 },   # [0,25)=3
+  { max = 40.0, score = 2 },   # [25,40)=2
+  { max = 50.0, score = 1 },   # [40,50)=1
+]
+low_quality_zero_review_at = 50.0   # [50,∞)=0 且 Review（50 恰值归 Review 档）
+
+# ── 异常互动 ─────────────────────────────────────────────────────
+[anomaly]
+# 禁用 "Reels ER>2% Review" 字面规则 [CONFLICT-ReelsER，docx §15 已裁定]
+concentration_min_posts = 5           # 至少 5 帖
+concentration_review_at = 70.0        # 单帖互动集中度 >=70% → Review
+
+# ── 赛道路由 ─────────────────────────────────────────────────────
+[niche_routing]
+# Lifestyle 主赛道 → 封顶 Review，有充分产品/护肤证据（人工证据导入）后可提升
+lifestyle_cap_review = true
+
+# ── A-F 六模块评分（满分 100）───────────────────────────────────
+[scoring]
+module_max = { A = 15, B = 15, C = 20, D = 15, E = 20, F = 15 }
+
+# A 内容赛道 15
+[scoring.A]
+core_niche = { skincare = 5, beauty_device = 5, beauty_wellness = 4, lifestyle = 2, other = 0 }
+# A2 导购型四档（半开区间）
+amazon_finds_bands = [
+  { min = 40.0, score = 5 },   # [40,∞)=5
+  { min = 30.0, score = 4 },   # [30,40)=4
+  { min = 20.0, score = 2 },   # [20,30)=2
+]                              # [0,20)=0
+sku_each_category = 1          # 产品词/竞品词/场景词每类 1 分（封顶 3）
+sku_max = 3
+# A4 organic 稳定性（客户填写 10 覆盖默认 3）[CONFLICT-organic，§5 C1]
+organic_bands = [
+  { min = 10, score = 2 },     # >=10=2
+  { min = 1, score = 1 },      # 1–9=1
+]                              # 0=0
+
+# B 专业度与视觉真实度 15
+[scoring.B]
+ingredients_max = 3            # 成分词
+device_specs_max = 4          # 设备规格词
+skin_science_max = 2          # 皮肤问题/科学
+raw_skin = { A = 4, B = 2, C = 0 }   # 视觉等级；Include 最低 B；C/无证据 → Review
+vo_score = 2                  # VO 人工确认
+include_min_raw_skin = "B"
+
+# C 社区信任 20
+[scoring.C]
+ig_er_score = 5               # 达标 5 / 略低 2
+er_benchmark = { micro_reels = 3.0, micro_static = 1.8, mid = 1.5 }
+modash_er_score = 3           # >2%=3；缺失 Review；<=2% 与 GATE 一致硬淘汰
+high_intent_full = 6          # 满分 6（双条件见 [comments]）；[5%,15%)=3；<5%=0
+high_intent_partial = 3
+low_quality_score_max = 3     # 分档见 [comments].low_quality_bands
+# C5 Save/Share/DM：Modash Reels Shares 有则辅助；缺失 → N/A 不扣分不进 Review（客户覆盖）
+save_share_score = 3
+save_share_missing_is_na = true
+
+# D 商业基础设施 15
+[scoring.D]
+storefront_confirm = { yes = 4, no = 2 }   # 未知 → Review
+storefront_maturity = 4       # 有且近3月更新=4；较旧=2；确认无 → N/A 重算
+sponsorship_health = { healthy = 3, borderline = 1 }   # <30%=3；[30,40]=1+Review；>40% Exclude
+elite_brand_each = 1.5        # Omnilux/CurrentBody/Therabody 每命中 +1.5
+elite_brand_cap = 4           # 封顶 4；红光面罩+VO 可直接 4
+elite_window_months = 12
+
+# E Modash 受众质量 20
+[scoring.E]
+fake_bands = [
+  { max = 15.0, score = 6 },   # [0,15)=6
+  { max = 25.0, score = 3 },   # [15,25)=3
+]                              # >=25 淘汰（硬门槛）
+country_match_score = 5       # 一致=5；不一致硬淘汰
+target_share = { full = 4, partial = 2 }   # >=50=4；[35,50)=2；<35 Review
+age_gender_na = true          # E4 恒 N/A，从分母移除
+language_score = 2            # 匹配且 >=50%；否则/缺失 Review
+
+# F 经济性与触达准备 15
+[scoring.F]
+# CPM 得分 [CONFLICT-F1分档，§5 C3]：覆盖 §6F "1-1.5倍=4"
+cpm_full = 8                  # <=$35=8
+cpm_review = 4               # ($35,$40]=4 且 Review
+cpm_threshold_pass = 35.0
+cpm_threshold_exclude = 40.0  # >$40 Exclude
+budget_tier_score = 3        # track/报价/粉丝档匹配
+contact = { email_or_form = 2, dm_only = 1, none = 0 }
+risk = { clear = 2, unknown = 0 }   # 不明 → Review
+# 曝光口径：非置顶近 10 Reels 均播优先，缺失才用 Modash 均播
+exposure_reels_window = 10
+# Gifting 记 0 成本、不算 CPM、F1 记 N/A（不送分不扣分）；Paid 缺实际报价 → 固定 Review
+gifting_cpm_is_na = true
+
+# ── AI Vetting Score 与分层 ──────────────────────────────────────
+[ai_score]
+# 分层判定用 normalized_total（防 74.9 被 round 成 7.5 误入 Include）
+include_min = 75.0            # >=75 Include
+priority_min = 65.0          # [65,75) Priority Review
+review_min = 50.0            # [50,65) Review；<50 Exclude
+# AI Score = round(normalized_total/10, 1) 仅作展示字段
+exceptional_floor = 9.5      # 9.5+ 需六条件全过，否则封顶 9.4 [CONFLICT-9.5VO，§5 C2]
+exceptional_cap = 9.4
+
+# ── 固定 Review（高分不得覆盖）──────────────────────────────────
+[fixed_review]
+reasons = [
+  "modash_core_missing",     # Modash 核心字段缺失
+  "storefront_unknown",      # Storefront 未知
+  "comments_insufficient",   # 有效评论 <20
+  "raw_skin_or_vo_unverified", # Raw Skin 或 VO 未核验
+  "paid_quote_missing",      # Paid 缺实际报价
+  "audience_target_below_35", # 目标受众合计 <35%
+  "language_unmatched",      # 语言不满足或缺失
+]
+
+# ── 多源合并优先级 ───────────────────────────────────────────────
+[merge_priority]
+# Modash 优先字段
+modash_first = ["follower_count", "general_er", "fake_pct", "creator_country",
+                "top_audience_country", "audience_distribution", "top_language", "partnerships"]
+# Instagram 优先字段
+instagram_first = ["content", "sponsorship", "comments", "visual"]
+# 人工证据最高优先级；冲突记 conflict 不静默覆盖
+manual_highest = true
+
+# ── 发现（Modash 单发现通道 + 外部 handle 注入）─────────────────
+[discovery]
+# IG 侧不再自产发现（tagged/mention/Lookalike API 已随 instagrapi 退役）
+brand_seeds = ["omnilux", "currentbody", "therabody"]
+product_keywords = ["nanoleaf", "red light therapy", "face mask", "wand", "panel", "led mask"]
+scene_keywords = ["acne care", "anti-aging", "skin recovery", "daily routine"]
+exclude_keywords = ["#shein", "#temu"]
+# 数量漏斗
+funnel = { search_page = 300, denoise = 100, ig_profile = 50, deep = 30, modash_profile = 20, include_max = 10 }
+# 两源命中优先深扫（Modash 各模板/客户回流/人工 Approved 互为独立源；IG 不再自产）
+prefer_multi_source = true
+
+# ── Modash 预算纪律（引用 modash_cost_policy.toml）──────────────
+[modash_budget]
+profile_per_round = 20
+profile_per_day = 30
+profile_per_period_cap = 110
+reserve_pct = 80             # 保留 Profiles 总额 80%
+export_only_shortlist = true
+email_unlock = 0
+monitoring_new = 0
+canary_before_new_action = true
+
+# ── 图谱边界 ─────────────────────────────────────────────────────
+[graph]
+cap_review = true            # 图谱/多跳来源未走完整审计 → 封顶 Review
+
+# ── 品牌号红线 ───────────────────────────────────────────────────
+[brand_account]
+exclude_non_personal = true
+# 医生/诊所/工作室 → 项目默认 Review（偏离 docx §4 默认 Exclude，待批示）[CONFLICT-医生诊所，§5 C8]
+medical_studio_default = "review"

@@ -1,0 +1,108 @@
+"""硬门槛边界用例（P0-11 / QA-01）。所有恰值语义按 config 半开区间。"""
+import sys
+import unittest
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / "scripts"))
+
+from extensions.sop_v2 import gates  # noqa: E402
+from extensions.sop_v2.config import load_config  # noqa: E402
+from extensions.sop_v2.contracts import GateVerdict  # noqa: E402
+
+CFG = load_config()
+
+
+def verdict(cand):
+    return gates.gate_summary(gates.evaluate_gates(cand, CFG))
+
+
+def base(**kw):
+    # 默认给 storefront confirmed，隔离被测门槛（storefront unknown 会独立返回 REVIEW）
+    c = {"platform": "instagram", "campaign_track": "paid", "storefront_status": "confirmed_yes"}
+    c.update(kw)
+    return c
+
+
+class TestFollowers(unittest.TestCase):
+    def test_paid_boundaries(self):
+        self.assertEqual(verdict(base(follower_count=9999)), GateVerdict.EXCLUDE)
+        self.assertEqual(verdict(base(follower_count=10000)), GateVerdict.PASS)
+        self.assertEqual(verdict(base(follower_count=150000)), GateVerdict.PASS)
+        self.assertEqual(verdict(base(follower_count=150001)), GateVerdict.EXCLUDE)
+
+    def test_gifting_boundaries(self):
+        g = lambda f: verdict(base(campaign_track="gifting", follower_count=f))
+        self.assertEqual(g(4999), GateVerdict.EXCLUDE)     # 下界外
+        self.assertEqual(g(5000), GateVerdict.PASS)        # 标准池含下界
+        self.assertEqual(g(29999), GateVerdict.PASS)       # 标准池上界内
+        self.assertEqual(g(30000), GateVerdict.REVIEW)     # 优秀池 → Priority Review
+        self.assertEqual(g(50000), GateVerdict.REVIEW)     # 优秀池含上界
+        self.assertEqual(g(50001), GateVerdict.EXCLUDE)    # 超出不进 Gifting
+
+
+class TestModashGates(unittest.TestCase):
+    def test_fake(self):
+        self.assertEqual(verdict(base(follower_count=50000, fake_pct=24.99)), GateVerdict.PASS)
+        self.assertEqual(verdict(base(follower_count=50000, fake_pct=25.0)), GateVerdict.EXCLUDE)
+
+    def test_general_er(self):
+        self.assertEqual(verdict(base(follower_count=50000, general_er=2.0)), GateVerdict.EXCLUDE)
+        self.assertEqual(verdict(base(follower_count=50000, general_er=2.01)), GateVerdict.PASS)
+
+
+class TestSponsorship(unittest.TestCase):
+    def s(self, v):
+        return verdict(base(follower_count=50000, sponsorship_saturation=v))
+
+    def test_bands(self):
+        self.assertEqual(self.s(29.99), GateVerdict.PASS)
+        self.assertEqual(self.s(30.0), GateVerdict.REVIEW)   # 含下界
+        self.assertEqual(self.s(40.0), GateVerdict.REVIEW)   # 含上界
+        self.assertEqual(self.s(40.01), GateVerdict.EXCLUDE)
+
+
+class TestCountry(unittest.TestCase):
+    def test_target_and_match(self):
+        self.assertEqual(verdict(base(follower_count=50000, creator_country="US",
+                                       top_audience_country="US")), GateVerdict.PASS)
+        self.assertEqual(verdict(base(follower_count=50000, creator_country="US",
+                                       top_audience_country="BR")), GateVerdict.EXCLUDE)
+        self.assertEqual(verdict(base(follower_count=50000, creator_country="BR",
+                                       top_audience_country="BR")), GateVerdict.EXCLUDE)
+        # tier2 可接受
+        self.assertEqual(verdict(base(follower_count=50000, creator_country="NL",
+                                       top_audience_country="NL")), GateVerdict.PASS)
+
+
+class TestStorefrontAndCollect(unittest.TestCase):
+    def test_storefront_dual_track(self):
+        for s in ("confirmed_yes", "confirmed_no"):
+            self.assertEqual(verdict(base(follower_count=50000, storefront_status=s)), GateVerdict.PASS)
+        self.assertEqual(verdict(base(follower_count=50000, storefront_status="unknown")),
+                         GateVerdict.REVIEW)
+
+    def test_private_excluded(self):
+        self.assertEqual(verdict(base(follower_count=50000, is_private=True)), GateVerdict.EXCLUDE)
+
+    def test_collect_fail_review(self):
+        self.assertEqual(verdict(base(follower_count=50000, collect_failed=True)), GateVerdict.REVIEW)
+
+
+class TestSheinTemuAndBrand(unittest.TestCase):
+    def test_shein_temu(self):
+        self.assertEqual(verdict(base(follower_count=50000, shein_temu_partnership=True)),
+                         GateVerdict.EXCLUDE)
+        # 普通提及（非合作）不淘汰
+        self.assertEqual(verdict(base(follower_count=50000, shein_temu_partnership=False)),
+                         GateVerdict.PASS)
+
+    def test_brand_account(self):
+        self.assertEqual(verdict(base(follower_count=50000, brand_account_type="brand")),
+                         GateVerdict.EXCLUDE)
+        self.assertEqual(verdict(base(follower_count=50000, brand_account_type="medical")),
+                         GateVerdict.REVIEW)
+
+
+if __name__ == "__main__":
+    unittest.main()
