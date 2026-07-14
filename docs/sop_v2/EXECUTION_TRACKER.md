@@ -17,8 +17,9 @@
 
 ## E0 本机环境就绪（先行，半天内）
 
-- [~] **E0-1** venv + requirements + `playwright install chromium`；Python 3.14 兼容性冒烟（import instagrapi/openpyxl/playwright + `python -m unittest` 现有 4 例）
-- [ ] **E0-2** IG 登录态 profile 建立：**等负责人提供账号**后，为每号起独立 Chrome profile（`start_instagram_cdp.zsh`）人工首登一次；不导私有 API 账号池
+- [x] **E0-1** venv + requirements 装好；playwright chromium 在位；Chrome 已装；账号 5/5 解析（含 sessionid）
+- [x] **B0-POC** cookie→登录态 profile 端到端验证（`scripts/dev/cookie_profile_smoke.py`）：index 0 账号 sessionid 注入 → LOGGED_IN、读到自己 profile 的 og:description 结构化字段。**浏览器唯一通道策略实测成立，零密码登录零烧号**。备注：og:description 中英文 locale 需 B0-3 处理
+- [~] **E0-2** IG 登录态 profile 建立：账号已到（5 个含 live sessionid）。**改进：用 cookie 注入建 profile（B0-POC 已验证），比人工首登更快、零密码登录**；index 0 已建，其余 4 个待批量建（R0-3）
 - [ ] **E0-3** 代理出口确认：本机是否有 Clash/固定出口；登录 profile 与采集尽量同出口（浏览器通道下已非阻断项，属存活性优化）
 - [ ] **E0-4** Modash 通道冒烟：连本机**已登录的 yibo Chrome 现有会话**（不新建实例）只读打开 Modash 用量页，记录五个余额桶**当前剩余量**基线（2026-07-14 只读核对时为：Profiles 剩 1310/1500、Emails & Exports 剩 929/1000、Monitoring 剩 298/400、Fans profiles 剩 6000/6000、linked accounts 剩 5/6，见主文档 §1.4；若数字变动以本次实读为新基线），作为后续所有 canary 的对照起点
 - [ ] **E0-5** 操作机功能同步决策（**需负责人拍板**）：独立 run 日志、`reports/run-audits/`、`config/sop_v2.toml`、`config/modash_cost_policy.toml` 只在操作机存在——能拿到文件则拷贝回推（走 R0-6），拿不到则在本仓库按 v1.5 口径重建（工作量小，且 sop_v2.toml 本来就要按 §2.5 重写）。注：`--warm-only` 是私有 API 旗标，instagrapi 退役后作废、不回推
