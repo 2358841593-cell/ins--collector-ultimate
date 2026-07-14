@@ -1,14 +1,14 @@
 # SOP V2 最终执行清单（开发追踪表）
 
-版本：1.1 ｜ 日期：2026-07-14 ｜ 分支：`sop-v2-dev`
-（v1.1 = 新增 B0 浏览器采集后端 track，IG 采集通道从私有 API 改为登录态浏览器；参考 `browser-cdp-lab`）
+版本：1.2 ｜ 日期：2026-07-14 ｜ 分支：`sop-v2-dev`
+（v1.1 = 新增 B0 浏览器采集后端 track；v1.2 = 客户拍板 instagrapi 完全退役、浏览器唯一 IG 通道、Modash 复用已登录 Chrome；R0 全面改为登录态 profile 池）
 **这是后续开发、修复与测试的唯一执行入口。** 每项任务的完整设计、阈值口径与验收标准见 [`DEV_EXECUTION_CHECKLIST.md`](DEV_EXECUTION_CHECKLIST.md)（v1.3.1，经三轮多视角对抗校验，共修订 67 处），此表只列"做什么、在哪做、什么算完成"。
 
 执行环境（本机）：
 - 仓库：`/Users/wiselq/Desktop/ins-collector`，分支 `sop-v2-dev`，边修复边测试。
-- Modash：本机 Chrome **yibo profile 已登录**，浏览器自动化只读驱动；成本纪律见 `DEV_EXECUTION_CHECKLIST.md` §1.4/§2.5 modash_budget。
-- Instagram 账号：由负责人提供后经 `scripts/import_pool.py` 导入本机 `.secrets/`（格式 `username----password----totp_secret`，一行一号）。
-- Python 本机 3.14.6（操作机初跑为 3.13.9）——E0-1 装完后必须跑依赖冒烟。
+- Modash：**复用本机已登录的 Chrome（yibo profile）现有会话**做只读自动化，**不新建独立进程 Chrome**；成本纪律见 `DEV_EXECUTION_CHECKLIST.md` §1.4/§2.5 modash_budget。
+- Instagram 采集：**浏览器唯一通道，instagrapi 私有 API 退役**（§1.6）。账号由负责人提供后，为每个账号起独立登录态 Chrome profile（`start_instagram_cdp.zsh` 模式），人工首登一次、长期挂机复用。不再用 `import_pool.py` 导私有 API 账号池。
+- Python 本机 3.14.6（操作机初跑为 3.13.9）——E0-1 装完后跑依赖冒烟（instagrapi 虽退役但 requirements 暂留，清理见 R0-6）。
 
 状态图例：`[ ]` 未开始 ｜ `[~]` 进行中 ｜ `[x]` 完成 ｜ `[!]` 阻塞（注明原因）
 纪律：每完成一项 → 勾选此表 → 同步 `REQUIREMENTS_CHECKLIST.md` 对应 ID 状态 → 单独 commit（信息里带任务 ID）。
@@ -18,37 +18,37 @@
 ## E0 本机环境就绪（先行，半天内）
 
 - [~] **E0-1** venv + requirements + `playwright install chromium`；Python 3.14 兼容性冒烟（import instagrapi/openpyxl/playwright + `python -m unittest` 现有 4 例）
-- [ ] **E0-2** IG 账号导入：`scripts/import_pool.py < accounts.txt`（**等负责人提供账号**）；导入后仅登记不登录
-- [ ] **E0-3** 代理出口确认：本机是否有 Clash/固定出口（登录 SOP 原则 6：会话建立与采集必须同出口）；确定本项目在本机的 `IG_PROXY` 口径并记录，之后所有暖 Session 建立与采集统一使用
-- [ ] **E0-4** Modash 浏览器通道冒烟：驱动 yibo profile 只读打开 Modash 用量页，记录五个余额桶**当前剩余量**基线（2026-07-14 只读核对时为：Profiles 剩 1310/1500、Emails & Exports 剩 929/1000、Monitoring 剩 298/400、Fans profiles 剩 6000/6000、linked accounts 剩 5/6，见主文档 §1.4；若数字变动以本次实读为新基线），作为后续所有 canary 的对照起点
+- [ ] **E0-2** IG 登录态 profile 建立：**等负责人提供账号**后，为每号起独立 Chrome profile（`start_instagram_cdp.zsh`）人工首登一次；不导私有 API 账号池
+- [ ] **E0-3** 代理出口确认：本机是否有 Clash/固定出口；登录 profile 与采集尽量同出口（浏览器通道下已非阻断项，属存活性优化）
+- [ ] **E0-4** Modash 通道冒烟：连本机**已登录的 yibo Chrome 现有会话**（不新建实例）只读打开 Modash 用量页，记录五个余额桶**当前剩余量**基线（2026-07-14 只读核对时为：Profiles 剩 1310/1500、Emails & Exports 剩 929/1000、Monitoring 剩 298/400、Fans profiles 剩 6000/6000、linked accounts 剩 5/6，见主文档 §1.4；若数字变动以本次实读为新基线），作为后续所有 canary 的对照起点
 - [ ] **E0-5** 操作机功能同步决策（**需负责人拍板**）：`--warm-only`、独立 run 日志、`reports/run-audits/`、`config/sop_v2.toml`、`config/modash_cost_policy.toml` 只在操作机存在——能拿到文件则拷贝回推（走 R0-6），拿不到则在本仓库按 v1.3.1 口径重建（工作量小，且 sop_v2.toml 本来就要按 §2.5 重写）
 
 ## B0 浏览器采集后端（IG 采集通道从私有 API 改为登录态浏览器；详见 §1.6/§2.6）
 
-> 决策：Modash-first 降低 IG 请求量后，IG 采集默认走登录态 Chrome（CDP），instagrapi 保留为可选快通道。参考实现 `browser-cdp-lab`。此 track 重塑 R0（见下方注记）。
+> 决策（客户拍板）：Modash-first 降低 IG 请求量后，**IG 采集走登录态 Chrome（CDP）唯一通道，instagrapi 私有 API 完全退役**（不作快通道保留，冷登录烧号太狠）。参考实现 `browser-cdp-lab`。此 track 与 R0 紧耦合。
 
-- [ ] **B0-1** 采集后端接口抽象：定义 `Collector` 协议（profile/posts/comments 三方法，产出与 `_compact_media` 同构 dict）；instagrapi 现逻辑封装为 `ApiCollector`（零行为变化）
-- [ ] **B0-2** `BrowserCollector`：驱动登录态 Chrome（CDP）读 `/{handle}/` profile+bio+链接 → 同构 dict（最稳，先做这一层跑通端到端）
+- [ ] **B0-1** 采集后端接口抽象：定义 `Collector` 协议（profile/posts/comments 三方法，产出与 `_compact_media` 同构 dict）；`BrowserCollector` 为唯一运行时实现（instagrapi 历史 scan cache 结构作 golden 参照，不再运行）
+- [ ] **B0-2** `BrowserCollector`：连登录态 Chrome（CDP）读 `/{handle}/` profile+bio+链接 → 同构 dict（最稳，先做这一层跑通端到端）
 - [ ] **B0-3** `BrowserCollector` 近帖采集：滚动读帖网格 + 逐帖 caption/like/comment/media_type/play_count/置顶标记（补齐 --v2-collect 的 30 帖窗口）
-- [ ] **B0-4** `BrowserCollector` 评论采集：开帖展开滚动读评论（Top/Recent 采样口径与 API 对齐；量小可接受慢）
-- [ ] **B0-5** `discover.py --collector browser|api`（默认 browser）；stage3-6 零改动验证（同一候选两后端产出结构一致性测试）
+- [ ] **B0-4** `BrowserCollector` 评论采集：开帖展开滚动读评论（Top/Recent 采样口径对齐；量小可接受慢）
+- [ ] **B0-5** `discover.py` 采集层切到 `Collector` 接口（Stage1 发现改由 Modash Handle 池注入 + Stage2 回扫走 BrowserCollector）；stage3-6 零改动验证（产出结构与 golden 参照同构测试）
 - [ ] **B0-6** CDP 启动器增强：吸收 lab 的多实例管理 + `.run/pids` 追踪 + ready 检查进 `start_instagram_cdp.zsh`；节奏拟人化（随机停顿、限速、单 profile 低并发）
 - [ ] **B0-7** 反爬健壮性：DOM 选择器容错 + 版面变更告警 + 失败转 Review（不误判 Exclude）；登录态失效检测（跳登录页即停该 profile）
 
 ## R0 认证与采集基础（与 P0 并行；详见 v1.3.1 §3 R0 表）
 
-> **B0 重塑注记**：采纳浏览器优先后，R0-1/2/3/5 的对象从"私有 API 暖 session"改为"登录态 Chrome profile"（存活性更高、运维更简单）；冷登录/TOTP/烧号防护降级为 instagrapi 快通道专用。健康池门槛"≥5 暖 Session"改为"≥N 个登录态 Chrome profile"（N 待定）。下表任务名保留，执行时按此对象调整。
+> **重塑注记**：instagrapi 退役后 R0 全部对象为**登录态 Chrome profile**（非私有 API session）；冷登录/TOTP/烧号防护从主路径移除（代码留仓标 deprecated）。健康池门槛为"≥N 个登录态 Chrome profile"（起步 N=1 挂机跑即可）。以下按此重写。
 
-- [ ] **R0-1** `scripts/pool_health.py` 账号池分诊（失败原因分类；每账号至多一次轻量验证、challenge/429 即停；报告零凭证）
-- [ ] **R0-2** 代理/IP 一致性固化（session 元数据记录建立出口；预检不一致拒跑；**统一 README 等文档中 `--no-proxy` 示例口径**）
-- [ ] **R0-3** 会话建立作业（本机新账号场景：按登录 SOP 谨慎首暖，一号一次、间隔执行、同出口；有浏览器登录态的号优先走 Cookie 导出路径 A/B）；目标健康池 **≥5**（自定门槛；≥3 可跑受控小批、<3 不开批）
+- [ ] **R0-1** `scripts/pool_health.py` Chrome profile 健康分诊（未登录/存活/失效/challenge；仅打开 IG 首页判断登录态、不批量请求；报告零凭证）
+- [ ] **R0-2** 代理/IP 一致性（profile 出口指纹记录 + 预检；**统一 README 等文档 `--no-proxy` 示例口径**）——存活性优化，非阻断
+- [ ] **R0-3** 登录态 profile 建立作业（`start_instagram_cdp.zsh` 起独立 profile 人工首登，永不删 profile、不脚本化密码登录）；目标 **≥N 个登录态 profile**（起步 N=1 挂机跑）+ 一页 playbook
 - [ ] **R0-4** 候选池持久化 + `--resume` 断点续跑 + 失败重试队列（耗尽→Review，COLLECT-02）+ `tests/test_resume.py`
-- [ ] **R0-5** 暖 Session 保活巡检（坏号立即移出保活；参数入 config）
-- [ ] **R0-6** 版本/文档统一（视 E0-5：回推或重建；同步修订 ARCHITECTURE.md 的 Modash-first 口径）
-- [ ] **R0-7** 开批预检门（健康池/代理/config SHA/目录契约，零 IG 请求）
+- [ ] **R0-5** 登录态保活巡检（跳登录页/challenge 的 profile 立即移出、标待重登；参数入 config）
+- [ ] **R0-6** 版本/文档统一（视 E0-5 回推或重建；修订 ARCHITECTURE.md/README：Modash-first + 浏览器唯一 IG 采集 + instagrapi 退役 + 删过时账号池示例）
+- [ ] **R0-7** 开批预检门（健康 profile 数/登录态新鲜度/代理/config SHA/目录契约，零 IG 数据请求）
 - [ ] **R0-8** run 审计跨 run 关联（batch 归组，为 P2-1 打底）
 
-## P0 决策可复现（纯离线，零烧号；13 项）
+## P0 决策可复现（纯离线，零 IG 请求；13 项）
 
 - [ ] **P0-1** `config/sop_v2.toml` 全量口径（§2.5 全表 22 组含 discovery/modash_budget/CONFLICT 标注）+ `modash_cost_policy.toml`
 - [ ] **P0-2** `extensions/sop_v2/contracts.py`（FieldEvidence/GateResult/ScoreItem/BatchManifest）
@@ -101,15 +101,15 @@
 汇合:             P1 全部 → RB-0..8 首批 → P2
 ```
 
-> 决策待确认（不阻塞离线轨）：instagrapi 是**保留为可选快通道**（默认此方案）还是**完全退役**。若完全退役，R0 的冷登录/TOTP/烧号防护整块可删，B0 成为唯一 IG 采集路径。
+> 决策已定（客户拍板）：**instagrapi 完全退役**，B0 浏览器为唯一 IG 采集路径；R0 的冷登录/TOTP/烧号防护从主路径移除（代码留仓标 deprecated，requirements 清理并入 R0-6）。
 
 ## 外部待办（阻塞标记）
 
 | 项 | 谁 | 阻塞什么 |
 |---|---|---|
-| 提供 IG 账号（username----password----totp_secret） | 负责人 | E0-2 → R0-3 → 一切在线测试 |
+| 提供 IG 账号（用于登录态 Chrome profile 首登） | 负责人 | E0-2 → R0-3 → 一切在线测试 |
 | 操作机文件是否可拷贝（E0-5 拍板） | 负责人 | R0-6 走回推还是重建 |
-| 本机代理出口口径（有无 Clash） | 负责人/运维 | E0-3 → R0-2/3 |
+| 本机代理出口口径（有无 Clash） | 负责人/运维 | E0-3 → R0-2/3（存活性优化，非阻断） |
 | 新 Search/AI/Lookalike/Save 首次 canary | 开发（RB-2 前执行） | Modash 模板批量执行 |
 | Raw Skin/VO 人工核验执行人 | 客户/负责人 | P1-1 证据供给 |
 | Paid 实际报价来源 | 客户 | F 模块（缺则固定 Review，不阻塞交付） |
