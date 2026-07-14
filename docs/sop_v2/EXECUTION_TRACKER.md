@@ -21,7 +21,7 @@
 - [ ] **E0-2** IG 登录态 profile 建立：**等负责人提供账号**后，为每号起独立 Chrome profile（`start_instagram_cdp.zsh`）人工首登一次；不导私有 API 账号池
 - [ ] **E0-3** 代理出口确认：本机是否有 Clash/固定出口；登录 profile 与采集尽量同出口（浏览器通道下已非阻断项，属存活性优化）
 - [ ] **E0-4** Modash 通道冒烟：连本机**已登录的 yibo Chrome 现有会话**（不新建实例）只读打开 Modash 用量页，记录五个余额桶**当前剩余量**基线（2026-07-14 只读核对时为：Profiles 剩 1310/1500、Emails & Exports 剩 929/1000、Monitoring 剩 298/400、Fans profiles 剩 6000/6000、linked accounts 剩 5/6，见主文档 §1.4；若数字变动以本次实读为新基线），作为后续所有 canary 的对照起点
-- [ ] **E0-5** 操作机功能同步决策（**需负责人拍板**）：`--warm-only`、独立 run 日志、`reports/run-audits/`、`config/sop_v2.toml`、`config/modash_cost_policy.toml` 只在操作机存在——能拿到文件则拷贝回推（走 R0-6），拿不到则在本仓库按 v1.3.1 口径重建（工作量小，且 sop_v2.toml 本来就要按 §2.5 重写）
+- [ ] **E0-5** 操作机功能同步决策（**需负责人拍板**）：独立 run 日志、`reports/run-audits/`、`config/sop_v2.toml`、`config/modash_cost_policy.toml` 只在操作机存在——能拿到文件则拷贝回推（走 R0-6），拿不到则在本仓库按 v1.5 口径重建（工作量小，且 sop_v2.toml 本来就要按 §2.5 重写）。注：`--warm-only` 是私有 API 旗标，instagrapi 退役后作废、不回推
 
 ## B0 浏览器采集后端（IG 采集通道从私有 API 改为登录态浏览器；详见 §1.6/§2.6）
 
@@ -74,9 +74,9 @@
 
 ## 首批验收 Runbook（R0 预检门 + P0 + P1 完成后；9 步）
 
-- [ ] **RB-0** 预检门通过（健康 Session ≥5、代理一致、config SHA 锁定）
+- [ ] **RB-0** 预检门通过（健康登录态 Chrome profile 数 ≥N，见 R0-3；登录态新鲜；代理一致；config SHA 锁定）
 - [ ] **RB-1** 建批：显式选 track；Handle 池目标 100-300 → Include 1-10 不凑数
-- [ ] **RB-2** 发现：a) Modash 模板搜索（新动作先 canary，结果页只读 → search_pool_import）；b) IG 种子辅助（--v2-collect --warm-only --wait-pool，可 --resume）
+- [ ] **RB-2** 发现（Modash 单通道）：a) Modash 模板搜索（新动作先 canary，结果页只读 → search_pool_import）+ 客户回流/人工 handle 注入；b) `discover.py --v2-collect --resume`（BrowserCollector 登录态 profile 回扫 Handle 池，中断可续跑）
 - [ ] **RB-3** verify_browser.py Storefront 三态核验
 - [ ] **RB-4** Modash 补数（缓存→Profile 队列 ≤20/轮→shortlist 导出+字段映射确认）
 - [ ] **RB-5** 人工证据录入（Raw Skin/VO/风险/报价）
@@ -88,7 +88,7 @@
 
 - [ ] **P2-1** batch manifest + 证据索引落盘
 - [ ] **P2-2** HTML 审计 V2 段（五池/gate 原值/A-F/CONFLICT/新旧对照）
-- [ ] **P2-3** Herman 反馈回导 + 批准者回流通道A种子 + 负向标签
+- [ ] **P2-3** Herman 反馈回导 + 批准者回流 **Modash Lookalike 扩池并注入 Handle 池**（非 IG Lookalike，已退役）+ 负向标签
 - [ ] **P2-4** 质量看板（批准率/五池比例/缺失率/淘汰率/误收误杀代理率/预算消耗/池健康）
 - [ ] **P2-5** `MODASH_OPERATIONS.md` 操作规范（docx §12 七步 + 成本纪律 + 白名单）
 

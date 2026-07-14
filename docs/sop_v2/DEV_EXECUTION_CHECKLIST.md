@@ -1,6 +1,6 @@
 # SOP V2 开发执行清单（代码实证版）
 
-版本：1.3.1（v1.1 = 五视角对抗校验修订 42 条；v1.2 = 合入操作机初跑实证、R0 修复阶段、Modash 真实余额；v1.2.1 = 三视角校验修订 14 条；v1.3 = 合入 Modash Discovery 浏览器实测，发现层改为 Modash-first 双通道；v1.3.1 = 双视角校验修订 11 条：Handle 池注入接口补全、两源命中承接、发现层降级口径、docx 引用消歧；v1.4 = IG 采集通道决策浏览器优先（§1.6/§2.6，Collector 后端接口，参考 browser-cdp-lab），B0 track，重塑 R0；v1.5 = 客户拍板 instagrapi 完全退役、浏览器唯一 IG 通道、Modash 复用已登录 Chrome 不新建进程；R0 全面改为登录态 Chrome profile 池）
+版本：1.3.1（v1.1 = 五视角对抗校验修订 42 条；v1.2 = 合入操作机初跑实证、R0 修复阶段、Modash 真实余额；v1.2.1 = 三视角校验修订 14 条；v1.3 = 合入 Modash Discovery 浏览器实测，发现层改为 Modash-first 双通道；v1.3.1 = 双视角校验修订 11 条：Handle 池注入接口补全、两源命中承接、发现层降级口径、docx 引用消歧；v1.4 = IG 采集通道决策浏览器优先（§1.6/§2.6，Collector 后端接口，参考 browser-cdp-lab），B0 track，重塑 R0；v1.5 = 客户拍板 instagrapi 完全退役、浏览器唯一 IG 通道、Modash 复用已登录 Chrome 不新建进程；R0 全面改为登录态 Chrome profile 池；v1.5.1 = 一致性校验清残留：发现层降为 Modash 单通道 + 外部 handle 注入，删除通道B/--warm-only/--wait-pool/暖 Session≥5 私有 API 措辞，批准者回流明确走 Modash lookalike）
 日期：2026-07-14
 规则源：`Instagram红人筛选SOP标准确认书_客户版.docx`（Client-Facing V2.0，2026-07-13）
 实证源：`FULL_INITIAL_RUN_REPORT_20260714.md` + 证据包（3 次在线 run 原始产物）+ `MODASH_FUNCTIONS_COST_REPORT.md`（客户账号只读核对）
@@ -31,7 +31,7 @@
 | 能力 | 位置 | 关键事实 |
 |---|---|---|
 | 六阶段线性管道 | `scripts/discover.py`（2320 行） | 种子(1a-1f)→回扫→六层漏斗→评论→评分→JSON/CSV+scan cache |
-| 种子源 | discover.py 阶段1 | 品牌 tagged/mention（旧管道主力；**v1.3 起降为通道B辅助，主发现见 §2.1 通道A**）、关键词 search_users、Lookalike、品牌帖点赞者、Modash CSV 导入；hashtag 默认禁用（软封） |
+| 种子源 | discover.py 阶段1 | 品牌 tagged/mention、关键词 search_users、Lookalike、品牌帖点赞者、Modash CSV 导入。**v1.5 起：这些 IG 自产发现端点随 instagrapi 全部退役，发现改由 Modash 单通道承担，discover.py Stage1 只接收 `--handle-pool` 注入**（见 §2.1/§1.6） |
 | 回扫早筛 | stage2 L928-941 | 无橱窗 → exclude + `posts=[]` 跳过深扫（**初跑实证 4/5 候选在此出局；V2 双轨接入点之一**） |
 | 漏斗门槛 | stage3 L993-1070 | 粉丝 10K-150K[硬 L995-999，初跑实证杀掉 3,157 粉候选]、品牌号[硬]、30 天活跃[硬]、无 Storefront[硬，双闸]、产品推荐<20%[软]、赞助>40%[硬]/>30%[软]、ER 低于基准[软]但**双零→硬 exclude（L1054-1058）** |
 | Bio/Amazon 检测 | `_check_bio_links` L1118 | 直链→True；bio 文本→True；聚合页→`"unverified"`；`PENETRATE_LINKTREE=False`（L105） |
@@ -61,7 +61,7 @@
 
 | 能力 | 操作机 | 本仓库 v0.1.1 |
 |---|---|---|
-| `--warm-only` 旗标（禁止冷登录） | 有 | **无** |
+| `--warm-only` 旗标（禁止冷登录） | 有 | **无**（instagrapi 退役后作废，不回推） |
 | 独立逐行 run 日志（logs/discover-*.log） | 有 | **无** |
 | `reports/run-audits/*.json`（含 sop_checks/risk_markers 审计框架） | 有 | **无** |
 | `config/sop_v2.toml` | 有（内容待核） | **无** |
@@ -119,19 +119,20 @@
 ### 2.1 数据流
 
 ```text
-┌─ 候选发现（Modash-first 双通道）──────────────────────────────┐
-│ 通道A(主) Modash Legacy/AI Search 结果页只读缩池              │
+┌─ 候选发现（Modash 单发现通道 + 外部 Handle 注入）────────────┐
+│ 主发现 Modash Legacy/AI Search 结果页只读缩池                │
 │   结果页只读零 Profile 消耗(新搜索动作首次先 canary)；        │
 │   不点 View、不导出；本地记录可见字段                         │
 │   + filters_snapshot → search_pool_import.py                  │
-│ 通道B(辅) Instagram 品牌 tagged/mention/Lookalike 种子        │
-│   含客户批准者回流；账号池压力大时可降为 0                    │
+│ 外部注入 客户批准者回流(Modash lookalike) + 人工 Approved     │
+│   handle；IG 侧不自产发现(tagged/mention/Lookalike API         │
+│   已随 instagrapi 退役)，仅外部 handle 注入合并去重           │
 └────────────────────────┬──────────────────────────────────────┘
                          v  合并去重后的 Handle 池
 ┌─ 稳定核心（不改逻辑，只加 --v2-collect 旗标）─────────────────┐
-│ discover.py --v2-collect [--warm-only] [--resume <run_id>]    │
-│   Stage1 发现/接收 Handle 池(候选池全量持久化) → Stage2 回扫  │
-│   (30帖+置顶;                                                 │
+│ discover.py --v2-collect [--resume <run_id>]                 │
+│   Stage1 接收 Handle 池(候选池全量持久化) → Stage2 回扫       │
+│   (登录态 Chrome/BrowserCollector; 30帖+置顶;                 │
 │   橱窗早筛旁路) → Stage3 旧漏斗(V2:Storefront/粉丝只标记)     │
 │   → Stage4 评论(Top10+Recent10,每帖≤10)                       │
 │   → Stage5 旧评分(对照;credibility旧线停用)                   │
@@ -191,7 +192,7 @@ tests/
 4. **补采置顶标记**：play_count/view_count 已有（初跑 scan cache 核实），仅补置顶标记；
 5. **评论采样 V2 口径**：Top10+Recent10 去重（≤20 帖）、每帖≤10 条；
 6. **旧隐藏线停用**：credibility<0.60（L1766）与 ER 双零硬 exclude（L1054-1058→改 Review）；
-7. **Handle 池注入接口**（通道A→采集层的衔接，v1.3 新增）：`--handle-pool <file>` 接收 search_pool_import.py 产出的去重 Handle 列表（复用现有 Modash CSV 种子源入口，字段映射按 §2.2 契约），Stage1 与通道B 种子合并去重后一并落盘候选池；来源标记 `modash_search:<search_mode>` 进 discovery_sources。
+7. **Handle 池注入接口**（发现层→采集层的唯一衔接）：`--handle-pool <file>` 接收 search_pool_import.py 产出的去重 Handle 列表 + 客户回流/人工 Approved handle（字段映射按 §2.2 契约），作为 Stage1 **唯一候选来源**落盘候选池（IG 侧不再自产种子）；来源标记 `modash_search:<search_mode>` / `client_feedback` / `manual` 进 discovery_sources。
 
 R0 另需两个**与旗标无关**的管道级修复（同样最小侵入，见 R0-4）：
 - **候选池持久化**：Stage1 完成后先落盘全量去重候选（`candidates-pool-<run>.json`，初跑 112 人即因未持久化而作废）；
@@ -236,8 +237,8 @@ BatchManifest: batch_id, sop_version, campaign_track, config_sha256,
 | ai_score | **分层判定用 normalized_total（≥75/[65,75)/[50,65)/<50），AI Score=round(nt/10,1) 仅展示**；9.5+ 按 docx §13 严口径六条件，否则封顶 9.4 [CONFLICT-9.5VO] |
 | fixed_review | Modash 核心字段缺失 / Storefront unknown / 有效评论<20 / Raw Skin或VO 未核验 / Paid 缺报价 / 受众合计<35% / 语言不满足——高分不得覆盖 |
 | merge_priority | Modash 优先：粉丝/General ER/假粉/国家/受众/语言/合作史；Instagram 优先：内容/赞助/评论/视觉；人工最高；冲突记 conflict |
-| seeds | 品牌种子 Omnilux/CurrentBody/Therabody；产品词/场景词/Lookalike/排除词 #shein #temu（DISC-01/05/06/07） |
-| discovery | Modash-first 双通道：**Paid 搜索模板**（Creator 主池 + Regular 补充池、Business 排除；10K-150K；Location 按 Tier1/2 分别执行；ER≥2%、Fake≤25% 仅作召回；Posted within 30 天不足放宽 90 天；Active creators 开启；Bio/Captions 词表 skincare/beauty device/red light/LED mask/anti-aging/acne/skin recovery；Mentions currentbody/omniluxled/therabody）；**Gifting 模板独立跑**（5K-<30K 与 30K-50K，不与 Paid 混用）；**AI Search 按意图拆小查询**（讲解型护肤教育/红光设备真实使用/自然光低滤镜/带教育 VO 的 Amazon 美容设备推荐）；**AI 每个查询叠加 Followers/Location/ER/Fake/Active/Account Type 基础过滤，先比结果质量再决定是否用 Image Search/Lookalike**；Gifting 除粉丝档外其余条件与 Paid 一致；Mentions 清单开放可扩（currentbody/omniluxled/therabody 等）；结果页只读不 View 不导出；UI 总数不可信按实际 handle 去重；数量漏斗 100-300→50-100→30-50→15-30→Profile 10-20→Include 1-10；**降噪与深扫排序承接成本报告"两源命中"要求：≥2 独立来源命中（Modash 搜索/IG 种子/客户回流互为独立源）优先进深扫队列，人工 Approved/客户回流可例外，单源候选仅在池量不足时按分数递补**；每类新动作（新 Search/AI/Image/Lookalike/Save）首次执行前 canary；Collaborations 索引不全，品牌合作用 Mentions/Captions 召回、以 Profile Report 合作史+IG 原帖判定 |
+| seeds | 品牌词 Omnilux/CurrentBody/Therabody、产品词、场景词、排除词 #shein #temu——**均用于 Modash 搜索模板的 Bio/Captions/Mentions 过滤**（非 IG 侧发现）；Lookalike 指 Modash lookalike（DISC-01/05/06/07） |
+| discovery | Modash 单发现通道 + 外部 handle 注入：**Paid 搜索模板**（Creator 主池 + Regular 补充池、Business 排除；10K-150K；Location 按 Tier1/2 分别执行；ER≥2%、Fake≤25% 仅作召回；Posted within 30 天不足放宽 90 天；Active creators 开启；Bio/Captions 词表 skincare/beauty device/red light/LED mask/anti-aging/acne/skin recovery；Mentions currentbody/omniluxled/therabody）；**Gifting 模板独立跑**（5K-<30K 与 30K-50K，不与 Paid 混用）；**AI Search 按意图拆小查询**（讲解型护肤教育/红光设备真实使用/自然光低滤镜/带教育 VO 的 Amazon 美容设备推荐）；**AI 每个查询叠加 Followers/Location/ER/Fake/Active/Account Type 基础过滤，先比结果质量再决定是否用 Image Search/Lookalike**；Gifting 除粉丝档外其余条件与 Paid 一致；Mentions 清单开放可扩（currentbody/omniluxled/therabody 等）；结果页只读不 View 不导出；UI 总数不可信按实际 handle 去重；数量漏斗 100-300→50-100→30-50→15-30→Profile 10-20→Include 1-10；**降噪与深扫排序承接成本报告"两源命中"要求：≥2 独立来源命中（Modash 各搜索模板 Paid/Gifting/AI、客户回流、人工 Approved 互为独立源；IG 侧不再自产发现源）优先进深扫队列，人工 Approved/客户回流可例外，单源候选仅在池量不足时按分数递补**；每类新动作（新 Search/AI/Image/Lookalike/Save）首次执行前 canary；Collaborations 索引不全，品牌合作用 Mentions/Captions 召回、以 Profile Report 合作史+IG 原帖判定 |
 | graph | 图谱来源未走完整审计→封顶 Review |
 | brand_account | 非个人 creator→Exclude；医生/诊所→项目默认 Review（偏离 docx §4 默认，待批示）[CONFLICT-医生诊所] |
 | modash_budget | 引用 modash_cost_policy.toml：Profile 每轮≤20/每日≤30/账期≤110/保留 80%；导出只限 shortlist，**每轮≤20/每日≤30/保留 80%（≤129 行余量）**；**禁止大池 Bulk save，Save 仅限 shortlist 级且先 canary**；邮箱解锁=0；Monitoring=0；Influential Fans 仅 preview（≤30）且保留≥90%、不新增 linked accounts；新动作先 canary；付费动作全部记台账（run/handle/action_id/时间），重跑不得重复扣费 |
@@ -288,7 +289,7 @@ class Collector(Protocol):        # BrowserCollector 为唯一运行时实现
 | P0-7 | 路由引擎 `routing.py`（硬红线→固定 Review（含受众/语言）→Lifestyle 封顶→分数分层→Storefront 双 Include；Gifting 30K-50K 插入位置=硬红线与固定 Review 之后） | ROUTE-01..05 | extensions/sop_v2/routing.py | 恰好一池；高分+缺报价不入 Include；Lifestyle 高分封顶；30K-50K+缺报价→Review；受众 34.9/35.0、语言 49.9/50.0 |
 | P0-8 | 编排入口 `run_v2.py` | DB-01/02 | extensions/sop_v2/run_v2.py | 同输入重跑逐字节一致 |
 | P0-9 | 五池导出 `export_v2_xlsx.py`（8 sheet） | DEL-01..08 | scripts/export_v2_xlsx.py | 结构测试；Herman 空列；缺失显示"缺失"不填 0 |
-| P0-10 | `discover.py --v2-collect`（§2.3 七点，含 `--handle-pool` 注入接口）。外部成本：在线验证消耗账号池请求 | GATE-11, GATE-01..03, COLLECT-03/04/05, SCORE-F3 | scripts/discover.py | 不带旗标逐字节一致；带旗标：Without-Storefront（初跑 4 人即用例）与 Gifting 5K-9,999 产出完整 30 帖+评论；置顶标记落库；**通道A-only 输入（仅 --handle-pool，无 IG 种子）可完成回扫全流程** |
+| P0-10 | `discover.py --v2-collect`（§2.3 七点，含 `--handle-pool` 注入接口；采集经 BrowserCollector）。外部成本：在线验证消耗登录态 profile 请求 | GATE-11, GATE-01..03, COLLECT-03/04/05, SCORE-F3 | scripts/discover.py | 不带旗标逐字节一致；带旗标：Without-Storefront（初跑 4 人即用例）与 Gifting 5K-9,999 产出完整 30 帖+评论；置顶标记落库；**仅 --handle-pool 输入即可完成回扫全流程（IG 侧无自产种子）** |
 | P0-11 | 测试套件 + 合成 fixtures（可采初跑证据包脱敏结构） | QA-01..04 | tests/ | 全绿；覆盖每个边界与每个池 |
 | P0-12 | 离线回归：历史 scan cache 跑 run_v2，新旧评分对照（流程性） | — | — | 对照表输出；无未解释翻转 |
 | P0-13 | 日志/交付包脱敏扫描 + 无外发断言（联系方式仅记录） | AUTH-05, SCOPE-02, SCORE-F6 | tests/test_redaction.py + batch.py 钩子 | 命中即失败；F6 只记录可用性 |
@@ -311,15 +312,15 @@ class Collector(Protocol):        # BrowserCollector 为唯一运行时实现
 |---|---|---|---|---|
 | P2-1 | 批次 manifest + 证据索引（承接 R0-8；跨 run 关联） | DB-02/03 | batch.py | manifest 含 SOP 版本/config/source SHA-256/各阶段计数/关联 run_id；证据可反查 |
 | P2-2 | HTML 审计报告 V2 段（五池/gate 原值/A-F/CONFLICT 台账/新旧对照） | DEL-04/05/07, DB-03 | build_report.py 增量段 | 旧报告不受影响 |
-| P2-3 | Herman 反馈回导 + 批准者回流 Lookalike + 拒绝者负向标签 | FB-01..03, DISC-02 | import_client_feedback.py + db.py | batch_id+handle 匹配；个例不自动改 config |
+| P2-3 | Herman 反馈回导 + 批准者回流 **Modash Lookalike 扩池并注入 Handle 池**（IG Lookalike/chaining 已退役）+ 拒绝者负向标签 | FB-01..03, DISC-02 | import_client_feedback.py + db.py | batch_id+handle 匹配；个例不自动改 config |
 | P2-4 | 质量看板（批准率、五池比例、缺失率、硬门槛淘汰率、误收/误杀代理率、Modash 预算消耗、账号池健康趋势） | QA/FB + R0 | db.py stats 扩展 | 每轮可对比上一批全部指标 |
 | P2-5 | Modash 操作规范文档（docx §12 全七步 + 成本纪律：结果页缩池模板、canary 步骤、Profile 队列规则、shortlist 导出时点、白名单与另行授权边界；**不动客户账号既有 List/Campaign/套餐**） | AUTH-01..04, SCOPE-02 | docs/sop_v2/MODASH_OPERATIONS.md | 执行者可照做；含余额前后核对表 |
 
 ### 首批验收 Runbook（R0 通过 + P0+P1 完成后）
 
-0. **R0 预检门通过**：健康暖 Session ≥5（项目自定门槛，定义与降级口径见 R0-3）、代理一致、config SHA 锁定，否则不开批。
-1. 建批：显式选 track；Gifting 批次采集边界 5K-50K 生效；目标：合并去重 Handle 池 100-300（漏斗第一级）→ Include 1-10，不凑数（与成本报告"~100 送 Profile"区分：那是账期级 Profiles 预算概念，非单批目标）。
-2. 候选发现双通道（**Modash 为主**）：a) Modash Legacy/AI Search 按 config discovery 模板执行（新搜索先 canary；结果页只读记录 → search_pool_import.py；不点 View、不导出、不 Bulk save）；b) `discover.py --v2-collect --warm-only --wait-pool`（Instagram 种子辅助 + 承接 Handle 池回扫；候选池落盘；中断可 --resume）。
+0. **R0 预检门通过**：健康登录态 Chrome profile 数 ≥N（门槛见 R0-3，起步 N=1 可挂机跑）、登录态新鲜、代理一致、config SHA 锁定，否则不开批。
+1. 建批：显式选 track；Gifting 批次采集边界 5K-50K 生效；目标：合并去重 Handle 池 100-300（Modash 多模板结果 + 客户回流/人工 handle 去重，非 IG 自产源）→ Include 1-10，不凑数（与成本报告"~100 送 Profile"区分：那是账期级 Profiles 预算概念，非单批目标）。
+2. 候选发现（**Modash 单发现通道**）：a) Modash Legacy/AI Search 按 config discovery 模板执行（新搜索先 canary；结果页只读记录 → search_pool_import.py；不点 View、不导出、不 Bulk save）+ 客户回流/人工 Approved handle 注入；b) `discover.py --v2-collect --resume`（BrowserCollector 走登录态 Chrome profile 回扫 Handle 池；候选池落盘；中断可续跑）。
 3. `verify_browser.py` 核验 Storefront 三态。
 4. Modash 补数：30 天缓存优先 → Profile 队列（≤20/轮）→ 终选 shortlist 才导出并完成**字段映射确认**。
 5. 人工证据：Raw Skin/VO/风险/报价模板录入导入。
@@ -360,9 +361,9 @@ class Collector(Protocol):        # BrowserCollector 为唯一运行时实现
 
 ## 6. 风险与降级
 
-- **认证再次阻断**：R0-7 预检门保证不空转；`--wait-pool` + 冷却纪律；发现成果因候选池持久化不再作废；账号补充走"干净好号"渠道而非换登录方式（README 铁律）。
+- **登录态 profile 失效**（跳登录页/challenge，替代原"认证再次阻断"）：R0-5 巡检立即移出并标待人工重登；R0-7 预检门保证健康 profile 数不足时不空转；发现成果因候选池持久化不作废；profile 补充靠人工重登既有账号（sessionid cookie 注入或浏览器登录），**不脚本化密码登录、零冷登录烧号**。
 - **Modash 补数不可用/预算触线**：主流程照跑，字段 missing → Review，不阻塞交付；预算台账防超支与重复扣费。
-- **Modash 发现通道A不可用**（v1.3 新增）：降级为通道B（IG tagged/mention/Lookalike + 客户回流）为主，**此时通道B不得同时降为 0**；双通道均不可用则本批不开批（挂 R0-7 预检门）。候选极少时 Profile/Bio/Storefront/少量近帖可走普通 Chrome 人工补证（实测报告 §10 已证可行），仅作低量兜底，不替代 R0。
+- **Modash 发现通道不可用/预算触线**：IG 侧无自产发现兜底（tagged/mention/Lookalike 端点已随 instagrapi 退役），仅可用客户回流/人工 Approved handle 直接注入 + 普通 Chrome 人工补证（实测报告 §10）作低量兜底；Modash 发现完全不可用则本批不开批（挂 R0-7 预检门）。
 - **评论采集节奏**：浏览器唯一通道下不再有私有 API 烧号风险；V2 采样上限 ≤20 帖×10=200 条，按登录态 profile 的拟人节奏（随机停顿、限速、挂机跑）采集；样本不足→固定 Review。
 - **规则冲突**：以 docx §4/§11/§15 固化口径为准，冲突入 §5 台账，不私自仲裁。
 - **旧新评分翻转**：P0-12 对照表；只有客户确认的差异才调 config。
