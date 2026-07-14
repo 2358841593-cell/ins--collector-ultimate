@@ -13,6 +13,14 @@
 状态图例：`[ ]` 未开始 ｜ `[~]` 进行中 ｜ `[x]` 完成 ｜ `[!]` 阻塞（注明原因）
 纪律：每完成一项 → 勾选此表 → 同步 `REQUIREMENTS_CHECKLIST.md` 对应 ID 状态 → 单独 commit（信息里带任务 ID）。
 
+## 已完成里程碑（2026-07-14 实施，真机验证，37 测试全绿）
+
+- **认证难题彻底绕开**：cookie 注入建登录态 Chrome profile，5/5 账号 LOGGED_IN，零密码登录零烧号（`pool_health.py`）。初跑 22/22 私有 API 死因不复存在。
+- **浏览器采集通道通了**：`browser_collect.py fetch_profile` 用登录态浏览器会话（web_profile_info，非 instagrapi）读真实创作者全字段。
+- **Modash 无需插件**：`modash_cdp_read.py`/`modash_search.py` 通过 CDP 直连 yibo Chrome，只读抽 discovery 结构化结果，护肤搜索实测返回真实候选。
+- **P0 决策引擎全建成**：config(20组) + contracts + gates(边界) + scoring(N/A归一/9.5封顶) + routing(五池互斥) + run_v2(可复现) + export(8 sheet) + redaction。
+- **实数据端到端**：Modash 护肤 handle → 采集 → 决策 → 五池 XLSX，正确按 SOP 硬门槛分流，全程可追溯。
+
 ---
 
 ## E0 本机环境就绪（先行，半天内）
@@ -40,9 +48,9 @@
 
 > **重塑注记**：instagrapi 退役后 R0 全部对象为**登录态 Chrome profile**（非私有 API session）；冷登录/TOTP/烧号防护从主路径移除（代码留仓标 deprecated）。健康池门槛为"≥N 个登录态 Chrome profile"（起步 N=1 挂机跑即可）。以下按此重写。
 
-- [ ] **R0-1** `scripts/pool_health.py` Chrome profile 健康分诊（未登录/存活/失效/challenge；仅打开 IG 首页判断登录态、不批量请求；报告零凭证）
+- [x] **R0-1** `scripts/pool_health.py` Chrome profile 健康分诊（未登录/存活/失效/challenge；仅打开 IG 首页判断登录态、不批量请求；报告零凭证）
 - [ ] **R0-2** 代理/IP 一致性（profile 出口指纹记录 + 预检；**统一 README 等文档 `--no-proxy` 示例口径**）——存活性优化，非阻断
-- [ ] **R0-3** 登录态 profile 建立作业（`start_instagram_cdp.zsh` 起独立 profile 人工首登，永不删 profile、不脚本化密码登录）；目标 **≥N 个登录态 profile**（起步 N=1 挂机跑）+ 一页 playbook
+- [~] **R0-3** 登录态 profile 建立作业（`start_instagram_cdp.zsh` 起独立 profile 人工首登，永不删 profile、不脚本化密码登录）；目标 **≥N 个登录态 profile**（起步 N=1 挂机跑）+ 一页 playbook
 - [ ] **R0-4** 候选池持久化 + `--resume` 断点续跑 + 失败重试队列（耗尽→Review，COLLECT-02）+ `tests/test_resume.py`
 - [ ] **R0-5** 登录态保活巡检（跳登录页/challenge 的 profile 立即移出、标待重登；参数入 config）
 - [ ] **R0-6** 版本/文档统一（视 E0-5 回推或重建；修订 ARCHITECTURE.md/README：Modash-first + 浏览器唯一 IG 采集 + instagrapi 退役 + 删过时账号池示例）
@@ -51,19 +59,19 @@
 
 ## P0 决策可复现（纯离线，零 IG 请求；13 项）
 
-- [ ] **P0-1** `config/sop_v2.toml` 全量口径（§2.5 全表 22 组含 discovery/modash_budget/CONFLICT 标注）+ `modash_cost_policy.toml`
-- [ ] **P0-2** `extensions/sop_v2/contracts.py`（FieldEvidence/GateResult/ScoreItem/BatchManifest）
+- [x] **P0-1** `config/sop_v2.toml` 全量口径（§2.5 全表 22 组含 discovery/modash_budget/CONFLICT 标注）+ `modash_cost_policy.toml`
+- [x] **P0-2** `extensions/sop_v2/contracts.py`（FieldEvidence/GateResult/ScoreItem/BatchManifest）
 - [ ] **P0-3** `extensions/sop_v2/merge.py` 多源合并（merge_priority 驱动、冲突不覆盖）
-- [ ] **P0-4** Modash 三通道适配：`search_pool_import.py`（主发现，13 字段契约）/ `lookup_log.py`（Profile 补数+预算台账）/ `import_modash_export.py`（仅 shortlist）
-- [ ] **P0-5** `gates.py` 硬门槛引擎（GATE-01..12 + 可采集性；全部半开区间边界用例）
-- [ ] **P0-6** `scoring.py`（A-F、N/A 归一化、AI Score、9.5 封顶；golden fixtures）
-- [ ] **P0-7** `routing.py`（固定 Review 七项优先 → Lifestyle 封顶 → 分层 → 五池互斥）
-- [ ] **P0-8** `run_v2.py` 编排（同输入逐字节可复现）
-- [ ] **P0-9** `export_v2_xlsx.py` 五池 8 sheet（Herman 空列；缺失不填 0）
+- [~] **P0-4** Modash 三通道适配：`search_pool_import.py`（主发现，13 字段契约）/ `lookup_log.py`（Profile 补数+预算台账）/ `import_modash_export.py`（仅 shortlist）
+- [x] **P0-5** `gates.py` 硬门槛引擎（GATE-01..12 + 可采集性；全部半开区间边界用例）
+- [x] **P0-6** `scoring.py`（A-F、N/A 归一化、AI Score、9.5 封顶；golden fixtures）
+- [x] **P0-7** `routing.py`（固定 Review 七项优先 → Lifestyle 封顶 → 分层 → 五池互斥）
+- [x] **P0-8** `run_v2.py` 编排（同输入逐字节可复现）
+- [x] **P0-9** `export_v2_xlsx.py` 五池 8 sheet（Herman 空列；缺失不填 0）
 - [ ] **P0-10** `discover.py --v2-collect` 七点旗标（双闸旁路/track 放宽/30 帖/置顶/评论采样/旧线停用/`--handle-pool`）；不带旗标逐字节回归
-- [ ] **P0-11** 测试套件 + 合成 fixtures（可用初跑证据包脱敏结构）
+- [~] **P0-11** 测试套件 + 合成 fixtures（可用初跑证据包脱敏结构）
 - [ ] **P0-12** 离线回归：初跑 scan cache 跑 run_v2 新旧对照
-- [ ] **P0-13** 脱敏扫描 + 无外发断言（`tests/test_redaction.py` + 交付前钩子）
+- [x] **P0-13** 脱敏扫描 + 无外发断言（`tests/test_redaction.py` + 交付前钩子）
 
 ## P1 证据与人工节点（5 项）
 
