@@ -16,6 +16,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import browser_collect  # noqa: E402
+from extensions.sop_v2 import content as content_mod  # noqa: E402
+from extensions.sop_v2.config import load_config  # noqa: E402
+
+_CFG = load_config()
 
 AGG = ("linktr.ee", "beacons", "ltk", "liketoknow", "shopmy", "komi.io", "stan.store",
        "linkin.bio", "milkshake", "flowpage")
@@ -88,9 +92,12 @@ def assemble_one(handle, modash_rec, account, headless=True):
         # Modash 补数字段留空 → 固定 Review（modash_core_missing）
         "fake_pct": None, "creator_country": None, "top_audience_country": None,
         "target_countries_audience_pct": None, "top_language_pct": None,
-        # 内容/评论/视觉/报价留空 → 固定 Review（诚实）
+        # 评论/视觉/报价留空 → 固定 Review（诚实）；内容信号从 posts 派生
         "valid_comments": None, "raw_skin_grade": None, "has_vo": None, "paid_cpm": None,
+        "posts": prof.get("posts"),
     }
+    cand.update(content_mod.derive_content_signals(cand, _CFG))
+    cand.pop("posts", None)   # 内容信号已派生，posts 不进候选（体积/隐私）
     return cand
 
 

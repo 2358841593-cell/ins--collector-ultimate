@@ -58,6 +58,31 @@ def parse_og_description(desc: str) -> dict:
     return out
 
 
+def _compact_posts(user: dict) -> list[dict]:
+    """从 web_profile_info 的 timeline media（首屏约 12 帖）抽同构 posts。
+    完整 30 帖窗口需 graphql 分页（B0-3 后续）；首屏已够内容/赞助/互动初判。"""
+    out = []
+    edges = ((user.get("edge_owner_to_timeline_media") or {}).get("edges") or [])
+    for e in edges:
+        n = e.get("node") or {}
+        caps = ((n.get("edge_media_to_caption") or {}).get("edges") or [])
+        caption = caps[0]["node"]["text"] if caps else ""
+        likes = (n.get("edge_liked_by") or n.get("edge_media_preview_like") or {}).get("count")
+        out.append({
+            "pk": n.get("id"),
+            "code": n.get("shortcode"),
+            "caption_text": caption,
+            "like_count": likes,
+            "comment_count": (n.get("edge_media_to_comment") or {}).get("count"),
+            "media_type": 2 if n.get("is_video") else 1,
+            "product_type": n.get("product_type") or "",
+            "play_count": n.get("video_view_count") or 0,
+            "taken_at": n.get("taken_at_timestamp"),
+            "pinned": bool(n.get("pinned_for_users")),
+        })
+    return out
+
+
 def _profile_from_web_info(user: dict) -> dict:
     """把 web_profile_info 的 user 映射到旧 _compact profile 同构字段。"""
     bio_links = []
@@ -66,6 +91,7 @@ def _profile_from_web_info(user: dict) -> dict:
             bio_links.append(link["url"])
     ext = user.get("external_url") or ""
     return {
+        "posts": _compact_posts(user),
         "handle": user.get("username"),
         "pk": str(user.get("id") or ""),
         "full_name": user.get("full_name") or "",
