@@ -1,0 +1,100 @@
+# SOP V2 最终执行清单（开发追踪表）
+
+版本：1.0 ｜ 日期：2026-07-14 ｜ 分支：`sop-v2-dev`
+**这是后续开发、修复与测试的唯一执行入口。** 每项任务的完整设计、阈值口径与验收标准见 [`DEV_EXECUTION_CHECKLIST.md`](DEV_EXECUTION_CHECKLIST.md)（v1.3.1，经三轮多视角对抗校验，共修订 67 处），此表只列"做什么、在哪做、什么算完成"。
+
+执行环境（本机）：
+- 仓库：`/Users/wiselq/Desktop/ins-collector`，分支 `sop-v2-dev`，边修复边测试。
+- Modash：本机 Chrome **yibo profile 已登录**，浏览器自动化只读驱动；成本纪律见 `DEV_EXECUTION_CHECKLIST.md` §1.4/§2.5 modash_budget。
+- Instagram 账号：由负责人提供后经 `scripts/import_pool.py` 导入本机 `.secrets/`（格式 `username----password----totp_secret`，一行一号）。
+- Python 本机 3.14.6（操作机初跑为 3.13.9）——E0-1 装完后必须跑依赖冒烟。
+
+状态图例：`[ ]` 未开始 ｜ `[~]` 进行中 ｜ `[x]` 完成 ｜ `[!]` 阻塞（注明原因）
+纪律：每完成一项 → 勾选此表 → 同步 `REQUIREMENTS_CHECKLIST.md` 对应 ID 状态 → 单独 commit（信息里带任务 ID）。
+
+---
+
+## E0 本机环境就绪（先行，半天内）
+
+- [~] **E0-1** venv + requirements + `playwright install chromium`；Python 3.14 兼容性冒烟（import instagrapi/openpyxl/playwright + `python -m unittest` 现有 4 例）
+- [ ] **E0-2** IG 账号导入：`scripts/import_pool.py < accounts.txt`（**等负责人提供账号**）；导入后仅登记不登录
+- [ ] **E0-3** 代理出口确认：本机是否有 Clash/固定出口（登录 SOP 原则 6：会话建立与采集必须同出口）；确定本项目在本机的 `IG_PROXY` 口径并记录，之后所有暖 Session 建立与采集统一使用
+- [ ] **E0-4** Modash 浏览器通道冒烟：驱动 yibo profile 只读打开 Modash 用量页，记录五个余额桶**当前剩余量**基线（2026-07-14 只读核对时为：Profiles 剩 1310/1500、Emails & Exports 剩 929/1000、Monitoring 剩 298/400、Fans profiles 剩 6000/6000、linked accounts 剩 5/6，见主文档 §1.4；若数字变动以本次实读为新基线），作为后续所有 canary 的对照起点
+- [ ] **E0-5** 操作机功能同步决策（**需负责人拍板**）：`--warm-only`、独立 run 日志、`reports/run-audits/`、`config/sop_v2.toml`、`config/modash_cost_policy.toml` 只在操作机存在——能拿到文件则拷贝回推（走 R0-6），拿不到则在本仓库按 v1.3.1 口径重建（工作量小，且 sop_v2.toml 本来就要按 §2.5 重写）
+
+## R0 认证与采集基础（与 P0 并行；详见 v1.3.1 §3 R0 表）
+
+- [ ] **R0-1** `scripts/pool_health.py` 账号池分诊（失败原因分类；每账号至多一次轻量验证、challenge/429 即停；报告零凭证）
+- [ ] **R0-2** 代理/IP 一致性固化（session 元数据记录建立出口；预检不一致拒跑；**统一 README 等文档中 `--no-proxy` 示例口径**）
+- [ ] **R0-3** 会话建立作业（本机新账号场景：按登录 SOP 谨慎首暖，一号一次、间隔执行、同出口；有浏览器登录态的号优先走 Cookie 导出路径 A/B）；目标健康池 **≥5**（自定门槛；≥3 可跑受控小批、<3 不开批）
+- [ ] **R0-4** 候选池持久化 + `--resume` 断点续跑 + 失败重试队列（耗尽→Review，COLLECT-02）+ `tests/test_resume.py`
+- [ ] **R0-5** 暖 Session 保活巡检（坏号立即移出保活；参数入 config）
+- [ ] **R0-6** 版本/文档统一（视 E0-5：回推或重建；同步修订 ARCHITECTURE.md 的 Modash-first 口径）
+- [ ] **R0-7** 开批预检门（健康池/代理/config SHA/目录契约，零 IG 请求）
+- [ ] **R0-8** run 审计跨 run 关联（batch 归组，为 P2-1 打底）
+
+## P0 决策可复现（纯离线，零烧号；13 项）
+
+- [ ] **P0-1** `config/sop_v2.toml` 全量口径（§2.5 全表 22 组含 discovery/modash_budget/CONFLICT 标注）+ `modash_cost_policy.toml`
+- [ ] **P0-2** `extensions/sop_v2/contracts.py`（FieldEvidence/GateResult/ScoreItem/BatchManifest）
+- [ ] **P0-3** `extensions/sop_v2/merge.py` 多源合并（merge_priority 驱动、冲突不覆盖）
+- [ ] **P0-4** Modash 三通道适配：`search_pool_import.py`（主发现，13 字段契约）/ `lookup_log.py`（Profile 补数+预算台账）/ `import_modash_export.py`（仅 shortlist）
+- [ ] **P0-5** `gates.py` 硬门槛引擎（GATE-01..12 + 可采集性；全部半开区间边界用例）
+- [ ] **P0-6** `scoring.py`（A-F、N/A 归一化、AI Score、9.5 封顶；golden fixtures）
+- [ ] **P0-7** `routing.py`（固定 Review 七项优先 → Lifestyle 封顶 → 分层 → 五池互斥）
+- [ ] **P0-8** `run_v2.py` 编排（同输入逐字节可复现）
+- [ ] **P0-9** `export_v2_xlsx.py` 五池 8 sheet（Herman 空列；缺失不填 0）
+- [ ] **P0-10** `discover.py --v2-collect` 七点旗标（双闸旁路/track 放宽/30 帖/置顶/评论采样/旧线停用/`--handle-pool`）；不带旗标逐字节回归
+- [ ] **P0-11** 测试套件 + 合成 fixtures（可用初跑证据包脱敏结构）
+- [ ] **P0-12** 离线回归：初跑 scan cache 跑 run_v2 新旧对照
+- [ ] **P0-13** 脱敏扫描 + 无外发断言（`tests/test_redaction.py` + 交付前钩子）
+
+## P1 证据与人工节点（5 项）
+
+- [ ] **P1-1** `import_manual_evidence.py`（Raw Skin/VO/风险/报价模板；Lifestyle 提升同通道）
+- [ ] **P1-2** Storefront 活跃度 + LTK 人工穿透工作流
+- [ ] **P1-3** CPM 计算（非置顶近 10 Reels 均播；Gifting F1=N/A；35/40/40.01 断言）
+- [ ] **P1-4** Modash Profile 补数执行流（yibo Chrome 只读；30 天缓存优先；预算触线即停）
+- [ ] **P1-5** 互动集中度异常检测（≥5 帖且 ≥70%→Review）
+
+## 首批验收 Runbook（R0 预检门 + P0 + P1 完成后；9 步）
+
+- [ ] **RB-0** 预检门通过（健康 Session ≥5、代理一致、config SHA 锁定）
+- [ ] **RB-1** 建批：显式选 track；Handle 池目标 100-300 → Include 1-10 不凑数
+- [ ] **RB-2** 发现：a) Modash 模板搜索（新动作先 canary，结果页只读 → search_pool_import）；b) IG 种子辅助（--v2-collect --warm-only --wait-pool，可 --resume）
+- [ ] **RB-3** verify_browser.py Storefront 三态核验
+- [ ] **RB-4** Modash 补数（缓存→Profile 队列 ≤20/轮→shortlist 导出+字段映射确认）
+- [ ] **RB-5** 人工证据录入（Raw Skin/VO/风险/报价）
+- [ ] **RB-6** run_v2 → 五池 → XLSX + HTML + manifest → 脱敏扫描
+- [ ] **RB-7** 人工抽查全部 Include + ≥20 条 Review/Exclude；同 raw 重跑一致性
+- [ ] **RB-8** 交付 → Herman 回填回导 → CONFLICT 台账（9 条，见 v1.3.1 §5）请客户裁定 → 只把明确确认的规则写回 config
+
+## P2 稳定运营（5 项）
+
+- [ ] **P2-1** batch manifest + 证据索引落盘
+- [ ] **P2-2** HTML 审计 V2 段（五池/gate 原值/A-F/CONFLICT/新旧对照）
+- [ ] **P2-3** Herman 反馈回导 + 批准者回流通道A种子 + 负向标签
+- [ ] **P2-4** 质量看板（批准率/五池比例/缺失率/淘汰率/误收误杀代理率/预算消耗/池健康）
+- [ ] **P2-5** `MODASH_OPERATIONS.md` 操作规范（docx §12 七步 + 成本纪律 + 白名单）
+
+## 建议执行顺序（并行轨道）
+
+```
+轨道一(采集/运维): E0-2/3 → R0-1/2/3(等账号) → R0-4/5/7 → R0-8
+轨道二(离线规则):  E0-1/5 → P0-1/2 → P0-3/4/5/6/7(可并行) → P0-8/9 → P0-11/12/13
+轨道三(采集改造):  P0-10(依赖 P0-1 的 config; 在线验证依赖轨道一)
+汇合:             P1 全部 → RB-0..8 首批 → P2
+```
+
+## 外部待办（阻塞标记）
+
+| 项 | 谁 | 阻塞什么 |
+|---|---|---|
+| 提供 IG 账号（username----password----totp_secret） | 负责人 | E0-2 → R0-3 → 一切在线测试 |
+| 操作机文件是否可拷贝（E0-5 拍板） | 负责人 | R0-6 走回推还是重建 |
+| 本机代理出口口径（有无 Clash） | 负责人/运维 | E0-3 → R0-2/3 |
+| 新 Search/AI/Lookalike/Save 首次 canary | 开发（RB-2 前执行） | Modash 模板批量执行 |
+| Raw Skin/VO 人工核验执行人 | 客户/负责人 | P1-1 证据供给 |
+| Paid 实际报价来源 | 客户 | F 模块（缺则固定 Review，不阻塞交付） |
+| CONFLICT 台账 9 条裁定 | 客户（随首批交付） | 下一版 config |
+| 阶段 9"触达/合作结果记录"是否本期范围 | 客户（随首批交付） | P2-3 回导模板列（暂按范围外） |
