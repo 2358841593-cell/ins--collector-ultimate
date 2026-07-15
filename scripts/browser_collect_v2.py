@@ -86,8 +86,13 @@ BRAND_CATEGORIES = ("cosmetic", "skin care service", "product", "shopping", "ret
                     "brand", "store", "company", "e-commerce", "wholesale")
 
 
-def fetch_profile_il(L, handle):
-    """instaloader 取 profile 字段。返回 dict 或 None（失败）。"""
+def fetch_profile_il(L, handle, use_cache=True):
+    """取 profile 浅扫字段：先查缓存库（命中新鲜即用，零 IG 请求），否则 instaloader 扫 + 回写库。"""
+    from extensions.sop_v2 import creator_cache
+    if use_cache:
+        cached = creator_cache.get(handle, max_age_days=30)
+        if cached:
+            return cached
     import instaloader
     try:
         p = instaloader.Profile.from_username(L.context, handle)
@@ -95,13 +100,21 @@ def fetch_profile_il(L, handle):
         return None
     cat = (p.business_category_name or "").lower()
     is_brand = bool(p.is_business_account) and any(k in cat for k in BRAND_CATEGORIES)
-    return {
+    pf = {
+        "handle": handle,
         "full_name": p.full_name, "follower_count": p.followers, "media_count": p.mediacount,
         "biography": p.biography, "external_url": p.external_url or None,
         "is_verified": p.is_verified, "is_private": p.is_private,
         "is_business": bool(p.is_business_account), "category": p.business_category_name,
         "brand_account_type": "brand" if is_brand else "personal",
     }
+    # 赛道也存（浅扫可判）
+    pf["core_niche_key"] = content_mod.derive_niche(pf.get("biography"), pf.get("full_name"))
+    try:
+        creator_cache.upsert(pf)
+    except Exception:  # noqa: BLE001
+        pass
+    return pf
 
 
 def open_ctx(pw, acct, proxy, headless=True):
@@ -153,6 +166,7 @@ def collect_candidate(L, pg, handle, ev_dir, n_posts=8):
         cand["_skipped"] = "brand_account"
         # 仍从外链判 storefront（品牌号也可能有橱窗，供参考）
         _resolve_storefront(cand, pg)
+        _cache_save(cand)
         return cand, ev
 
     # 2) 渲染 profile 页取帖子网格（评论截图用）
@@ -209,7 +223,16 @@ def collect_candidate(L, pg, handle, ev_dir, n_posts=8):
 
     # 4) Storefront（instaloader 已给外链）
     _resolve_storefront(cand, pg)
+    _cache_save(cand)   # 完整浅扫数据回写缓存库（含 storefront + 精化赛道）
     return cand, ev
+
+
+def _cache_save(cand):
+    try:
+        from extensions.sop_v2 import creator_cache
+        creator_cache.upsert(cand)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _resolve_storefront(cand, pg):
