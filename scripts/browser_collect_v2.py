@@ -88,15 +88,27 @@ def _pause(a=4.0, b=8.0):
     time.sleep(random.uniform(a, b))
 
 
-def collect_candidate(pg, handle, ev_dir, sample_posts=3):
-    """采一个候选：profile + 帖子 + 评论区截图。返回候选 dict + 证据列表。"""
+def _goto(pg, url, tries=3):
+    """代理抖动时重试导航。"""
+    for t in range(tries):
+        try:
+            pg.goto(url, wait_until="domcontentloaded", timeout=60000)
+            return True
+        except Exception:  # noqa: BLE001
+            time.sleep(random.uniform(3, 6))
+    return False
+
+
+def collect_candidate(pg, handle, ev_dir, n_posts=8):
+    """采一个候选：profile + N 帖赞评（IG ER）+ 评论区截图 + Storefront 穿透。"""
     ev = []
     cand = {"handle": handle, "profile_url": f"https://www.instagram.com/{handle}/",
             "discovery_source": "Modash Discover / ai_search", "discovered_via": "modash_search",
             "captured_at": time.strftime("%Y-%m-%d %H:%M")}
 
     # 1) profile 页
-    pg.goto(f"https://www.instagram.com/{handle}/", wait_until="domcontentloaded", timeout=60000)
+    if not _goto(pg, f"https://www.instagram.com/{handle}/"):
+        return None, "profile_goto_failed"
     pg.wait_for_timeout(6000)
     get_prof = r"""() => {
       const meta=(p)=>{const e=document.querySelector(`meta[property="${p}"]`);return e?e.content:null;};
@@ -130,36 +142,66 @@ def collect_candidate(pg, handle, ev_dir, sample_posts=3):
                "source_url": cand["profile_url"], "captured_at": _now()})
     _pause()
 
-    # 2/3) 采样帖子 → 评论区截图
+    # 2/3) 开 N 个帖子：取赞评（算 IG ER）+ 前几个截评论区
     codes = prof.get("codes") or []
     posts_meta = []
     comment_shots = []
-    for i, href in enumerate(codes[:sample_posts]):
-        pg.goto(f"https://www.instagram.com{href}", wait_until="domcontentloaded", timeout=60000)
-        pg.wait_for_timeout(7000)
-        pmeta = pg.evaluate(r"""() => {
+    shot_n = min(4, len(codes))          # 截前 4 个帖的评论区作证据
+    for i, href in enumerate(codes[:n_posts]):
+        if not _goto(pg, f"https://www.instagram.com{href}"):
+            continue
+        pg.wait_for_timeout(5500)
+        pm = pg.evaluate(r"""() => {
           const meta=(p)=>{const e=document.querySelector(`meta[property="${p}"]`);return e?e.content:null;};
-          const cm=(document.querySelector('svg[aria-label*="Comment"],svg[aria-label*="评论"]')||{});
-          return {caption: meta('og:description')||'', video: !!meta('og:video'),
-                  media: meta('og:video')||meta('og:image')||''};
-        }""")
-        shot = ev_dir / f"comments_{i+1:02d}.png"
-        pg.screenshot(path=str(shot))
-        comment_shots.append(str(shot.relative_to(ROOT)))
-        ev.append({"type": "comment_area", "path": str(shot.relative_to(ROOT)),
-                   "source_url": f"https://www.instagram.com{href}", "captured_at": _now(),
-                   "note": "供视觉读购买意图评论"})
-        posts_meta.append({"code": href, "caption": pmeta.get("caption", ""),
-                           "is_video": pmeta.get("video"), "media_url": pmeta.get("media", "")})
-        _pause()
+          return {caption: meta('og:description')||'', video: !!meta('og:video')}; }""")
+        posts_meta.append({"code": href, "caption": pm.get("caption", ""), "is_video": pm.get("video")})
+        if i < shot_n:
+            shot = ev_dir / f"comments_{i+1:02d}.png"
+            pg.screenshot(path=str(shot))
+            comment_shots.append(str(shot.relative_to(ROOT)))
+            ev.append({"type": "comment_area", "path": str(shot.relative_to(ROOT)),
+                       "source_url": f"https://www.instagram.com{href}", "captured_at": _now(),
+                       "note": "供视觉读购买意图评论 + 赞评数"})
+        _pause(3, 6)
 
     cand["comment_shots"] = comment_shots
     cand["sampled_posts"] = posts_meta
-    # 内容信号（从 caption 派生；赞助/导购/成分等）
+    # 内容信号（赞助/导购/成分词，从 caption 派生；赞评 ER 后续视觉读截图补）
     cand["posts"] = [{"caption_text": p["caption"], "media_type": 2 if p["is_video"] else 1,
                       "like_count": None, "comment_count": None, "play_count": 0} for p in posts_meta]
     cand.update(content_mod.derive_content_signals(cand, _CFG))
     cand.pop("posts", None)
+
+    # 4) Storefront：从 profile 页读 bio 外链 → 穿透（用于门槛，不作评论证据）
+    ext = None
+    try:
+        ext = pg.evaluate(r"""() => { const a=[...document.querySelectorAll('a[href]')]
+          .map(x=>x.href).find(h=>/l\.instagram\.com|linktr\.ee|beacons|linktree|amazon\.|amzn|shopmy|liketoknow|stan\.store/i.test(h)); return a||null; }""")
+    except Exception:  # noqa: BLE001
+        ext = None
+    cand["external_url"] = ext
+    cand["bio_links"] = [ext] if ext else []
+    joined = (ext or "").lower()
+    if any(a in joined for a in AMAZON):
+        cand["storefront_status"] = "confirmed_yes"
+        cand["amazon_storefront_link"] = ext
+    elif any(g in joined for g in AGG):
+        # 穿透聚合页：用当前页开聚合页读真实出链（不嵌套 playwright、不截图）
+        cand["storefront_status"] = "unknown"
+        if _goto(pg, ext):
+            pg.wait_for_timeout(4000)
+            amz = pg.evaluate(r"""() => { const hs=[...document.querySelectorAll('a[href]')].map(a=>a.href);
+              const shop=hs.find(h=>/amazon\.[a-z.]+\/(shop|storefront)/i.test(h));
+              const any=hs.find(h=>/amazon\.|amzn\.to/i.test(h)); return shop||any||null; }""")
+            if amz:
+                cand["storefront_status"] = "confirmed_yes"
+                cand["amazon_storefront_link"] = amz
+            else:
+                cand["storefront_status"] = "confirmed_no"
+    elif ext:
+        cand["storefront_status"] = "unknown"
+    else:
+        cand["storefront_status"] = "confirmed_no"
     return cand, ev
 
 
@@ -190,7 +232,7 @@ def main():
     ap.add_argument("--batch-id", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--limit", type=int, default=0)
-    ap.add_argument("--sample-posts", type=int, default=3)
+    ap.add_argument("--posts", type=int, default=8, help="每候选开几个帖子取赞评算 IG ER")
     args = ap.parse_args()
 
     proxy = load_proxy()
@@ -223,24 +265,26 @@ def main():
             try:
                 ctx = open_ctx(pw, acct, proxy)
                 pg = ctx.pages[0] if ctx.pages else ctx.new_page()
-                cand, ev = collect_candidate(pg, h, ev_dir, args.sample_posts)
+                cand, ev = collect_candidate(pg, h, ev_dir, args.posts)
                 if cand is None:
                     print(f"     ✗ {ev}", flush=True)
                     cands.append({"handle": h, "collect_failed": True, "note": ev, "campaign_track": None})
                 else:
-                    cand["general_er"] = _erf(rec.get("er"))
-                    cand["storefront_status"] = None  # 由后续穿透补
+                    cand["modash_er"] = _erf(rec.get("er"))   # Modash ER 作参考并列
                     for e in ev:
                         e["handle"] = h
                         evidence_index.append(e)
                     cands.append(cand)
-                    print(f"     ✓ {len(cand.get('comment_shots',[]))} 张评论截图", flush=True)
+                    print(f"     ✓ {len(cand.get('comment_shots',[]))}评论截图 · 赞助={cand.get('sponsorship_saturation')} · 橱窗={cand.get('storefront_status')} · 粉丝={cand.get('follower_count')}", flush=True)
             except Exception as e:  # noqa: BLE001
                 print(f"     ✗ {type(e).__name__}: {str(e)[:60]}", flush=True)
                 cands.append({"handle": h, "collect_failed": True, "campaign_track": None})
             finally:
                 if ctx:
                     ctx.close()
+            # 增量保存：每候选后写盘，中途失败也不丢已采数据
+            Path(args.out).write_text(json.dumps(cands, ensure_ascii=False, indent=2))
+            (batch_ev / "evidence_index.json").write_text(json.dumps(evidence_index, ensure_ascii=False, indent=2))
             _pause(6, 12)  # 候选间更长停顿
 
     Path(args.out).write_text(json.dumps(cands, ensure_ascii=False, indent=2))
