@@ -94,14 +94,15 @@ def _cell(cand: dict, key: str):
     if key == "missing_data":
         return "; ".join(cand.get("missing_data") or []) or ""
     if key == "evidence_link":
+        import os
         parts = []
         if cand.get("profile_url"):
             parts.append(cand["profile_url"])
         ev = cand.get("storefront_evidence") or {}
+        if ev.get("source_url"):
+            parts.append(f"Storefront 核验: {ev['source_url']}")
         if ev.get("screenshot"):
-            parts.append(f"storefront 截图: {ev['screenshot']}")
-        elif ev.get("source_url"):
-            parts.append(f"storefront: {ev['source_url']}")
+            parts.append(f"截图: evidence/{os.path.basename(ev['screenshot'])}")  # 相对引用，不暴露本机路径
         return " | ".join(parts) or MISSING
     if key == "score_af":
         sm = cand.get("score_by_module") or {}
