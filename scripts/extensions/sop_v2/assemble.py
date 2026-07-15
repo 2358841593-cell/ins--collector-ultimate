@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import re
 import sys
 import time
@@ -140,10 +141,18 @@ def _collect_comments(cand: dict, account: str, headless: bool):
     cand["high_intent_snippets"] = res["top_intent"]
 
 
+def _load_accounts():
+    """从 .secrets/chrome-instagram-profiles/ 读所有已建登录态 profile 账号名。"""
+    base = Path(__file__).resolve().parents[2].parent / ".secrets" / "chrome-instagram-profiles"
+    if base.exists():
+        return sorted([p.name for p in base.iterdir() if p.is_dir()])
+    return []
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--pool", required=True, help="modash handle 池 JSON")
-    ap.add_argument("--account", required=True, help="用哪个登录态 profile 采集")
+    ap.add_argument("--accounts", default=None, help="逗号分隔账号名；缺省=全部已建 profile 轮换")
     ap.add_argument("--out", required=True)
     ap.add_argument("--limit", type=int, default=0, help="只采前 N 个（0=全部）")
     ap.add_argument("--penetrate", action="store_true", help="对未确认 Storefront 做浏览器穿透")
@@ -154,28 +163,46 @@ def main() -> int:
     PENETRATE = args.penetrate
     COMMENTS = args.comments
 
+    accounts = [a.strip() for a in args.accounts.split(",")] if args.accounts else _load_accounts()
+    if not accounts:
+        raise SystemExit("无可用登录态 profile（先跑 pool_health.py 建池）")
+    print(f"账号池轮换：{accounts}")
+
     pool = json.loads(Path(args.pool).read_text())
     recs = pool.get("candidates", pool)
     if args.limit:
         recs = recs[:args.limit]
 
     cands = []
+    n_acc = len(accounts)
     for i, rec in enumerate(recs):
         h = (rec.get("handle") or "").lstrip("@")
         if not h:
             continue
         rec.setdefault("search_mode", pool.get("search_mode"))
-        print(f"  [{i+1}/{len(recs)}] 采集 @{h} …")
+        acct = accounts[i % n_acc]
+        print(f"  [{i+1}/{len(recs)}] 采集 @{h} · 用 {acct} …")
+        cand = None
         try:
-            cands.append(assemble_one(h, rec, args.account, headless=not args.show_head))
+            cand = assemble_one(h, rec, acct, headless=not args.show_head)
+            # web_profile_info 失败（只拿到 og 粉丝数）→ 换号重试一次
+            if cand.get("_profile_source") == "browser:og_description":
+                alt = accounts[(i + 1) % n_acc]
+                print(f"    ↻ web_profile_info 回退，换 {alt} 重试 …")
+                time.sleep(random.uniform(2, 4))
+                retry = assemble_one(h, rec, alt, headless=not args.show_head)
+                if retry.get("_profile_source") == "browser:web_profile_info":
+                    cand = retry
         except Exception as e:  # noqa: BLE001
             print(f"    采集失败：{type(e).__name__}: {e} → 标记 collect_failed")
-            cands.append({"handle": h, "collect_failed": True,
-                          "discovery_source": "modash_search", "campaign_track": None})
-        time.sleep(3.0)  # 拟人停顿
+            cand = {"handle": h, "collect_failed": True,
+                    "discovery_source": "modash_search", "campaign_track": None}
+        cands.append(cand)
+        time.sleep(random.uniform(2.5, 5.5))  # 拟人停顿
 
     Path(args.out).write_text(json.dumps(cands, ensure_ascii=False, indent=2))
-    print(f"组装 {len(cands)} 候选 → {args.out}")
+    ok = sum(1 for c in cands if c.get("_profile_source") == "browser:web_profile_info")
+    print(f"组装 {len(cands)} 候选（{ok} 个全字段）→ {args.out}")
     return 0
 
 
