@@ -136,15 +136,24 @@ def _pause(a=4.0, b=8.0):
     time.sleep(random.uniform(a, b))
 
 
-def _goto(pg, url, tries=3):
+def _goto(pg, url, tries=2):
     """代理抖动时重试导航。"""
     for t in range(tries):
         try:
-            pg.goto(url, wait_until="domcontentloaded", timeout=60000)
+            pg.goto(url, wait_until="domcontentloaded", timeout=45000)
             return True
         except Exception:  # noqa: BLE001
-            time.sleep(random.uniform(3, 6))
+            time.sleep(random.uniform(2, 4))
     return False
+
+
+def _shot(pg, path):
+    """安全截图：短超时 + 失败跳过（不卡在字体加载 30 秒）。"""
+    try:
+        pg.screenshot(path=str(path), timeout=8000, animations="disabled")
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def collect_candidate(L, pg, handle, ev_dir, n_posts=8):
@@ -186,29 +195,28 @@ def collect_candidate(L, pg, handle, ev_dir, n_posts=8):
         pg.wait_for_timeout(3500)
         g = pg.evaluate(get_codes)
     prof = {"codes": g.get("codes", [])}
-    _pause()
+    _pause(2, 4)
 
     # 2/3) 开 N 个帖子：取赞评（算 IG ER）+ 前几个截评论区
     codes = prof.get("codes") or []
     posts_meta = []
     comment_shots = []
-    shot_n = min(4, len(codes))          # 截前 4 个帖的评论区作证据
+    shot_n = min(2, len(codes))          # 截前 2 个帖的评论区作证据（够读购买意图）
     for i, href in enumerate(codes[:n_posts]):
         if not _goto(pg, f"https://www.instagram.com{href}"):
             continue
-        pg.wait_for_timeout(5500)
+        pg.wait_for_timeout(4000)
         pm = pg.evaluate(r"""() => {
           const meta=(p)=>{const e=document.querySelector(`meta[property="${p}"]`);return e?e.content:null;};
           return {caption: meta('og:description')||'', video: !!meta('og:video')}; }""")
         posts_meta.append({"code": href, "caption": pm.get("caption", ""), "is_video": pm.get("video")})
-        if i < shot_n:
-            shot = ev_dir / f"comments_{i+1:02d}.png"
-            pg.screenshot(path=str(shot))
-            comment_shots.append(str(shot.relative_to(ROOT)))
-            ev.append({"type": "comment_area", "path": str(shot.relative_to(ROOT)),
+        if i < shot_n and _shot(pg, ev_dir / f"comments_{i+1:02d}.png"):
+            rel = str((ev_dir / f"comments_{i+1:02d}.png").relative_to(ROOT))
+            comment_shots.append(rel)
+            ev.append({"type": "comment_area", "path": rel,
                        "source_url": f"https://www.instagram.com{href}", "captured_at": _now(),
                        "note": "供视觉读购买意图评论 + 赞评数"})
-        _pause(3, 6)
+        _pause(2, 4)
 
     cand["comment_shots"] = comment_shots
     cand["sampled_posts"] = posts_meta
@@ -290,7 +298,7 @@ def main():
     ap.add_argument("--batch-id", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--limit", type=int, default=0)
-    ap.add_argument("--posts", type=int, default=8, help="每候选开几个帖子取赞评算 IG ER")
+    ap.add_argument("--posts", type=int, default=4, help="每候选开几个帖子取赞评算 IG ER")
     args = ap.parse_args()
 
     proxy = load_proxy()
@@ -345,7 +353,7 @@ def main():
             # 增量保存：每候选后写盘，中途失败也不丢已采数据
             Path(args.out).write_text(json.dumps(cands, ensure_ascii=False, indent=2))
             (batch_ev / "evidence_index.json").write_text(json.dumps(evidence_index, ensure_ascii=False, indent=2))
-            _pause(6, 12)  # 候选间更长停顿
+            _pause(4, 7)  # 候选间停顿
 
     Path(args.out).write_text(json.dumps(cands, ensure_ascii=False, indent=2))
     (batch_ev / "evidence_index.json").write_text(json.dumps(evidence_index, ensure_ascii=False, indent=2))
