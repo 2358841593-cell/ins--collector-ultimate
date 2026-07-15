@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""五池 XLSX 业务交付导出（P0-9 / DEL-01..08）。
+"""五池 XLSX 业务交付导出（专业可读版）。
 
-对齐客户 SOP §8 字段 + §13 原值/标准化/采集时间；采用可点真实链接（IG 主页 / Bio /
-Amazon 橱窗）+ 嵌入截图的证据 sheet（参考客户 sample.xlsx 呈现风格）。
-五个互斥决策池 + Batch Summary + 证据截图 + 说明。缺失显示"缺失"不填 0；Herman 两列空。
+对齐客户 SOP §8 字段；以"购买意向评论证据"为重点（客户核心诉求）；可点真实链接
+（IG 主页 / Amazon 橱窗）；评论区截图嵌入证据 sheet 并内链跳转。
+风格：色标验收建议 + 隔行底纹 + 合理行高列宽 + 冻结窗格 + 自动筛选，专业可读。
 """
 from __future__ import annotations
 
@@ -13,259 +13,228 @@ import os
 from collections import Counter
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
 POOLS = ["Include-With-Storefront", "Include-Without-Storefront",
          "Priority-Review", "Review", "Exclude"]
 MISSING = "缺失"
-NICHE_LABEL = {"skincare": "Skincare", "beauty_device": "Beauty Device",
-               "beauty_wellness": "Beauty/Wellness", "lifestyle": "Lifestyle", "other": "Other"}
+NICHE_LABEL = {"skincare": "护肤", "beauty_device": "美容仪器", "beauty_wellness": "美妆/健康",
+               "lifestyle": "生活方式", "other": "其他"}
+POOL_ZH = {"Include-With-Storefront": "纳入·有橱窗", "Include-Without-Storefront": "纳入·无橱窗",
+           "Priority-Review": "优先复核", "Review": "待复核", "Exclude": "已排除"}
 
-# 数据列（纯文本，对齐 SOP §8 + §13）
-DATA_COLS = [
-    ("Country", "country"),
-    ("Handle (IG)", "handle_at"),
-    ("Full Name", "full_name"),
-    ("Followers", "follower_count"),
-    ("Creator Niche", "niche_label"),
-    ("Fake / ER (%)", "fake_er"),
-    ("Amazon Storefront", "storefront_state"),
-    ("Sponsorship Saturation", "sponsorship_cell"),
-    ("Has VO & Raw Skin", "vo_rawskin"),
-    ("Elite Brand History", "elite_brand"),
-    ("AI Vetting Score (1-10)", "ai_reason"),
-    ("High-Intent Comments", "high_intent_snips"),
-    ("Review Reason", "review_reason"),
-    ("Exclude Reason", "exclude_reason"),
-    ("Missing Data", "missing_data"),
-    ("Discovery Source", "discovery_source"),
-    ("Normalized Total", "normalized_total"),
-    ("Score A-F", "score_af"),
-    ("Captured At", "captured_at"),
-    ("Herman Approval", "_blank"),
-    ("Herman's Feedback", "_blank"),
+# 配色（克制、专业）
+C_HEAD = "1F4E4A"       # 深墨绿表头
+C_STRIPE = "F4F7F6"     # 隔行浅底
+C_LINK = "1A6E64"
+POOL_FILL = {"Include-With-Storefront": "DCEEE4", "Include-Without-Storefront": "E4F0EA",
+             "Priority-Review": "FBF0D9", "Review": "FBF4E6", "Exclude": "F7E7E5"}
+POOL_FONT = {"Include-With-Storefront": "1E7A47", "Include-Without-Storefront": "1E7A47",
+             "Priority-Review": "9A6A1E", "Review": "9A6A1E", "Exclude": "AE3B37"}
+
+# 列定义：(标题, key, 宽, 是否wrap)
+COLS = [
+    ("验收建议", "verdict", 12, False),
+    ("Handle", "handle_at", 20, False),
+    ("全名", "full_name", 22, False),
+    ("粉丝", "follower_count", 9, False),
+    ("赛道", "niche", 11, False),
+    ("购买意向评论（原话）", "intent_snippet", 40, True),
+    ("评论证据", "comment_ev", 10, False),
+    ("Amazon 橱窗", "storefront_link", 14, False),
+    ("赞助占比", "sponsorship", 9, False),
+    ("Fake%（Modash）", "fake", 12, False),
+    ("ER 对照", "er_compare", 20, True),
+    ("AI 评分", "ai", 8, False),
+    ("结论", "summary", 30, True),
+    ("待补/原因", "reasons", 34, True),
+    ("主页", "profile", 8, False),
+    ("采集时间", "captured_at", 14, False),
+    ("Herman Approval", "_blank", 15, False),
+    ("Herman's Feedback", "_blank", 15, False),
 ]
-# 链接列（可点）：标题 → (取链接的函数 key, 显示文案)
-LINK_COLS = [
-    ("主页 (IG)", "ig", "打开 ↗"),
-    ("Bio 链接", "bio", "打开 ↗"),
-    ("Amazon 橱窗链接", "amazon", "打开 ↗"),
-    ("证据截图", "shot", "查看 →"),
-]
 
 
-def _link_url(cand, kind):
-    if kind == "ig":
-        return cand.get("profile_url") or f"https://instagram.com/{cand.get('handle','')}"
-    if kind == "bio":
-        ext = cand.get("external_url")
-        links = cand.get("bio_links") or []
-        return ext or (links[0] if links else None)
-    if kind == "amazon":
-        return cand.get("amazon_storefront_link") if cand.get("storefront_status") == "confirmed_yes" else None
-    if kind == "shot":
-        return (cand.get("storefront_evidence") or {}).get("screenshot")
-    return None
+def _verdict(pool):
+    return POOL_ZH.get(pool, pool)
 
 
-def _cell(cand, key):
+def _cell(c, key):
     if key == "_blank":
         return ""
-    if key == "country":
-        return cand.get("creator_country") or MISSING
+    if key == "verdict":
+        return _verdict(c.get("final_pool", "Review"))
     if key == "handle_at":
-        h = cand.get("handle") or ""
+        h = c.get("handle") or ""
         return h if h.startswith("@") else f"@{h}"
-    if key == "niche_label":
-        return NICHE_LABEL.get(cand.get("core_niche_key"), cand.get("core_niche_key") or MISSING)
-    if key == "fake_er":
-        fake = f"{cand['fake_pct']}% Fake" if cand.get("fake_pct") is not None else "— Fake"
-        er = f"{cand['general_er']}% ER" if cand.get("general_er") is not None else "— ER"
-        return f"{fake} / {er}"
-    if key == "storefront_state":
-        return {"confirmed_yes": "✓ 有橱窗", "confirmed_no": "确认无",
-                "unknown": "未确认"}.get(cand.get("storefront_status"), "未确认")
-    if key == "sponsorship_cell":
-        v = cand.get("sponsorship_saturation")
-        return f"{v}%" if v is not None else MISSING
-    if key == "vo_rawskin":
-        vo = {True: "Yes", False: "No"}.get(cand.get("has_vo"), "Pending")
-        return f"VO: {vo} / Raw Skin: {cand.get('raw_skin_grade') or 'Pending'}"
-    if key == "elite_brand":
-        h = cand.get("elite_brand_hits")
-        return f"命中 {h} 个" if h else ("无" if h == 0 else MISSING)
-    if key == "ai_reason":
-        ai = cand.get("ai_vetting_score")
-        return f"{ai} — {cand.get('decision_summary','')}" if ai is not None else cand.get("decision_summary", "")
-    if key == "high_intent_snips":
-        snips = cand.get("high_intent_snippets") or []
-        return " / ".join(snips[:2]) if snips else ("—" if cand.get("comments_analyzed") else "评论待采集")
-    if key == "review_reason":
-        return "；".join(cand.get("review_reasons_text") or []) or ""
-    if key == "exclude_reason":
-        return "；".join(cand.get("exclude_reasons_text") or []) or ""
-    if key == "missing_data":
-        return "; ".join(cand.get("missing_data") or []) or ""
-    if key == "score_af":
-        sm = cand.get("score_by_module") or {}
-        return " ".join(f"{m}:{sm[m]['earned']}/{sm[m]['available']}" if sm.get(m, {}).get("available")
-                        else f"{m}:N/A" for m in "ABCDEF" if m in sm)
+    if key == "full_name":
+        return c.get("full_name") or "—"
+    if key == "niche":
+        return NICHE_LABEL.get(c.get("core_niche_key"), c.get("core_niche_key") or "—")
+    if key == "intent_snippet":
+        snips = c.get("high_intent_snippets") or []
+        if snips:
+            return "\n".join(f"· {s}" for s in snips[:3])
+        return "无明显购买意向" if c.get("comments_read") else "待视觉读取"
+    if key == "comment_ev":
+        return "查看 →" if c.get("comment_shots") else "—"
+    if key == "storefront_link":
+        st = c.get("storefront_status")
+        if st == "confirmed_yes":
+            return "打开 ↗"
+        return {"confirmed_no": "确认无", "unknown": "未确认"}.get(st, "—")
+    if key == "sponsorship":
+        v = c.get("sponsorship_saturation")
+        return f"{v}%" if v is not None else "—"
+    if key == "fake":
+        v = c.get("fake_pct")
+        return f"{v}%" if v is not None else "待补"
+    if key == "er_compare":
+        mo = c.get("modash_er")
+        ig = c.get("ig_er")
+        parts = []
+        parts.append(f"Modash {mo}%" if mo is not None else "Modash —")
+        parts.append(f"IG实算 {ig}%" if ig is not None else "IG 待读")
+        return " / ".join(parts)
+    if key == "ai":
+        return c.get("ai_vetting_score") if c.get("ai_vetting_score") is not None else "—"
+    if key == "summary":
+        return c.get("decision_summary") or ""
+    if key == "reasons":
+        r = (c.get("review_reasons_text") or []) + (c.get("exclude_reasons_text") or [])
+        return "；".join(r) or "—"
+    if key == "profile":
+        return "打开 ↗"
     if key == "captured_at":
-        return cand.get("captured_at") or ""
-    v = cand.get(key)
+        return c.get("captured_at") or ""
+    v = c.get(key)
     return MISSING if v is None else v
+
+
+def _url(c, key):
+    if key == "profile":
+        h = (c.get("handle") or "").lstrip("@")
+        return c.get("profile_url") or f"https://www.instagram.com/{h}/"
+    if key == "storefront_link" and c.get("storefront_status") == "confirmed_yes":
+        return c.get("amazon_storefront_link")
+    return None
 
 
 def build_workbook(decisions):
     from openpyxl import Workbook
     from openpyxl.drawing.image import Image as XLImage
-    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
     from openpyxl.utils import get_column_letter
 
-    LINK_FONT = Font(color="1F6E6A", underline="single", size=10)
-    HEAD_FILL = PatternFill("solid", fgColor="0E6E62")
-    HEAD_FONT = Font(bold=True, color="FFFFFF", size=10)
     cands = decisions.get("candidates", [])
+    head_font = Font(bold=True, color="FFFFFF", size=10.5, name="Microsoft YaHei")
+    head_fill = PatternFill("solid", fgColor=C_HEAD)
+    link_font = Font(color=C_LINK, underline="single", size=10)
+    base_font = Font(size=10, name="Microsoft YaHei")
+    thin = Side(style="thin", color="E0E4E2")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    wrap = Alignment(wrap_text=True, vertical="top")
+    center = Alignment(horizontal="center", vertical="center")
 
     wb = Workbook()
 
-    # ── 证据截图 sheet（先建，拿到每个 handle 的锚点行）──
+    # ── 证据截图 sheet（评论区）──
     wse = wb.active
-    wse.title = "证据截图"
-    wse.cell(1, 1, "Amazon / 电商橱窗 浏览器核验截图 · 证据存档").font = Font(bold=True, size=12)
-    wse.cell(2, 1, "由 Playwright 真实 Chrome 抓取；点候选表『证据截图』列跳到对应截图，点链接看实时页").font = Font(size=9, color="5E6672")
-    wse.column_dimensions["A"].width = 42
+    wse.title = "评论证据"
+    wse.cell(1, 1, "评论区截图 · 购买意向证据（浏览器真实抓取）").font = Font(bold=True, size=13, name="Microsoft YaHei")
+    wse.cell(2, 1, "每个候选取近帖评论区截图；点候选表『评论证据』列跳到对应截图").font = Font(size=9, color="5E6672")
+    wse.column_dimensions["A"].width = 46
     anchor = {}
     er = 4
     for c in cands:
-        ev = c.get("storefront_evidence") or {}
-        shot = ev.get("screenshot")
-        if not (shot and os.path.exists(shot)):
+        shots = c.get("comment_shots") or []
+        shots = [s for s in shots if (ROOT / s).exists()]
+        if not shots:
             continue
         h = c.get("handle")
         anchor[h] = er
-        hc = wse.cell(er, 1, f"@{h}")
-        hc.font = Font(bold=True, size=10)
-        src = ev.get("source_url")
-        if src:
-            sc = wse.cell(er, 2, "打开实时页 ↗")
-            sc.hyperlink = src
-            sc.font = LINK_FONT
-        try:
-            img = XLImage(shot)
-            # 缩略到宽约 360px 保持比例
-            if img.width and img.height:
-                ratio = 360 / img.width
-                img.width = 360
-                img.height = int(img.height * ratio)
-            wse.add_image(img, f"A{er + 1}")
-        except Exception:  # noqa: BLE001
-            pass
-        er += 22  # 每张截图留高度
+        hc = wse.cell(er, 1, f"@{h} · {c.get('full_name') or ''}")
+        hc.font = Font(bold=True, size=11, name="Microsoft YaHei")
+        row = er + 1
+        for sp in shots[:4]:
+            try:
+                img = XLImage(str(ROOT / sp))
+                ratio = 300 / img.width if img.width else 1
+                img.width = 300
+                img.height = int((img.height or 400) * ratio)
+                wse.add_image(img, f"A{row}")
+                row += 16
+            except Exception:  # noqa: BLE001
+                pass
+        er = row + 2
 
     # ── Batch Summary ──
-    ws = wb.create_sheet("Batch Summary", 0)
+    ws = wb.create_sheet("批次总览", 0)
     meta = decisions.get("manifest", {})
-    pools_count = Counter(c.get("final_pool", "Review") for c in cands)
-    exc_reasons = Counter()
-    for c in cands:
-        for r in (c.get("exclude_reasons_text") or []):
-            exc_reasons[r] += 1
-    ers = [c["general_er"] for c in cands if c.get("general_er") is not None]
-    if ers:
-        over2 = sum(1 for e in ers if e > 2.0)
-        er_finding = (f"本批 {len(ers)} 个有 Modash ER：区间 {min(ers):.2f}%–{max(ers):.2f}%，"
-                      f"其中 >2%(硬门槛)仅 {over2} 个（{over2 * 100 // len(ers)}%）。"
-                      f"红光/LED 护肤设备赛道互动率普遍偏低，建议客户校准该赛道 ER 门槛。")
-    else:
-        er_finding = "本批无 Modash ER 值（待补数）。"
-    sf_confirmed = [c["handle"] for c in cands if c.get("storefront_status") == "confirmed_yes"]
+    pc = Counter(c.get("final_pool", "Review") for c in cands)
+    sf = [c["handle"] for c in cands if c.get("storefront_status") == "confirmed_yes"]
+    ws.cell(1, 1, "Instagram 红人筛选 · 交付总览").font = Font(bold=True, size=15, name="Microsoft YaHei")
     rows = [
-        ("批次报告", "Instagram 红人筛选 · SOP V2 交付"),
-        ("Batch ID", meta.get("batch_id", "")),
-        ("SOP 版本", meta.get("sop_version", "")),
-        ("Campaign Track", meta.get("campaign_track", "")),
+        ("批次", meta.get("batch_id", "")),
         ("生成时间", decisions.get("generated_at", "")),
-        ("", ""),
+        ("Campaign Track", meta.get("campaign_track", "")),
         ("候选总数", len(cands)),
-        ("— Include (With Storefront)", pools_count.get("Include-With-Storefront", 0)),
-        ("— Include (Without Storefront)", pools_count.get("Include-Without-Storefront", 0)),
-        ("— Priority Review", pools_count.get("Priority-Review", 0)),
-        ("— Review", pools_count.get("Review", 0)),
-        ("— Exclude", pools_count.get("Exclude", 0)),
+        ("纳入·有橱窗 / 无橱窗", f"{pc.get('Include-With-Storefront',0)} / {pc.get('Include-Without-Storefront',0)}"),
+        ("优先复核 / 待复核 / 已排除", f"{pc.get('Priority-Review',0)} / {pc.get('Review',0)} / {pc.get('Exclude',0)}"),
+        ("确认有 Amazon 橱窗", f"{len(sf)} 个"),
         ("", ""),
-        ("确认有 Amazon 橱窗", f"{len(sf_confirmed)} 个：{', '.join('@' + h for h in sf_confirmed)}" or "0"),
-        ("主要淘汰原因", "；".join(f"{k}×{v}" for k, v in exc_reasons.most_common(4)) or "—"),
-        ("★ 校准发现（ER 分布）", er_finding),
-        ("", ""),
-        ("阅读说明", "五个 sheet 为互斥决策池，同一候选只出现一次。缺失显示「缺失」，不等于 0。"),
-        ("", "链接列（主页/Bio/Amazon 橱窗）可直接点击核验；证据截图列跳到浏览器核验现场截图。"),
-        ("", "AI Vetting Score 1-10；分层用 Normalized Total。Herman 两列供客户回填。"),
-        ("Modash 补数说明", "本批未逐个开 Modash Profile（受众/假粉/国家/语言待补），相关候选按 SOP 固定进 Review。"),
+        ("阅读说明", "五个决策池互斥，一人一池。『验收建议』色标区分；『购买意向评论』是核心，评论证据列可跳截图。"),
+        ("链接", "Handle/主页/Amazon 橱窗均可点击核验。"),
+        ("ER 口径", "Modash ER（近两月中位数，偏低）与 IG 实算 ER（近帖，部分藏赞）并列参考；本赛道 Modash ER 普遍<2%，硬门槛以可靠标准+购买意向评论为准。"),
+        ("Herman 两列", "供客户审批回填。"),
     ]
-    for r, (k, v) in enumerate(rows, 1):
-        ws.cell(r, 1, k).font = Font(bold=True)
-        ws.cell(r, 2, v).alignment = Alignment(wrap_text=True, vertical="top")
-    ws.column_dimensions["A"].width = 30
-    ws.column_dimensions["B"].width = 88
+    for r, (k, v) in enumerate(rows, 3):
+        ws.cell(r, 1, k).font = Font(bold=True, size=10.5, name="Microsoft YaHei")
+        cell = ws.cell(r, 2, v)
+        cell.alignment = wrap
+        cell.font = base_font
+    ws.column_dimensions["A"].width = 26
+    ws.column_dimensions["B"].width = 96
 
     # ── 五池 sheet ──
     by_pool = {p: [] for p in POOLS}
     for c in cands:
         by_pool.setdefault(c.get("final_pool", "Review"), []).append(c)
-    titles = [t for t, _ in DATA_COLS] + [t for t, _, _ in LINK_COLS]
 
     for pool in POOLS:
-        ws = wb.create_sheet(pool[:31])
-        for col, t in enumerate(titles, 1):
-            cell = ws.cell(1, col, t)
-            cell.font = HEAD_FONT
-            cell.fill = HEAD_FILL
-        for r, cand in enumerate(by_pool.get(pool, []), 2):
-            for col, (_, key) in enumerate(DATA_COLS, 1):
-                ws.cell(r, col, _cell(cand, key))
-            base = len(DATA_COLS)
-            for j, (_, kind, disp) in enumerate(LINK_COLS, 1):
-                col = base + j
-                if kind == "shot":
-                    a = anchor.get(cand.get("handle"))
-                    if a:
-                        cc = ws.cell(r, col, disp)
-                        cc.hyperlink = f"#证据截图!A{a}"
-                        cc.font = LINK_FONT
-                    else:
-                        ws.cell(r, col, "—")
-                    continue
-                url = _link_url(cand, kind)
-                if url:
-                    cc = ws.cell(r, col, disp)
-                    cc.hyperlink = url
-                    cc.font = LINK_FONT
-                else:
-                    ws.cell(r, col, "—")
+        ws = wb.create_sheet(POOL_ZH[pool][:31])
+        for j, (title, _, w, _wrap) in enumerate(COLS, 1):
+            cell = ws.cell(1, j, title)
+            cell.font = head_font
+            cell.fill = head_fill
+            cell.alignment = center
+            cell.border = border
+            ws.column_dimensions[get_column_letter(j)].width = w
+        ws.row_dimensions[1].height = 30
+        for r, c in enumerate(by_pool.get(pool, []), 2):
+            ws.row_dimensions[r].height = 46
+            for j, (_, key, _w, do_wrap) in enumerate(COLS, 1):
+                cell = ws.cell(r, j, _cell(c, key))
+                cell.border = border
+                cell.font = base_font
+                cell.alignment = wrap if do_wrap else Alignment(vertical="center")
+                if r % 2 == 0:
+                    cell.fill = PatternFill("solid", fgColor=C_STRIPE)
+                # 链接
+                u = _url(c, key)
+                if u:
+                    cell.hyperlink = u
+                    cell.font = link_font
+                if key == "comment_ev" and c.get("handle") in anchor:
+                    cell.hyperlink = f"#评论证据!A{anchor[c['handle']]}"
+                    cell.font = link_font
+                # 验收建议色标
+                if key == "verdict":
+                    cell.fill = PatternFill("solid", fgColor=POOL_FILL[pool])
+                    cell.font = Font(bold=True, size=10, color=POOL_FONT[pool], name="Microsoft YaHei")
+                    cell.alignment = center
         ws.freeze_panes = "C2"
         if by_pool.get(pool):
-            ws.auto_filter.ref = f"A1:{get_column_letter(len(titles))}{len(by_pool[pool]) + 1}"
-        ws.column_dimensions["B"].width = 22
-        ws.column_dimensions["C"].width = 24
-        ws.column_dimensions["K"].width = 34
-
-    # ── 说明 sheet ──
-    ws = wb.create_sheet("说明")
-    ws.cell(1, 1, "交付说明 · 字段与规则").font = Font(bold=True, size=12)
-    dd = [
-        ("五池", "Include-With/Without-Storefront / Priority-Review / Review / Exclude，互斥，一人一池"),
-        ("链接列", "主页/Bio/Amazon 橱窗均为可点真实链接；证据截图跳到浏览器核验现场截图"),
-        ("Amazon Storefront", "浏览器穿透聚合页读真实出链确认；有/无均可 Include，未知进 Review"),
-        ("Fake / ER (%)", "Modash 原值；ER 硬门槛 >2%，假粉硬门槛 <25%"),
-        ("AI Vetting Score", "1-10，附一句话理由；分层用 Normalized Total（≥75 Include / 65-75 Priority / 50-65 Review / <50 Exclude）"),
-        ("缺失 / N/A", "缺失=未采集/未补数，不等于 0；N/A=子项不适用，从评分分母移除"),
-        ("固定 Review", "缺 Modash 核心/Storefront 未知/评论不足/Raw Skin·VO 未核验/缺报价——高分不覆盖"),
-        ("Herman 两列", "供客户审批回填；批准者回流下一轮 Modash Lookalike"),
-    ]
-    for r, (k, v) in enumerate(dd, 2):
-        ws.cell(r, 1, k).font = Font(bold=True)
-        ws.cell(r, 2, v).alignment = Alignment(wrap_text=True, vertical="top")
-    ws.column_dimensions["A"].width = 20
-    ws.column_dimensions["B"].width = 92
+            ws.auto_filter.ref = f"A1:{get_column_letter(len(COLS))}{len(by_pool[pool])+1}"
     return wb
 
 
@@ -278,7 +247,7 @@ def main():
     wb = build_workbook(decisions)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     wb.save(args.out)
-    print(f"业务交付 XLSX → {args.out}")
+    print(f"专业交付 XLSX → {args.out}")
     return 0
 
 

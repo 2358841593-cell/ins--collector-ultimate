@@ -19,6 +19,26 @@ SKIN_SCIENCE = ["acne", "hyperpigmentation", "collagen", "sensitive skin", "derm
                 "fine lines", "wrinkle", "cell turnover", "rosacea", "melasma"]
 
 
+NICHE_KW = [
+    ("beauty_device", ["led", "red light", "redlight", "device", "wavelength", "nm", "irradiance",
+                       "near infrared", "光疗", "面罩", "microcurrent", "gua sha"]),
+    ("skincare", ["skincare", "skin care", "derma", "retinol", "niacinamide", "acne", "esthetic",
+                  "facial", "护肤", "farmac", "salud y belleza", "serum", "moisturizer", "spf",
+                  "hyaluronic", "cuidado de la piel", "piel"]),
+    ("beauty_wellness", ["beauty", "makeup", "wellness", "美妆", "belleza", "maquillaje", "glow"]),
+    ("lifestyle", ["lifestyle", "home", "decor", "mom", "family", "生活", "家居", "vlog", "grwm"]),
+]
+
+
+def derive_niche(*texts) -> str:
+    """从 bio/全名/caption 文本判主赛道。"""
+    blob = " ".join(t for t in texts if t).lower()
+    for key, kws in NICHE_KW:
+        if any(k in blob for k in kws):
+            return key
+    return "other"
+
+
 def _hits(text, terms):
     t = text.lower()
     return [k for k in terms if k in t]
