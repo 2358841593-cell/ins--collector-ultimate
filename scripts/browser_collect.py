@@ -182,27 +182,57 @@ def fetch_comments(account: str, media_pk: str, shortcode: str = "", max_n: int 
             user_data_dir=str(profile_dir), channel="chrome", headless=headless,
             args=["--no-first-run", "--no-default-browser-check"])
         try:
+            if not shortcode:
+                return []
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
-            ref = f"https://www.instagram.com/p/{shortcode}/" if shortcode else "https://www.instagram.com/"
-            page.goto(ref, wait_until="domcontentloaded", timeout=45000)
-            page.wait_for_timeout(2000)
-            data = page.evaluate(
-                """async ({pk, appid}) => {
-                    const r = await fetch(`/api/v1/media/${pk}/comments/?can_support_threading=true&permalink_enabled=false`,
-                      {headers: {'x-ig-app-id': appid}, credentials: 'include'});
-                    if (!r.ok) return {__error: 'http_' + r.status};
-                    return await r.json();
-                }""",
-                {"pk": str(media_pk), "appid": IG_WEB_APP_ID},
+            page.goto(f"https://www.instagram.com/p/{shortcode}/",
+                      wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(3500)
+            # 登录态帖子页把评论渲染进 DOM：抓 article 内 span[dir=auto]，首条为 caption
+            rows = page.evaluate(
+                r"""() => {
+                  const art = document.querySelector('article') || document.body;
+                  const out = [];
+                  const TIME = /^\s*\d+\s*(天|小时|分钟|周|秒|w|d|h|m|y|hours?|days?|weeks?|min)\s*$/i;
+                  const META = /^(回复|Reply|赞|like[ds]?|查看翻译|See translation|编辑|作者)$/i;
+                  const anchors = Array.from(art.querySelectorAll('a[href^="/"]'));
+                  const seenLi = new Set();
+                  for (const a of anchors) {
+                    const href = a.getAttribute('href') || '';
+                    if (!/^\/[A-Za-z0-9._]+\/$/.test(href)) continue;
+                    const li = a.closest('li') || a.parentElement?.closest('div');
+                    if (!li || seenLi.has(li)) continue;
+                    seenLi.add(li);
+                    const uname = a.textContent.trim();
+                    // 取该行内最长、非用户名、非时间、非按钮、非纯@的文本 span
+                    const spans = Array.from(li.querySelectorAll('span'));
+                    let best = '';
+                    for (const s of spans) {
+                      if (s.querySelector('a, time, button')) continue;   // 跳过含子控件的容器
+                      const t = (s.textContent || '').trim();
+                      if (!t || t === uname || TIME.test(t) || META.test(t)) continue;
+                      if (t.startsWith('@') && t.length < 20) continue;
+                      if (t.length > best.length) best = t;
+                    }
+                    if (best && best.length > 1) out.push({ username: uname, text: best.slice(0, 300) });
+                  }
+                  return out;
+                }"""
             )
-            comments = (data or {}).get("comments") or []
-            out = []
-            for c in comments[:max_n]:
-                out.append({
-                    "text": c.get("text") or "",
-                    "username": (c.get("user") or {}).get("username") or "",
-                    "like_count": c.get("comment_like_count") or 0,
-                })
+            # 去重 + 过滤：文本==用户名/空 视为未取到正文，丢弃（宁缺勿造假，见 B0-4）
+            seen, out = set(), []
+            for r in rows:
+                text = (r.get("text") or "").strip()
+                uname = (r.get("username") or "").strip().rstrip("已验证")
+                if not text or text == uname or text.replace("已验证", "") == uname:
+                    continue
+                key = (uname, text)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append({"text": text, "username": uname, "like_count": 0})
+                if len(out) >= max_n:
+                    break
             return out
         except Exception:  # noqa: BLE001
             return []
