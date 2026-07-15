@@ -69,6 +69,41 @@ def load_accounts():
     return out
 
 
+def make_iloader(acct, proxy):
+    """instaloader 会话（代理 + cookie），用于可靠取 profile 字段。"""
+    import instaloader
+    L = instaloader.Instaloader(quiet=True, request_timeout=30)
+    if proxy:
+        purl = f"http://{proxy['username']}:{proxy['password']}@{proxy['server'].split('//')[-1]}" \
+            if proxy.get("username") else proxy["server"]
+        L.context._session.proxies = {"http": purl, "https": purl}
+    L.context._session.cookies.set("sessionid", acct["sessionid"], domain=".instagram.com")
+    L.context._session.cookies.set("ds_user_id", acct["ds_user_id"], domain=".instagram.com")
+    return L
+
+
+BRAND_CATEGORIES = ("cosmetic", "skin care service", "product", "shopping", "retail",
+                    "brand", "store", "company", "e-commerce", "wholesale")
+
+
+def fetch_profile_il(L, handle):
+    """instaloader 取 profile 字段。返回 dict 或 None（失败）。"""
+    import instaloader
+    try:
+        p = instaloader.Profile.from_username(L.context, handle)
+    except Exception:  # noqa: BLE001
+        return None
+    cat = (p.business_category_name or "").lower()
+    is_brand = bool(p.is_business_account) and any(k in cat for k in BRAND_CATEGORIES)
+    return {
+        "full_name": p.full_name, "follower_count": p.followers, "media_count": p.mediacount,
+        "biography": p.biography, "external_url": p.external_url or None,
+        "is_verified": p.is_verified, "is_private": p.is_private,
+        "is_business": bool(p.is_business_account), "category": p.business_category_name,
+        "brand_account_type": "brand" if is_brand else "personal",
+    }
+
+
 def open_ctx(pw, acct, proxy, headless=True):
     pd = SECRETS / "chrome-instagram-profiles" / acct["username"]
     pd.mkdir(parents=True, exist_ok=True)
@@ -99,47 +134,44 @@ def _goto(pg, url, tries=3):
     return False
 
 
-def collect_candidate(pg, handle, ev_dir, n_posts=8):
-    """采一个候选：profile + N 帖赞评（IG ER）+ 评论区截图 + Storefront 穿透。"""
+def collect_candidate(L, pg, handle, ev_dir, n_posts=8):
+    """采一个候选：profile(instaloader) + 品牌早筛 + N 帖评论截图 + Storefront。"""
     ev = []
     cand = {"handle": handle, "profile_url": f"https://www.instagram.com/{handle}/",
             "discovery_source": "Modash Discover / ai_search", "discovered_via": "modash_search",
             "captured_at": time.strftime("%Y-%m-%d %H:%M")}
 
-    # 1) profile 页
+    # 1) profile 字段走 instaloader（可靠：外链/商业号/类目/粉丝）
+    pf = fetch_profile_il(L, handle)
+    if pf is None:
+        return None, "profile_fetch_failed"
+    cand.update(pf)
+    if pf.get("is_private"):
+        return cand, ev  # 私密号：交给 gate 判 Exclude，不深采
+    # 品牌号早筛：直接标记，跳过昂贵的帖子/评论采集
+    if pf.get("brand_account_type") == "brand":
+        cand["_skipped"] = "brand_account"
+        # 仍从外链判 storefront（品牌号也可能有橱窗，供参考）
+        _resolve_storefront(cand, pg)
+        return cand, ev
+
+    # 2) 渲染 profile 页取帖子网格（评论截图用）
     if not _goto(pg, f"https://www.instagram.com/{handle}/"):
-        return None, "profile_goto_failed"
-    pg.wait_for_timeout(6000)
-    get_prof = r"""() => {
-      const meta=(p)=>{const e=document.querySelector(`meta[property="${p}"]`);return e?e.content:null;};
-      const codes=[...document.querySelectorAll('a')].map(a=>a.getAttribute('href'))
-        .filter(h=>h&&/\/(p|reel)\//.test(h));
-      return {title:meta('og:title'), desc:meta('og:description'), codes:[...new Set(codes)].slice(0,12),
-              logged_out: /创建新账户|Create new account/.test(document.body.innerText.slice(0,120))};
-    }"""
-    prof = pg.evaluate(get_prof)
-    if prof.get("logged_out"):
+        return cand, ev
+    pg.wait_for_timeout(5000)
+    get_codes = r"""() => { const codes=[...document.querySelectorAll('a')].map(a=>a.getAttribute('href'))
+        .filter(h=>h&&/\/(p|reel)\//.test(h)); return {codes:[...new Set(codes)].slice(0,12),
+        logged_out:/创建新账户|Create new account/.test(document.body.innerText.slice(0,120))}; }"""
+    g = pg.evaluate(get_codes)
+    if g.get("logged_out"):
         return None, "logged_out"
-    # 帖子网格没加载 → 滚动 + 再等 + 重试（最多 3 次）
     for _ in range(3):
-        if prof.get("codes"):
+        if g.get("codes"):
             break
         pg.mouse.wheel(0, 1200)
         pg.wait_for_timeout(3500)
-        prof = pg.evaluate(get_prof)
-    if not prof.get("codes"):
-        return None, "no_post_grid"
-    # 解析 og
-    title = prof.get("title") or ""
-    m = re.match(r"(.+?)\s*\(@", title)
-    cand["full_name"] = m.group(1).strip() if m else None
-    desc = prof.get("desc") or ""
-    fm = re.search(r"([\d.,]+\s*[KMkm万]?)\s*(?:Followers|位?粉丝)", desc)
-    cand["follower_count"] = _to_int(fm.group(1)) if fm else None
-    profshot = ev_dir / "profile.png"
-    pg.screenshot(path=str(profshot))
-    ev.append({"type": "profile", "path": str(profshot.relative_to(ROOT)),
-               "source_url": cand["profile_url"], "captured_at": _now()})
+        g = pg.evaluate(get_codes)
+    prof = {"codes": g.get("codes", [])}
     _pause()
 
     # 2/3) 开 N 个帖子：取赞评（算 IG ER）+ 前几个截评论区
@@ -171,22 +203,28 @@ def collect_candidate(pg, handle, ev_dir, n_posts=8):
                       "like_count": None, "comment_count": None, "play_count": 0} for p in posts_meta]
     cand.update(content_mod.derive_content_signals(cand, _CFG))
     cand.pop("posts", None)
+    # 赛道从 bio + 全名 + caption 派生
+    caps = " ".join(p.get("caption", "") for p in posts_meta)
+    cand["core_niche_key"] = content_mod.derive_niche(cand.get("biography"), cand.get("full_name"), caps)
 
-    # 4) Storefront：从 profile 页读 bio 外链 → 穿透（用于门槛，不作评论证据）
-    ext = None
-    try:
-        ext = pg.evaluate(r"""() => { const a=[...document.querySelectorAll('a[href]')]
-          .map(x=>x.href).find(h=>/l\.instagram\.com|linktr\.ee|beacons|linktree|amazon\.|amzn|shopmy|liketoknow|stan\.store/i.test(h)); return a||null; }""")
-    except Exception:  # noqa: BLE001
-        ext = None
-    cand["external_url"] = ext
+    # 4) Storefront（instaloader 已给外链）
+    _resolve_storefront(cand, pg)
+    return cand, ev
+
+
+def _resolve_storefront(cand, pg):
+    """按 instaloader 拿到的 external_url 判 storefront；聚合页用当前页穿透。"""
+    ext = cand.get("external_url")
     cand["bio_links"] = [ext] if ext else []
     joined = (ext or "").lower()
+    if not ext:
+        cand["storefront_status"] = "confirmed_no"
+        return
     if any(a in joined for a in AMAZON):
         cand["storefront_status"] = "confirmed_yes"
         cand["amazon_storefront_link"] = ext
-    elif any(g in joined for g in AGG):
-        # 穿透聚合页：用当前页开聚合页读真实出链（不嵌套 playwright、不截图）
+        return
+    if any(g in joined for g in AGG):
         cand["storefront_status"] = "unknown"
         if _goto(pg, ext):
             pg.wait_for_timeout(4000)
@@ -198,11 +236,8 @@ def collect_candidate(pg, handle, ev_dir, n_posts=8):
                 cand["amazon_storefront_link"] = amz
             else:
                 cand["storefront_status"] = "confirmed_no"
-    elif ext:
-        cand["storefront_status"] = "unknown"
     else:
-        cand["storefront_status"] = "confirmed_no"
-    return cand, ev
+        cand["storefront_status"] = "unknown"
 
 
 def _to_int(s):
@@ -263,9 +298,10 @@ def main():
             print(f"  [{i+1}/{len(recs)}] @{h} · {acct['username']} …", flush=True)
             ctx = None
             try:
+                L = make_iloader(acct, proxy)
                 ctx = open_ctx(pw, acct, proxy)
                 pg = ctx.pages[0] if ctx.pages else ctx.new_page()
-                cand, ev = collect_candidate(pg, h, ev_dir, args.posts)
+                cand, ev = collect_candidate(L, pg, h, ev_dir, args.posts)
                 if cand is None:
                     print(f"     ✗ {ev}", flush=True)
                     cands.append({"handle": h, "collect_failed": True, "note": ev, "campaign_track": None})
@@ -275,7 +311,8 @@ def main():
                         e["handle"] = h
                         evidence_index.append(e)
                     cands.append(cand)
-                    print(f"     ✓ {len(cand.get('comment_shots',[]))}评论截图 · 赞助={cand.get('sponsorship_saturation')} · 橱窗={cand.get('storefront_status')} · 粉丝={cand.get('follower_count')}", flush=True)
+                    tag = "品牌号跳过" if cand.get("_skipped") else f"{len(cand.get('comment_shots',[]))}评论截图"
+                    print(f"     ✓ {tag} · 商业号={cand.get('is_business')} · 橱窗={cand.get('storefront_status')} · 外链={cand.get('external_url')} · 粉丝={cand.get('follower_count')}", flush=True)
             except Exception as e:  # noqa: BLE001
                 print(f"     ✗ {type(e).__name__}: {str(e)[:60]}", flush=True)
                 cands.append({"handle": h, "collect_failed": True, "campaign_track": None})
