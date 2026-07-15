@@ -1,0 +1,232 @@
+<title>Instagram 红人筛选 · 首批交付预览 SKINCARE-20260714</title>
+<style>
+  :root {
+    --paper:#F6F7F4; --paper-2:#FCFCFB; --ink:#1A1C22; --mid:#5E6672; --faint:#8B929C;
+    --line:#E2E4DF; --line-2:#EDEEEA; --accent:#0E6E62; --accent-soft:#E4EFEC;
+    --inc:#2F7D5A; --inc-bg:#E7F1EA; --rev:#9A6A1E; --rev-bg:#F5ECD9;
+    --exc:#AE3B37; --exc-bg:#F5E3E1;
+    --mono:ui-monospace,"SF Mono","SFMono-Regular",Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,"PingFang SC","Microsoft YaHei",sans-serif;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--paper);color:var(--ink);font-family:var(--sans);font-size:16px;line-height:1.62;-webkit-font-smoothing:antialiased;}
+  .wrap{max-width:880px;margin:0 auto;padding:0 28px;}
+  .col{max-width:740px;}
+  header.mast{border-bottom:2px solid var(--ink);padding:52px 0 26px;}
+  .eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);margin:0 0 16px;}
+  h1.title{font-size:37px;line-height:1.1;letter-spacing:-.02em;font-weight:680;margin:0 0 14px;text-wrap:balance;}
+  .dek{font-size:18px;color:var(--mid);margin:0;max-width:660px;text-wrap:pretty;}
+  .meta-row{display:flex;flex-wrap:wrap;gap:8px 26px;margin-top:24px;font-family:var(--mono);font-size:12.5px;color:var(--faint);}
+  .meta-row b{color:var(--ink);font-weight:600;}
+
+  .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line);border:1px solid var(--line);border-radius:8px;overflow:hidden;margin:32px 0 6px;}
+  .stat{background:var(--paper-2);padding:17px 18px 15px;}
+  .stat .n{font-size:26px;font-weight:680;letter-spacing:-.01em;font-variant-numeric:tabular-nums;}
+  .stat .n small{font-size:14px;font-weight:600;color:var(--mid);}
+  .stat .l{font-size:12.5px;color:var(--mid);margin-top:2px;}
+
+  section{padding:38px 0 4px;}
+  .snum{font-family:var(--mono);font-size:12px;color:var(--accent);letter-spacing:.08em;display:block;margin-bottom:8px;}
+  h2{font-size:24px;letter-spacing:-.015em;font-weight:640;margin:0 0 15px;text-wrap:balance;}
+  h3{font-size:16px;font-weight:640;margin:24px 0 8px;}
+  p{margin:0 0 14px;}
+  .col p,.col ul{max-width:740px;}
+  strong{font-weight:640;}
+  a{color:var(--accent);text-underline-offset:2px;word-break:break-all;}
+  hr{border:none;border-top:1px solid var(--line);margin:38px 0 0;}
+  code,.m{font-family:var(--mono);font-size:13.5px;}
+  .m{background:var(--accent-soft);color:#0a4f47;padding:1px 5px;border-radius:4px;}
+
+  .decision{border:1px solid var(--rev);border-left:4px solid var(--rev);background:var(--rev-bg);border-radius:0 10px 10px 0;padding:20px 24px;margin:20px 0;}
+  .decision h4{margin:0 0 8px;font-size:16px;font-weight:660;color:#7c5410;}
+  .decision p{margin:0 0 8px;font-size:15px;color:#5f4a1c;}
+  .decision p:last-child{margin:0;}
+
+  .callout{border:1px solid var(--line);border-left:3px solid var(--accent);background:var(--paper-2);border-radius:0 8px 8px 0;padding:16px 20px;margin:16px 0;}
+  .callout p{margin:0;font-size:15px;color:var(--mid);}
+
+  /* pool bars */
+  .pools{display:flex;flex-direction:column;gap:9px;margin:18px 0 6px;}
+  .prow{display:grid;grid-template-columns:180px 1fr 42px;align-items:center;gap:14px;font-size:14px;}
+  .plabel{font-weight:600;}
+  .ptrack{height:22px;background:var(--line-2);border-radius:5px;overflow:hidden;}
+  .pfill{height:100%;border-radius:5px;}
+  .pcount{font-family:var(--mono);font-variant-numeric:tabular-nums;text-align:right;color:var(--mid);}
+
+  .tbl-wrap{overflow-x:auto;margin:16px 0 8px;border:1px solid var(--line);border-radius:8px;}
+  table{border-collapse:collapse;width:100%;font-size:13.5px;}
+  th,td{text-align:left;padding:9px 13px;border-bottom:1px solid var(--line-2);vertical-align:top;}
+  th{font-family:var(--mono);font-size:11px;letter-spacing:.04em;text-transform:uppercase;color:var(--mid);font-weight:600;background:var(--paper-2);white-space:nowrap;}
+  tr:last-child td{border-bottom:none;}
+  td.num,th.num{font-variant-numeric:tabular-nums;white-space:nowrap;}
+  td .h{font-family:var(--mono);font-size:12.5px;}
+
+  .pill{display:inline-block;font-family:var(--mono);font-size:11px;font-weight:600;padding:2px 8px;border-radius:20px;white-space:nowrap;}
+  .p-inc{background:var(--inc-bg);color:var(--inc);}
+  .p-rev{background:var(--rev-bg);color:var(--rev);}
+  .p-exc{background:var(--exc-bg);color:var(--exc);}
+  .star{color:var(--accent);font-weight:700;}
+
+  ul.clean{list-style:none;padding:0;margin:0 0 14px;}
+  ul.clean li{padding:7px 0 7px 22px;position:relative;border-bottom:1px solid var(--line-2);}
+  ul.clean li:last-child{border-bottom:none;}
+  ul.clean li::before{content:"";position:absolute;left:3px;top:15px;width:6px;height:6px;border-radius:50%;background:var(--accent);}
+
+  .cols{columns:2;column-gap:26px;font-size:14px;margin:12px 0;}
+  .cols span{display:block;padding:4px 0;break-inside:avoid;color:var(--mid);}
+  .cols span b{color:var(--ink);font-weight:600;font-family:var(--mono);font-size:12.5px;}
+
+  .foot{color:var(--faint);font-size:13px;font-family:var(--mono);padding:38px 0 60px;border-top:1px solid var(--line);margin-top:38px;}
+  @media (max-width:620px){h1.title{font-size:29px;}.stats{grid-template-columns:repeat(2,1fr);}.wrap{padding:0 18px;}.prow{grid-template-columns:120px 1fr 34px;}.cols{columns:1;}}
+</style>
+
+<div class="wrap">
+  <header class="mast">
+    <p class="eyebrow">首批交付预览 · 供格式与规则反馈</p>
+    <h1 class="title">Instagram 红人筛选<br>首批候选交付</h1>
+    <p class="dek">30 个真实候选,按确认书 SOP 的硬门槛与 A–F 评分自动分流,每条带赛道、ER、Amazon 橱窗核验证据与淘汰/复核原因。请就交付格式与一个 ER 门槛问题给反馈。</p>
+    <div class="meta-row">
+      <span>批次 <b>SKINCARE-20260714</b></span>
+      <span>候选 <b>30</b></span>
+      <span>发现 <b>Modash Discover</b></span>
+      <span>轨道 <b>Paid (10K–150K)</b></span>
+    </div>
+  </header>
+
+  <div class="stats">
+    <div class="stat"><div class="n">30</div><div class="l">真实候选</div></div>
+    <div class="stat"><div class="n">4<small> / 5</small></div><div class="l">Amazon 橱窗已穿透</div></div>
+    <div class="stat"><div class="n">5</div><div class="l">进入复核池</div></div>
+    <div class="stat"><div class="n">3.89<small>%</small></div><div class="l">最高 ER</div></div>
+  </div>
+
+  <div class="col">
+
+  <section>
+    <span class="snum">需要您拍板 — 01</span>
+    <h2>一个关键发现:这个赛道的互动率普遍偏低</h2>
+    <p>本批 25 个拿到 Modash ER 的候选,区间是 <strong>0.01% – 3.89%</strong>,其中只有 <strong>2 个(8%)</strong>越过确认书的 <span class="m">General ER &gt; 2%</span> 硬红线。这不是搜索的问题——红光/LED 面罩、护肤设备类内容偏产品演示,互动率天生低于纯生活方式号。</p>
+    <div class="decision">
+      <h4>请确认:红光设备赛道的 ER 门槛怎么定?</h4>
+      <p><strong>现状</strong>:严格执行 &gt;2% → 本批 23 个因 ER 被淘汰,产出很少。</p>
+      <p><strong>选项</strong>:(A) 维持 &gt;2%,接受这个赛道产出天然少;(B) 为红光设备赛道单独放宽(如 &gt;1%),把更多候选放进复核;(C) 改看我们另算的 Reels 互动率(见下)。这决定整个项目的产出量,确认书也说首批要校准。</p>
+    </div>
+    <div class="callout">
+      <p><strong>补充口径</strong>:Modash 的 ER 是近两月中位数,和我们从近帖实算的 Reels ER 是两个口径。例如 <span class="m">@montanasalgado_</span> Modash ER 2.94%,而她近帖 Reels 互动明显更高。两个值我们都保留,门槛用哪个由您定。</p>
+    </div>
+  </section>
+
+  <hr>
+
+  <section>
+    <span class="snum">结果 — 02</span>
+    <h2>30 个候选如何分流</h2>
+    <p>每个候选只落一个互斥决策池。本批因上面的 ER 门槛,集中在 Exclude 与 Review。</p>
+    <div class="pools">
+      <div class="prow"><span class="plabel"><span class="pill p-inc">Include</span></span><div class="ptrack"><div class="pfill" style="width:2%;background:var(--inc)"></div></div><span class="pcount">0</span></div>
+      <div class="prow"><span class="plabel"><span class="pill p-rev">Review</span></span><div class="ptrack"><div class="pfill" style="width:16.7%;background:var(--rev)"></div></div><span class="pcount">5</span></div>
+      <div class="prow"><span class="plabel"><span class="pill p-exc">Exclude</span></span><div class="ptrack"><div class="pfill" style="width:83.3%;background:var(--exc)"></div></div><span class="pcount">25</span></div>
+    </div>
+    <p style="margin-top:16px;font-size:14.5px;color:var(--mid)">Include 为 0 是<strong>正确的、也是有意的</strong>:确认书要求进 Include 必须硬门槛全过<strong>且核心字段完整</strong>。本批还没逐个开 Modash Profile 补假粉/受众国家(为省额度),所以过了硬门槛的候选按规则一律先进 Review——系统不会在缺证据时硬塞进 Include。补数后即可升池。</p>
+  </section>
+
+  <hr>
+
+  <section>
+    <span class="snum">值得看 — 03</span>
+    <h2>复核池:最有希望的候选</h2>
+    <p>这 5 个越过或未触发硬红线,只差 Modash 补数就能定池。<span class="star">★</span> 标注的是本批最强的一个。</p>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>Handle</th><th class="num">粉丝</th><th class="num">Modash ER</th><th>Amazon 橱窗</th><th>待补</th></tr></thead>
+        <tbody>
+          <tr><td><span class="h">@montanasalgado_</span> <span class="star">★</span></td><td class="num">12.8K</td><td class="num">2.94%</td><td><a href="https://www.amazon.es/shop/montanaasmr">amazon.es/shop/montanaasmr</a></td><td>Modash 补数</td></tr>
+          <tr><td><span class="h">@testoerecensiscopervoi1</span></td><td class="num">140.7K</td><td class="num">3.89%</td><td>确认无</td><td>Modash 补数</td></tr>
+          <tr><td><span class="h">@skinray.by</span></td><td class="num">11.4K</td><td class="num">—</td><td>确认无</td><td>ER + 补数</td></tr>
+          <tr><td><span class="h">@verina_albert3</span></td><td class="num">312K*</td><td class="num">—</td><td>确认无</td><td>ER + 补数</td></tr>
+          <tr><td><span class="h">@ohmyskin</span></td><td class="num">—</td><td class="num">—</td><td>确认无</td><td>ER + 补数</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="callout">
+      <p><span class="star">★</span> <strong>@montanasalgado_</strong> 是本批唯一同时满足 <strong>ER 2.94%(过门槛)+ 真实 Amazon 橱窗</strong>(浏览器已穿透到 <span class="m">amazon.es/shop/montanaasmr</span> 并存证)的候选。只要对她做一次 Modash Profile 补数(假粉/受众国家),就能升到 <span class="pill p-inc">Include-With-Storefront</span>——这是最值得先投入的一个。</p>
+    </div>
+    <h3>另外 4 个有 Amazon 橱窗(但 ER 未过门槛)</h3>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>Handle</th><th>Amazon 橱窗(浏览器穿透确认)</th></tr></thead>
+        <tbody>
+          <tr><td><span class="h">@natural_outcome</span></td><td><a href="https://www.amazon.com/stores/NaturalOutcome/">amazon.com/stores/NaturalOutcome</a></td></tr>
+          <tr><td><span class="h">@zchristinne</span></td><td><a href="https://www.amazon.com/shop/zchristinne">amazon.com/shop/zchristinne</a></td></tr>
+          <tr><td><span class="h">@mi_littlefllife</span></td><td>Amazon 联盟跳转链(amzlink.to)</td></tr>
+          <tr><td><span class="h">@velvetvibes002</span></td><td>houseofbalance.us(<strong>非 Amazon,系统已标记待人工复核</strong>)</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p style="font-size:13.5px;color:var(--faint);margin-top:8px">* 粉丝数抓取有个别毛刺,正式补数时以 Modash Profile 为准。@velvetvibes002 的橱窗系统判定不确定并如实标出——这正是"不确定就进复核、不伪造"的设计。</p>
+  </section>
+
+  <hr>
+
+  <section>
+    <span class="snum">规则透明 — 04</span>
+    <h2>被淘汰的 25 个:每条都有可追溯理由</h2>
+    <p>系统不是黑箱。淘汰全部落到确认书的硬红线,可逐条追溯到实测值与阈值。</p>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>示例候选</th><th class="num">Modash ER</th><th>淘汰原因(可追溯)</th></tr></thead>
+        <tbody>
+          <tr><td><span class="h">@ehsantialproducts</span></td><td class="num">0.01%</td><td>General ER ≤ 2%(GATE-07)</td></tr>
+          <tr><td><span class="h">@originsitalia</span></td><td class="num">0.04%</td><td>General ER ≤ 2%(GATE-07)</td></tr>
+          <tr><td><span class="h">@labelle.biju.smg</span></td><td class="num">0.39%</td><td>粉丝 9.3K &lt; 10K + ER ≤ 2%</td></tr>
+          <tr><td><span class="h">@la.mayor</span></td><td class="num">0.03%</td><td>粉丝 181K &gt; 150K + ER ≤ 2%</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p style="margin-top:14px;font-size:14.5px;color:var(--mid)">主要淘汰原因统计:<strong>Modash ER ≤ 2% × 23</strong>、粉丝档超出范围 × 14(部分候选两项都中)。</p>
+  </section>
+
+  <hr>
+
+  <section>
+    <span class="snum">格式 — 05</span>
+    <h2>每个候选交付时包含的字段</h2>
+    <p>正式交付是一个 Excel:<strong>五个互斥决策池 + 批次总览 + 证据索引 + 字段字典</strong>共 8 个表。每条候选按确认书第 8 章固定 18 个字段,请确认是否符合预期:</p>
+    <div class="cols">
+      <span><b>Country</b> 国家两位码</span>
+      <span><b>Handle (IG)</b> @账号</span>
+      <span><b>Followers</b> 粉丝量</span>
+      <span><b>Creator Niche</b> 赛道</span>
+      <span><b>Fake / ER (%)</b> 假粉/互动率</span>
+      <span><b>Amazon Storefront Link</b> 橱窗链接</span>
+      <span><b>Sponsorship Saturation</b> 赞助占比</span>
+      <span><b>Has VO &amp; Raw Skin</b> 旁白/真实皮肤</span>
+      <span><b>Elite Brand History</b> 红光品牌合作史</span>
+      <span><b>AI Vetting Score</b> 1–10 + 一句话理由</span>
+      <span><b>High-Intent Comments</b> 高意图评论原话</span>
+      <span><b>Herman Approval</b> 空列供回填</span>
+      <span><b>Herman's Feedback</b> 空列供回填</span>
+      <span><b>Review / Exclude Reason</b> 原因</span>
+      <span><b>Missing Data</b> 待补字段</span>
+      <span><b>Evidence Link</b> 主页/橱窗/截图证据</span>
+      <span><b>Discovery Source</b> 候选来源</span>
+      <span><b>Captured At</b> 采集时间</span>
+    </div>
+    <p style="font-size:14px;color:var(--mid)">附带 Amazon 橱窗穿透的现场截图作证据。Herman Approval / Feedback 两列留空,供您审批后回填,再回流到下一轮种子。</p>
+  </section>
+
+  <hr>
+
+  <section>
+    <span class="snum">请反馈 — 06</span>
+    <h2>需要您两个反馈</h2>
+    <ul class="clean">
+      <li><strong>交付格式</strong>:五池结构 + 上面 18 个字段 + 证据索引,是否符合预期?有没有要加/去的字段?</li>
+      <li><strong>ER 门槛(关键)</strong>:红光设备赛道 ER 普遍 &lt;2%,&gt;2% 硬门槛是否为这个赛道放宽?或改用 Reels 互动率口径?这决定产出量。</li>
+    </ul>
+    <p>确认后我们即可:对 @montanasalgado_ 等高潜候选做 Modash 补数升为正式 Include,并按校准后的门槛跑更大批次。</p>
+  </section>
+
+  </div>
+  <p class="foot">Instagram 红人筛选 · 首批交付预览 · SKINCARE-20260714 · 30 候选真实数据 · 决策口径以确认书 SOP V2 为准</p>
+</div>
