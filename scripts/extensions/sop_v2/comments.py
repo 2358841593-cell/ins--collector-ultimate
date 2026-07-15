@@ -34,6 +34,54 @@ def _intent(text: str):
     return None
 
 
+# 明确购买意图短语（高精度：只留清晰买信号，不含"有效/推荐"等辩论也会中的宽词）
+INTENT_PHRASES = [
+    # 求链接/在哪买（最强信号）
+    "where is the link", "where's the link", "link please", "drop the link", "send the link",
+    "where can i buy", "where to buy", "how do i buy", "is it in your storefront",
+    "in your storefront", "which storefront", "share the link",
+    "dónde lo compro", "donde lo compro", "dónde se compra", "donde se compra", "dónde comprar",
+    "donde comprar", "cómo lo compro", "como lo compro", "dónde consigo", "donde consigo",
+    "pásame el link", "pasame el link", "el link porfa", "onde comprar", "onde compro",
+    "link do produto",
+    # 问价
+    "how much is", "how much does", "what's the price", "what is the price",
+    "cuánto cuesta", "cuanto cuesta", "cuánto vale", "cuanto vale", "cuánto sale", "qué precio",
+    "que precio", "quanto custa",
+    # 购买确认
+    "just ordered", "just bought", "i just bought", "already ordered", "in my cart",
+    "adding to cart", "lo compré", "ya lo compré", "acabo de comprar", "lo pedí", "ya lo pedí",
+    "lo acabo de comprar", "comprado ✓",
+    # 明确想要 + 具体产品
+    "i need this", "i want this", "lo quiero", "lo necesito", "quiero uno", "quiero comprar",
+]
+
+
+def find_intent_in_text(page_text: str, max_snippets: int = 4) -> list[str]:
+    """从帖子页可见文字中提取"有购买意图"的评论片段（多语言）。
+    返回清洗后的短句列表；无则空。用于判断该帖评论是否有意义、是否值得截图。"""
+    if not page_text:
+        return []
+    # 按行/句切分，逐段找意图短语
+    segs = re.split(r"[\n\r]+|(?<=[.?!。？！])\s+", page_text)
+    out, seen = [], set()
+    tl_meta = re.compile(r"^\s*(\d+\s*(天|周|小时|分钟|d|w|h|min|semanas?|días?|horas?)|回复|responder|reply|"
+                         r"me gusta|likes?|verified|已验证|查看翻译|ver traducción|traducir)\s*$", re.I)
+    for s in segs:
+        s = s.strip()
+        if not s or len(s) < 4 or len(s) > 140 or tl_meta.match(s):
+            continue
+        low = s.lower()
+        if any(ph in low for ph in INTENT_PHRASES):
+            key = low[:40]
+            if key not in seen:
+                seen.add(key)
+                out.append(s[:120])
+                if len(out) >= max_snippets:
+                    break
+    return out
+
+
 def _is_low_quality(text: str) -> bool:
     t = text.strip()
     if not t or EMOJI_RE.match(t) or TAG_ONLY_RE.match(t):

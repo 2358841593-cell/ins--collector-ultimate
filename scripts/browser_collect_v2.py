@@ -197,26 +197,49 @@ def collect_candidate(L, pg, handle, ev_dir, n_posts=8):
     prof = {"codes": g.get("codes", [])}
     _pause(2, 4)
 
-    # 2/3) 开 N 个帖子：取赞评（算 IG ER）+ 前几个截评论区
+    # 2/3) 开 N 个帖子：读评论文字判购买意图 → 有意义才截图，截不到就用链接
+    from extensions.sop_v2 import comments as cmt_mod
     codes = prof.get("codes") or []
     posts_meta = []
-    comment_shots = []
-    shot_n = min(2, len(codes))          # 截前 2 个帖的评论区作证据（够读购买意图）
+    comment_shots = []       # 有购买意图且截图成功的证据
+    intent_posts = []        # 有购买意图的帖子（链接 + 原话），截图失败也留
+    all_snips = []
     for i, href in enumerate(codes[:n_posts]):
-        if not _goto(pg, f"https://www.instagram.com{href}"):
+        purl = f"https://www.instagram.com{href}"
+        if not _goto(pg, purl):
             continue
-        pg.wait_for_timeout(4000)
-        pm = pg.evaluate(r"""() => {
+        pg.wait_for_timeout(3500)
+        # 滚动评论区加载更多评论（提高命中真实购买意图；桌面版评论在右侧列表）
+        for _ in range(3):
+            pg.mouse.wheel(0, 1200)
+            pg.wait_for_timeout(1200)
+        info = pg.evaluate(r"""() => {
           const meta=(p)=>{const e=document.querySelector(`meta[property="${p}"]`);return e?e.content:null;};
-          return {caption: meta('og:description')||'', video: !!meta('og:video')}; }""")
-        posts_meta.append({"code": href, "caption": pm.get("caption", ""), "is_video": pm.get("video")})
-        if i < shot_n and _shot(pg, ev_dir / f"comments_{i+1:02d}.png"):
-            rel = str((ev_dir / f"comments_{i+1:02d}.png").relative_to(ROOT))
-            comment_shots.append(rel)
-            ev.append({"type": "comment_area", "path": rel,
-                       "source_url": f"https://www.instagram.com{href}", "captured_at": _now(),
-                       "note": "供视觉读购买意图评论 + 赞评数"})
+          const art=document.querySelector('article')||document.body;
+          return {caption: meta('og:description')||'', video: !!meta('og:video'),
+                  text: (art.innerText||'').slice(0, 9000)}; }""")
+        posts_meta.append({"code": href, "caption": info.get("caption", ""), "is_video": info.get("video")})
+        snips = cmt_mod.find_intent_in_text(info.get("text", ""))
+        if snips:
+            all_snips.extend(snips)
+            rec = {"post_url": purl, "snippets": snips[:2], "screenshot": None}
+            # 有明确购买意图 → 截图（有意义的才截）；截不到就只留链接+原话
+            shotpath = ev_dir / f"intent_{i+1:02d}.png"
+            if _shot(pg, shotpath):
+                rel = str(shotpath.relative_to(ROOT))
+                comment_shots.append(rel)
+                rec["screenshot"] = rel
+                ev.append({"type": "intent_comment", "path": rel, "source_url": purl,
+                           "captured_at": _now(), "snippets": snips[:2]})
+            else:
+                ev.append({"type": "intent_comment_link", "path": None, "source_url": purl,
+                           "captured_at": _now(), "snippets": snips[:2], "note": "截图失败,用链接核验"})
+            intent_posts.append(rec)
         _pause(2, 4)
+    cand["intent_posts"] = intent_posts
+    cand["high_intent_snippets"] = all_snips[:5]
+    cand["high_intent_count"] = len(all_snips)
+    cand["comments_read"] = True
 
     cand["comment_shots"] = comment_shots
     cand["sampled_posts"] = posts_meta
@@ -342,8 +365,11 @@ def main():
                         e["handle"] = h
                         evidence_index.append(e)
                     cands.append(cand)
-                    tag = "品牌号跳过" if cand.get("_skipped") else f"{len(cand.get('comment_shots',[]))}评论截图"
-                    print(f"     ✓ {tag} · 商业号={cand.get('is_business')} · 橱窗={cand.get('storefront_status')} · 外链={cand.get('external_url')} · 粉丝={cand.get('follower_count')}", flush=True)
+                    if cand.get("_skipped"):
+                        tag = "品牌号跳过"
+                    else:
+                        tag = f"购买意图{cand.get('high_intent_count',0)}条·截图{len(cand.get('comment_shots',[]))}张"
+                    print(f"     ✓ {tag} · 橱窗={cand.get('storefront_status')} · 粉丝={cand.get('follower_count')}", flush=True)
             except Exception as e:  # noqa: BLE001
                 print(f"     ✗ {type(e).__name__}: {str(e)[:60]}", flush=True)
                 cands.append({"handle": h, "collect_failed": True, "campaign_track": None})
