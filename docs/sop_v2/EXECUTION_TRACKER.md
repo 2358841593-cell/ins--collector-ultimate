@@ -38,8 +38,8 @@
 
 - [~] **B0-1** 采集后端接口抽象：`scripts/browser_collect.py` 起 `BrowserCollector` 雏形（fetch_profile 已实现）；正式 `Collector` 协议（三方法）待抽出
 - [x] **B0-2** `BrowserCollector.fetch_profile`：登录态浏览器会话调 web_profile_info（web app 同款端点，非 instagrapi），og:description 中英 locale 回退。**实测 @annascountryhome 18,525 粉丝/类目/bio/external_url 全部同构拿到**，零烧号
-- [ ] **B0-3** `BrowserCollector` 近帖采集：滚动读帖网格 + 逐帖 caption/like/comment/media_type/play_count/置顶标记（补齐 --v2-collect 的 30 帖窗口）
-- [ ] **B0-4** `BrowserCollector` 评论采集：开帖展开滚动读评论（Top/Recent 采样口径对齐；量小可接受慢）
+- [~] **B0-3** `BrowserCollector` 近帖采集：滚动读帖网格 + 逐帖 caption/like/comment/media_type/play_count/置顶标记（补齐 --v2-collect 的 30 帖窗口）
+- [~] **B0-4** `BrowserCollector` 评论采集：开帖展开滚动读评论（Top/Recent 采样口径对齐；量小可接受慢）
 - [ ] **B0-5** `discover.py` 采集层切到 `Collector` 接口（Stage1 发现改由 Modash Handle 池注入 + Stage2 回扫走 BrowserCollector）；stage3-6 零改动验证（产出结构与 golden 参照同构测试）
 - [ ] **B0-6** CDP 启动器增强：吸收 lab 的多实例管理 + `.run/pids` 追踪 + ready 检查进 `start_instagram_cdp.zsh`；节奏拟人化（随机停顿、限速、单 profile 低并发）
 - [ ] **B0-7** 反爬健壮性：DOM 选择器容错 + 版面变更告警 + 失败转 Review（不误判 Exclude）；登录态失效检测（跳登录页即停该 profile）
@@ -61,7 +61,7 @@
 
 - [x] **P0-1** `config/sop_v2.toml` 全量口径（§2.5 全表 22 组含 discovery/modash_budget/CONFLICT 标注）+ `modash_cost_policy.toml`
 - [x] **P0-2** `extensions/sop_v2/contracts.py`（FieldEvidence/GateResult/ScoreItem/BatchManifest）
-- [ ] **P0-3** `extensions/sop_v2/merge.py` 多源合并（merge_priority 驱动、冲突不覆盖）
+- [~] **P0-3** `extensions/sop_v2/merge.py` 多源合并（merge_priority 驱动、冲突不覆盖）
 - [~] **P0-4** Modash 三通道适配：`search_pool_import.py`（主发现，13 字段契约）/ `lookup_log.py`（Profile 补数+预算台账）/ `import_modash_export.py`（仅 shortlist）
 - [x] **P0-5** `gates.py` 硬门槛引擎（GATE-01..12 + 可采集性；全部半开区间边界用例）
 - [x] **P0-6** `scoring.py`（A-F、N/A 归一化、AI Score、9.5 封顶；golden fixtures）
@@ -75,8 +75,8 @@
 
 ## P1 证据与人工节点（5 项）
 
-- [ ] **P1-1** `import_manual_evidence.py`（Raw Skin/VO/风险/报价模板；Lifestyle 提升同通道）
-- [ ] **P1-2** Storefront 活跃度 + LTK 人工穿透工作流
+- [x] **P1-1** `import_manual_evidence.py`（Raw Skin/VO/风险/报价模板；Lifestyle 提升同通道）
+- [~] **P1-2** Storefront 活跃度 + LTK 人工穿透工作流
 - [ ] **P1-3** CPM 计算（非置顶近 10 Reels 均播；Gifting F1=N/A；35/40/40.01 断言）
 - [ ] **P1-4** Modash Profile 补数执行流（yibo Chrome 只读；30 天缓存优先；预算触线即停）
 - [ ] **P1-5** 互动集中度异常检测（≥5 帖且 ≥70%→Review）

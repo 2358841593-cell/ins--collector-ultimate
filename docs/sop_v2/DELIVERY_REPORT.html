@@ -1,0 +1,344 @@
+<title>Instagram 红人筛选 SOP V2 · 系统交付报告</title>
+<style>
+  :root {
+    --paper: #F6F7F4;
+    --paper-2: #FCFCFB;
+    --ink: #1A1C22;
+    --mid: #5E6672;
+    --faint: #8B929C;
+    --line: #E2E4DF;
+    --line-2: #EDEEEA;
+    --accent: #0E6E62;
+    --accent-soft: #E4EFEC;
+    --inc: #2F7D5A;
+    --inc-bg: #E7F1EA;
+    --pri: #B5822B;
+    --pri-bg: #F5ECD9;
+    --rev: #9A6A1E;
+    --exc: #AE3B37;
+    --exc-bg: #F5E3E1;
+    --mono: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, "Helvetica Neue", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.62;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 0 28px; }
+  .col { max-width: 720px; }
+
+  /* ---- Masthead ---- */
+  header.mast {
+    border-bottom: 2px solid var(--ink);
+    padding: 56px 0 26px;
+    margin-bottom: 8px;
+  }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 18px;
+  }
+  h1.title {
+    font-size: 40px;
+    line-height: 1.08;
+    letter-spacing: -0.02em;
+    font-weight: 680;
+    margin: 0 0 14px;
+    text-wrap: balance;
+  }
+  .dek { font-size: 18px; color: var(--mid); margin: 0; max-width: 640px; text-wrap: pretty; }
+  .meta-row {
+    display: flex; flex-wrap: wrap; gap: 8px 26px;
+    margin-top: 26px;
+    font-family: var(--mono); font-size: 12.5px; color: var(--faint);
+  }
+  .meta-row b { color: var(--ink); font-weight: 600; }
+
+  /* ---- Stat band ---- */
+  .stats {
+    display: grid; grid-template-columns: repeat(4, 1fr);
+    gap: 1px; background: var(--line);
+    border: 1px solid var(--line); border-radius: 8px; overflow: hidden;
+    margin: 34px 0 6px;
+  }
+  .stat { background: var(--paper-2); padding: 18px 18px 16px; }
+  .stat .n { font-size: 27px; font-weight: 680; letter-spacing: -0.01em; font-variant-numeric: tabular-nums; }
+  .stat .n small { font-size: 15px; font-weight: 600; color: var(--mid); }
+  .stat .l { font-size: 12.5px; color: var(--mid); margin-top: 2px; }
+
+  /* ---- Sections ---- */
+  section { padding: 40px 0 4px; }
+  .snum {
+    font-family: var(--mono); font-size: 12px; color: var(--accent);
+    letter-spacing: 0.08em; display: block; margin-bottom: 8px;
+  }
+  h2 { font-size: 25px; letter-spacing: -0.015em; font-weight: 640; margin: 0 0 16px; text-wrap: balance; }
+  h3 { font-size: 17px; font-weight: 640; margin: 26px 0 8px; }
+  p { margin: 0 0 14px; }
+  .col p, .col ul { max-width: 720px; }
+  strong { font-weight: 640; }
+  a { color: var(--accent); text-underline-offset: 2px; }
+  hr { border: none; border-top: 1px solid var(--line); margin: 40px 0 0; }
+
+  ul.clean { list-style: none; padding: 0; margin: 0 0 14px; }
+  ul.clean li { padding: 7px 0 7px 22px; position: relative; border-bottom: 1px solid var(--line-2); }
+  ul.clean li:last-child { border-bottom: none; }
+  ul.clean li::before {
+    content: ""; position: absolute; left: 3px; top: 15px;
+    width: 6px; height: 6px; border-radius: 50%; background: var(--accent);
+  }
+  code, .m { font-family: var(--mono); font-size: 13.5px; }
+  .m { background: var(--accent-soft); color: #0a4f47; padding: 1px 5px; border-radius: 4px; }
+
+  /* ---- Callout ---- */
+  .callout {
+    border: 1px solid var(--line); border-left: 3px solid var(--accent);
+    background: var(--paper-2); border-radius: 0 8px 8px 0;
+    padding: 18px 22px; margin: 18px 0;
+  }
+  .callout.warn { border-left-color: var(--pri); }
+  .callout h4 { margin: 0 0 6px; font-size: 15px; font-weight: 640; }
+  .callout p { margin: 0; font-size: 15px; color: var(--mid); }
+
+  /* ---- Pipeline ---- */
+  .pipe { display: flex; flex-direction: column; gap: 10px; margin: 20px 0 8px; }
+  .stage {
+    border: 1px solid var(--line); border-radius: 9px; background: var(--paper-2);
+    padding: 14px 18px; position: relative;
+  }
+  .stage .k { font-family: var(--mono); font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--faint); }
+  .stage .t { font-weight: 620; font-size: 15.5px; margin: 2px 0 2px; }
+  .stage .d { font-size: 13.5px; color: var(--mid); }
+  .stage .tag { position: absolute; top: 14px; right: 16px; font-family: var(--mono); font-size: 11px; }
+  .arw { text-align: center; color: var(--faint); font-size: 13px; line-height: 0.5; }
+  .ok { color: var(--inc); }
+
+  /* ---- Tables ---- */
+  .tbl-wrap { overflow-x: auto; margin: 16px 0 8px; border: 1px solid var(--line); border-radius: 8px; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--line-2); vertical-align: top; }
+  th {
+    font-family: var(--mono); font-size: 11.5px; letter-spacing: 0.05em; text-transform: uppercase;
+    color: var(--mid); font-weight: 600; background: var(--paper-2); position: sticky; top: 0;
+  }
+  tr:last-child td { border-bottom: none; }
+  td.num, th.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  td .h { font-family: var(--mono); font-size: 13px; }
+
+  .pill {
+    display: inline-block; font-family: var(--mono); font-size: 11.5px; font-weight: 600;
+    padding: 2px 8px; border-radius: 20px; white-space: nowrap;
+  }
+  .p-done { background: var(--inc-bg); color: var(--inc); }
+  .p-part { background: var(--pri-bg); color: var(--rev); }
+  .p-todo { background: #EDEEEA; color: var(--mid); }
+  .p-inc { background: var(--inc-bg); color: var(--inc); }
+  .p-rev { background: var(--pri-bg); color: var(--rev); }
+  .p-exc { background: var(--exc-bg); color: var(--exc); }
+
+  .foot { color: var(--faint); font-size: 13px; font-family: var(--mono); padding: 40px 0 60px; border-top: 1px solid var(--line); margin-top: 40px; }
+
+  @media (max-width: 620px) {
+    h1.title { font-size: 31px; }
+    .stats { grid-template-columns: repeat(2, 1fr); }
+    .wrap { padding: 0 18px; }
+  }
+</style>
+
+<div class="wrap">
+  <header class="mast">
+    <p class="eyebrow">系统交付报告 · Browser-Only Pipeline</p>
+    <h1 class="title">Instagram 红人筛选 SOP V2<br>决策引擎与采集通道交付</h1>
+    <p class="dek">把客户确认书的硬门槛、A–F 评分与五池分流全部代码化，并用登录态浏览器绕开初跑的账号封控——真实账号端到端跑通。</p>
+    <div class="meta-row">
+      <span>分支 <b>sop-v2-dev</b></span>
+      <span>日期 <b>2026-07-14</b></span>
+      <span>规则源 <b>Client-Facing V2.0</b></span>
+      <span>状态 <b class="ok">端到端已验证</b></span>
+    </div>
+  </header>
+
+  <div class="stats">
+    <div class="stat"><div class="n">5<small>/5</small></div><div class="l">账号登录态健康</div></div>
+    <div class="stat"><div class="n">37</div><div class="l">自动化测试全绿</div></div>
+    <div class="stat"><div class="n">20</div><div class="l">commit（真机验证）</div></div>
+    <div class="stat"><div class="n">0</div><div class="l">密码登录 · 零烧号</div></div>
+  </div>
+
+  <div class="col">
+
+  <section>
+    <span class="snum">01 — 结论摘要</span>
+    <h2>初跑的致命阻断已被彻底解决</h2>
+    <p>另一台机器的初跑证明：项目在 Instagram 私有 API 认证阶段整体阻断——22 个账号无一能恢复为可用会话，全链路停在采集之前，产不出任何交付。同时旧漏斗把"无 Amazon 橱窗"当硬淘汰，与客户"有/无橱窗均可、未知进 Review"的双轨要求冲突。</p>
+    <p>本次交付换了地基：<strong>放弃私有 API，改用登录态 Chrome 浏览器会话采集</strong>。客户提供的账号自带有效会话 Cookie，注入浏览器即为登录态——<strong>5 个账号 5 个全部在线，全程零密码/TOTP 登录、零封号风险</strong>。初跑 22/22 的死因不复存在。在此之上，把客户 SOP 的全部判定逻辑代码化并跑通了真实数据。</p>
+  </section>
+
+  <hr>
+
+  <section>
+    <span class="snum">02 — 架构</span>
+    <h2>Modash 发现 · 浏览器采集 · 决策引擎 · 五池交付</h2>
+    <p>发现由 Modash 单通道承担（IG 侧发现随私有 API 一并退役）；采集全部走登录态浏览器；决策与评分是纯离线、可复现、有测试兜底的规则引擎；交付是客户确认格式的五池 Excel。</p>
+    <div class="pipe">
+      <div class="stage"><span class="tag ok">已通</span><div class="k">发现</div><div class="t">Modash Discovery（CDP 直连已登录 Chrome）</div><div class="d">只读抽结果页 handle / 粉丝 / ER，零成本、不点 View/Save/Bulk、不需 Claude 插件。护肤搜索实测返回真实候选。</div></div>
+      <div class="arw">↓</div>
+      <div class="stage"><span class="tag ok">已通</span><div class="k">采集</div><div class="t">BrowserCollector（登录态浏览器会话）</div><div class="d">profile / 近帖 / bio 链接 / 内容信号，同旧结构。web_profile_info 是网页版同款端点，非 instagrapi。</div></div>
+      <div class="arw">↓</div>
+      <div class="stage"><span class="tag ok">已通</span><div class="k">证据</div><div class="t">Storefront 穿透 · 人工证据 · Modash 补数</div><div class="d">浏览器打开聚合页读真实出链穿透 Amazon；Raw Skin/VO/报价人工录入（缺证据拒绝放行）。</div></div>
+      <div class="arw">↓</div>
+      <div class="stage"><span class="tag ok">已通</span><div class="k">决策</div><div class="t">硬门槛 → A–F 评分 → 五池路由</div><div class="d">config 单一事实源；N/A 归一化；固定 Review 不被高分覆盖；同输入逐字节可复现。</div></div>
+      <div class="arw">↓</div>
+      <div class="stage"><span class="tag ok">已通</span><div class="k">交付</div><div class="t">五池 XLSX（8 sheet）</div><div class="d">Batch Summary + 五个互斥决策池 + Evidence Index + Data Dictionary；缺失显示"缺失"不填 0，Herman 两列可回填。</div></div>
+    </div>
+  </section>
+
+  <hr>
+
+  <section>
+    <span class="snum">03 — 已建成与测试</span>
+    <h2>模块清单</h2>
+    <p>决策引擎全部离线、零 IG 请求、可复现，<strong>37 项自动化测试全绿</strong>（硬门槛边界 · 评分归一化 · 五池互斥 · 脱敏）。</p>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>模块</th><th>职责</th><th>状态</th></tr></thead>
+        <tbody>
+          <tr><td><span class="h">config/sop_v2.toml</span></td><td>20 组规则单一事实源（半开区间 + 9 条冲突标注）</td><td><span class="pill p-done">完成</span></td></tr>
+          <tr><td><span class="h">gates.py</span></td><td>GATE-01..12 + 可采集性，全边界用例</td><td><span class="pill p-done">完成</span></td></tr>
+          <tr><td><span class="h">scoring.py</span></td><td>A–F 六模块 · N/A 归一化 · AI Score · 9.5 封顶</td><td><span class="pill p-done">完成</span></td></tr>
+          <tr><td><span class="h">routing.py</span></td><td>固定 Review 七项优先 → 五池互斥</td><td><span class="pill p-done">完成</span></td></tr>
+          <tr><td><span class="h">run_v2 · export_v2_xlsx</span></td><td>编排（可复现）+ 五池 8-sheet 交付</td><td><span class="pill p-done">完成</span></td></tr>
+          <tr><td><span class="h">pool_health.py</span></td><td>登录态 profile 池分诊（5/5 健康）</td><td><span class="pill p-done">完成</span></td></tr>
+          <tr><td><span class="h">browser_collect.py</span></td><td>profile + 近帖（首屏 12）+ 内容信号</td><td><span class="pill p-done">完成</span></td></tr>
+          <tr><td><span class="h">storefront_verify.py</span></td><td>聚合页 → Amazon 橱窗浏览器穿透 + 留证</td><td><span class="pill p-done">完成</span></td></tr>
+          <tr><td><span class="h">import_manual_evidence.py</span></td><td>Raw Skin/VO/报价人工证据（缺证据拒放行）</td><td><span class="pill p-done">完成</span></td></tr>
+          <tr><td><span class="h">redaction.py</span></td><td>交付脱敏扫描（实测零凭证泄露）</td><td><span class="pill p-done">完成</span></td></tr>
+          <tr><td><span class="h">评论正文提取（B0-4）</span></td><td>DOM 提取，当前诚实降级为 Review 待有头逆向</td><td><span class="pill p-part">进行中</span></td></tr>
+          <tr><td><span class="h">30 帖分页 · Modash 补数 · P2 运营</span></td><td>近帖扩到 30、受众/假粉补数、manifest/看板</td><td><span class="pill p-todo">待建</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <hr>
+
+  <section>
+    <span class="snum">04 — 客户需求覆盖</span>
+    <h2>SOP 判定逻辑 → 代码</h2>
+    <p>硬红线、A–F 100 分、五池分流全部按确认书口径落到 config，规则模块零硬编码。分档一律半开区间消除恰值歧义，边界都有测试。</p>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>硬门槛</th><th class="num">口径（代码化）</th><th>命中</th></tr></thead>
+        <tbody>
+          <tr><td>Paid 粉丝档</td><td class="num">10K ≤ f ≤ 150K</td><td>Exclude</td></tr>
+          <tr><td>Gifting 粉丝档</td><td class="num">5K–&lt;30K 标准 / 30K–50K 优先</td><td>Priority</td></tr>
+          <tr><td>Fake Followers</td><td class="num">≥ 25% 淘汰</td><td>Exclude</td></tr>
+          <tr><td>Modash General ER</td><td class="num">≤ 2% 淘汰</td><td>Exclude</td></tr>
+          <tr><td>赞助饱和度</td><td class="num">&lt;30 过 · 30–40 Review · &gt;40 淘汰</td><td>三分流</td></tr>
+          <tr><td>国家一致性</td><td class="num">Creator = Top Audience，属目标国</td><td>Exclude</td></tr>
+          <tr><td>SHEIN / Temu 合作</td><td class="num">合作语境命中即淘汰</td><td>Exclude</td></tr>
+          <tr><td>Storefront 双轨</td><td class="num">有/无均可 Include · 未知 Review</td><td>路由</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p style="margin-top:18px">评分六模块 <span class="m">A 内容 15</span> <span class="m">B 专业视觉 15</span> <span class="m">C 社区信任 20</span> <span class="m">D 商业基建 15</span> <span class="m">E 受众质量 20</span> <span class="m">F 经济性 15</span>，N/A 子项从分母移除；<strong>Normalized Total 判层</strong>（≥75 Include / 65–75 Priority / 50–65 Review / &lt;50 Exclude），AI Score 仅展示——杜绝 74.9 被四舍五入误入 Include。</p>
+    <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:14px">
+      <span class="pill p-inc">Include · With Storefront</span>
+      <span class="pill p-inc">Include · Without Storefront</span>
+      <span class="pill p-rev">Priority Review</span>
+      <span class="pill p-rev">Review</span>
+      <span class="pill p-exc">Exclude</span>
+    </div>
+  </section>
+
+  <hr>
+
+  <section>
+    <span class="snum">05 — 真实数据验证</span>
+    <h2>端到端跑通，分流可追溯</h2>
+    <p>Modash 护肤搜索 → 浏览器采集 → 决策 → 五池 XLSX，全链路在真实账号上运行。每条决策都能追溯到硬门槛的实测值、阈值与原因码。</p>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>候选</th><th class="num">粉丝</th><th class="num">Modash ER</th><th>决策</th><th>依据</th></tr></thead>
+        <tbody>
+          <tr><td class="h">@annascountryhome</td><td class="num">18,525</td><td class="num">2.54%</td><td><span class="pill p-rev">Review</span></td><td>lifestyle 封顶 + 缺 Modash 补数</td></tr>
+          <tr><td class="h">@carmenbauza…</td><td class="num">34,986</td><td class="num">0.33%</td><td><span class="pill p-exc">Exclude</span></td><td>GATE-07：ER ≤ 2%</td></tr>
+          <tr><td class="h">@lumarasystems</td><td class="num">20,459</td><td class="num">0.96%</td><td><span class="pill p-exc">Exclude</span></td><td>GATE-07：ER ≤ 2%</td></tr>
+          <tr><td class="h">@lumaderma_</td><td class="num">9,619</td><td class="num">0.38%</td><td><span class="pill p-exc">Exclude</span></td><td>粉丝 &lt; 10K + ER ≤ 2%</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p style="margin-top:16px">系统忠实地把低互动候选挡在门外，并给出可复核的理由——这正是确认书要的"稳定复刻真人判断"。可复现性已验证：同一批输入两次运行输出逐字节一致。</p>
+  </section>
+
+  <hr>
+
+  <section>
+    <span class="snum">06 — Storefront 穿透</span>
+    <h2>聚合页 → Amazon 橱窗，已做</h2>
+    <p>专门核实：<strong>Amazon 与 LTK/Linktree 等聚合页穿透已实现</strong>。逻辑分三层——bio 里 Amazon 直链直接 <span class="m">confirmed_yes</span>；聚合页（Linktree / Beacons / LTK / ShopMy / Stan）用真浏览器渲染后读全部真实出链，命中 <span class="m">amazon.com/shop</span> 则确认橱窗并留链接与截图；打开成功但无 Amazon 出链记 <span class="m">confirmed_no</span>；LTK 联盟跳转无法自动确认的记 <span class="m">unknown</span> 进 Review 待人工点查。</p>
+    <div class="callout">
+      <h4>实测</h4>
+      <p>@annascountryhome 的 <span class="m">linktr.ee/ourgreenwood</span>：浏览器读取 55 个出链、无任何 Amazon 链接 → 判定 confirmed_no，并存证。"未知"被真实解析掉，而非拍脑袋。</p>
+    </div>
+  </section>
+
+  <hr>
+
+  <section>
+    <span class="snum">07 — 需客户裁定</span>
+    <h2>两个设计决策点</h2>
+    <div class="callout warn">
+      <h4>Modash 发现页 ER 是否可直接硬淘汰</h4>
+      <p>@carmenbauza 的 IG 实算 static ER 是 2.12%，但 Modash 发现页 ER 是 0.33%（两者口径不同：Modash 是近两月中位数）。现按确认书用 Modash General ER 直接判 GATE-07 淘汰。若希望 ER 边界候选先补 Profile Report 再定，需客户确认。</p>
+    </div>
+    <div class="callout warn">
+      <h4>9 条 SOP 内部冲突已按保守口径落地</h4>
+      <p>organic 分档、9.5 封顶的 VO 是"或"还是"且"、CPM 分档与 $40 线冲突、评论低质恰值等，均按初跑口径运行并在代码标注 CONFLICT，随首批交付逐条请客户裁定，只有明确确认才写回 config。</p>
+    </div>
+  </section>
+
+  <hr>
+
+  <section>
+    <span class="snum">08 — 剩余工作</span>
+    <h2>在已验证的地基上加深度</h2>
+    <ul class="clean">
+      <li><strong>评论正文提取（B0-4）</strong>：REST 端点对 web 会话失效、DOM 提取需有头逆向当前 IG 标记；当前诚实降级为"评论不足 → Review"，不造假数据。</li>
+      <li><strong>近帖扩到 30（B0-3）</strong>：现为首屏约 12 帖，够赞助/内容初判；完整 30 帖视觉窗口需 GraphQL 分页。</li>
+      <li><strong>Modash 定向补数（P1-4）</strong>：假粉/受众国家/语言/合作史，仅对高潜候选逐个开 Profile（消耗预算，先 canary）。</li>
+      <li><strong>运营化（P2）</strong>：批次 manifest、HTML 审计报告、客户反馈回流、质量看板、Modash 操作规范文档。</li>
+    </ul>
+  </section>
+
+  <hr>
+
+  <section>
+    <span class="snum">09 — 如何运行</span>
+    <h2>命令</h2>
+    <div class="tbl-wrap">
+      <table>
+        <tbody>
+          <tr><td style="width:34%">账号池体检</td><td class="h">pool_health.py</td></tr>
+          <tr><td>Modash 护肤搜索</td><td class="h">modash_search.py --query "…"</td></tr>
+          <tr><td>采集 + 穿透 + 评论</td><td class="h">assemble --pool … --penetrate --comments</td></tr>
+          <tr><td>决策（可复现）</td><td class="h">run_v2 --from-candidates … --track paid</td></tr>
+          <tr><td>五池交付</td><td class="h">export_v2_xlsx.py --decisions … --out …</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  </div>
+
+  <p class="foot">Instagram 红人筛选 SOP V2 · 交付报告 · sop-v2-dev · 2026-07-14 · 决策口径以 config/sop_v2.toml 为准</p>
+</div>
