@@ -15,62 +15,102 @@ from pathlib import Path
 POOLS = ["Include-With-Storefront", "Include-Without-Storefront",
          "Priority-Review", "Review", "Exclude"]
 
-# 共用列（决策+反馈 / 身份 / 硬门槛 / 评分分解 一部分）
+# 交付列，严格对齐客户 SOP §8 最终交付字段 + §13 原始/标准化值与采集时间
 COLUMNS = [
-    ("Final Pool", "final_pool"),
-    ("AI Vetting Score", "ai_vetting_score"),
-    ("Normalized Total", "normalized_total"),
-    ("Country", "creator_country"),
+    ("Country", "country"),
     ("Handle (IG)", "handle_at"),
-    ("Full Name", "full_name"),
     ("Followers", "follower_count"),
-    ("Campaign Track", "campaign_track"),
-    ("Creator Niche", "core_niche_key"),
-    ("Storefront Status", "storefront_status"),
-    ("Amazon Storefront Link", "amazon_storefront_link"),
-    ("Fake %", "fake_pct"),
-    ("Modash ER %", "general_er"),
-    ("Sponsorship Saturation", "sponsorship_saturation"),
-    ("A Content", "score_A"),
-    ("B Prof&Visual", "score_B"),
-    ("C Community", "score_C"),
-    ("D Commercial", "score_D"),
-    ("E Audience", "score_E"),
-    ("F Economics", "score_F"),
+    ("Creator Niche", "niche_label"),
+    ("Fake / ER (%)", "fake_er"),
+    ("Amazon Storefront Link", "storefront_cell"),
+    ("Sponsorship Saturation", "sponsorship_cell"),
+    ("Has VO & Raw Skin", "vo_rawskin"),
+    ("Elite Brand History", "elite_brand"),
+    ("AI Vetting Score (1-10)", "ai_reason"),
+    ("High-Intent Comment Snippets", "high_intent_snips"),
+    ("Herman Approval", "_herman_approval"),
+    ("Herman's Feedback", "_herman_feedback"),
     ("Review Reason", "review_reason"),
     ("Exclude Reason", "exclude_reason"),
     ("Missing Data", "missing_data"),
+    ("Evidence Link", "evidence_link"),
     ("Discovery Source", "discovery_source"),
-    ("Profile URL", "profile_url"),
-    ("Herman Approval", "_herman_approval"),
-    ("Herman's Feedback", "_herman_feedback"),
+    ("Normalized Total", "normalized_total"),
+    ("Score A-F", "score_af"),
+    ("Captured At", "captured_at"),
 ]
 
 MISSING = "缺失"
+
+NICHE_LABEL = {"skincare": "Skincare", "beauty_device": "Beauty Device",
+               "beauty_wellness": "Beauty/Wellness", "lifestyle": "Lifestyle", "other": "Other"}
+
+
+def _fmt_pct(v):
+    return f"{v}%" if v is not None else MISSING
 
 
 def _cell(cand: dict, key: str):
     if key in ("_herman_approval", "_herman_feedback"):
         return ""  # 空列供客户回填
+    if key == "country":
+        return cand.get("creator_country") or MISSING
     if key == "handle_at":
         h = cand.get("handle") or ""
         return f"@{h}" if h and not h.startswith("@") else h
+    if key == "niche_label":
+        return NICHE_LABEL.get(cand.get("core_niche_key"), cand.get("core_niche_key") or MISSING)
+    if key == "fake_er":
+        fake = f"{cand['fake_pct']}% Fake" if cand.get("fake_pct") is not None else "— Fake"
+        er = f"{cand['general_er']}% ER" if cand.get("general_er") is not None else "— ER"
+        return f"{fake} / {er}"
+    if key == "storefront_cell":
+        st = cand.get("storefront_status")
+        link = cand.get("amazon_storefront_link")
+        if st == "confirmed_yes":
+            return link or "有（链接待补）"
+        if st == "confirmed_no":
+            return "确认无 Storefront"
+        return "未确认（待穿透/人工）"
+    if key == "sponsorship_cell":
+        return _fmt_pct(cand.get("sponsorship_saturation"))
+    if key == "vo_rawskin":
+        vo = {True: "Yes", False: "No"}.get(cand.get("has_vo"), "Pending")
+        rs = cand.get("raw_skin_grade") or "Pending"
+        return f"VO: {vo} / Raw Skin: {rs}"
+    if key == "elite_brand":
+        h = cand.get("elite_brand_hits")
+        return f"命中 {h} 个" if h else ("无" if h == 0 else MISSING)
+    if key == "ai_reason":
+        ai = cand.get("ai_vetting_score")
+        return f"{ai} — {cand.get('decision_summary', '')}" if ai is not None else cand.get("decision_summary", "")
+    if key == "high_intent_snips":
+        snips = cand.get("high_intent_snippets") or []
+        return " / ".join(snips[:2]) if snips else ("—" if cand.get("comments_analyzed") else "评论待采集")
     if key == "review_reason":
-        return "; ".join(cand.get("review_reasons") or []) or ""
+        return "；".join(cand.get("review_reasons_text") or []) or ""
     if key == "exclude_reason":
-        return "; ".join(cand.get("exclude_reasons") or []) or ""
+        return "；".join(cand.get("exclude_reasons_text") or []) or ""
     if key == "missing_data":
         return "; ".join(cand.get("missing_data") or []) or ""
-    if key.startswith("score_"):
-        mod = key.split("_")[1]
-        sd = (cand.get("score_by_module") or {}).get(mod)
-        if sd is None:
-            return MISSING
-        return f"{sd['earned']}/{sd['available']}" if sd.get("available") else "N/A"
+    if key == "evidence_link":
+        parts = []
+        if cand.get("profile_url"):
+            parts.append(cand["profile_url"])
+        ev = cand.get("storefront_evidence") or {}
+        if ev.get("screenshot"):
+            parts.append(f"storefront 截图: {ev['screenshot']}")
+        elif ev.get("source_url"):
+            parts.append(f"storefront: {ev['source_url']}")
+        return " | ".join(parts) or MISSING
+    if key == "score_af":
+        sm = cand.get("score_by_module") or {}
+        return " ".join(f"{m}:{sm[m]['earned']}/{sm[m]['available']}" if sm.get(m, {}).get("available")
+                        else f"{m}:N/A" for m in "ABCDEF" if m in sm)
+    if key == "captured_at":
+        return cand.get("captured_at") or ""
     v = cand.get(key)
-    if v is None:
-        return MISSING
-    return v
+    return MISSING if v is None else v
 
 
 def build_workbook(decisions: dict):
@@ -81,25 +121,47 @@ def build_workbook(decisions: dict):
     # Batch Summary
     ws = wb.active
     ws.title = "Batch Summary"
+    from collections import Counter
     meta = decisions.get("manifest", {})
+    cands = decisions.get("candidates", [])
     pools_count = {p: 0 for p in POOLS}
-    for c in decisions.get("candidates", []):
+    for c in cands:
         pools_count[c.get("final_pool", "Review")] = pools_count.get(c.get("final_pool", "Review"), 0) + 1
+    exc_reasons = Counter()
+    for c in cands:
+        for r in (c.get("exclude_reasons_text") or []):
+            exc_reasons[r] += 1
+    missing_n = sum(1 for c in cands if c.get("missing_data"))
+    top_exc = "；".join(f"{k}×{v}" for k, v in exc_reasons.most_common(4)) or "—"
+
     rows = [
+        ("批次报告", "Instagram 红人筛选 · SOP V2 交付"),
         ("Batch ID", meta.get("batch_id", "")),
         ("SOP 版本", meta.get("sop_version", "")),
         ("Campaign Track", meta.get("campaign_track", "")),
-        ("config SHA-256", meta.get("config_sha256", "")),
-        ("候选总数", len(decisions.get("candidates", []))),
         ("生成时间", decisions.get("generated_at", "")),
+        ("config SHA-256", (meta.get("config_sha256", "") or "")[:16] + "…"),
+        ("", ""),
+        ("候选总数", len(cands)),
+        ("— Include (With Storefront)", pools_count.get("Include-With-Storefront", 0)),
+        ("— Include (Without Storefront)", pools_count.get("Include-Without-Storefront", 0)),
+        ("— Priority Review", pools_count.get("Priority-Review", 0)),
+        ("— Review", pools_count.get("Review", 0)),
+        ("— Exclude", pools_count.get("Exclude", 0)),
+        ("", ""),
+        ("有待补数据(Missing)候选", missing_n),
+        ("主要淘汰原因", top_exc),
+        ("", ""),
+        ("阅读说明", "五个 sheet 为互斥决策池，同一候选只出现一次。缺失字段显示「缺失」，不等于 0。"),
+        ("", "AI Vetting Score 1-10；分层用 Normalized Total（≥75 Include / 65-75 Priority / 50-65 Review / <50 Exclude）。"),
+        ("", "Herman Approval / Herman's Feedback 为空列，供客户回填。"),
+        ("Modash 补数说明", "本批未逐个开 Modash Profile（受众/假粉/国家/语言待补），相关候选按 SOP 固定进 Review。"),
     ]
-    for p in POOLS:
-        rows.append((p, pools_count.get(p, 0)))
     for r, (k, v) in enumerate(rows, 1):
         ws.cell(r, 1, k).font = Font(bold=True)
         ws.cell(r, 2, v)
-    ws.column_dimensions["A"].width = 26
-    ws.column_dimensions["B"].width = 50
+    ws.column_dimensions["A"].width = 30
+    ws.column_dimensions["B"].width = 82
 
     header_fill = PatternFill("solid", fgColor="2563EB")
     by_pool = {p: [] for p in POOLS}

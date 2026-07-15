@@ -24,6 +24,57 @@ from extensions.sop_v2.config import config_sha256, load_config  # noqa: E402
 from extensions.sop_v2.contracts import GateVerdict  # noqa: E402
 
 
+REASON_TEXT = {
+    "followers_out_of_range": "粉丝档超出范围",
+    "gifting_out_of_range": "Gifting 粉丝档超出范围",
+    "fake_followers_high": "假粉 ≥ 25%",
+    "general_er_low": "Modash General ER ≤ 2%",
+    "sponsorship_saturated": "赞助饱和 > 40%",
+    "sponsorship_borderline": "赞助 30–40% 待复核",
+    "creator_country_not_target": "非目标国家",
+    "country_mismatch": "创作者国家 ≠ 受众主国",
+    "shein_temu_partnership": "SHEIN/Temu 合作史",
+    "non_personal_creator": "非个人创作者（品牌号）",
+    "medical_studio_default": "医生/诊所账号待客户批示",
+    "storefront_unknown": "Storefront 状态未确认",
+    "modash_core_missing": "缺 Modash 核心补数（假粉/国家/受众）",
+    "comments_insufficient": "有效评论样本不足",
+    "raw_skin_or_vo_unverified": "Raw Skin / VO 未人工核验",
+    "paid_quote_missing": "缺实际报价",
+    "audience_target_below_35": "目标受众合计 < 35%",
+    "language_unmatched": "受众语言不匹配/缺失",
+    "lifestyle_cap": "Lifestyle 赛道待补产品/护肤证据",
+    "gifting_priority_pool": "Gifting 30K–50K 优秀候选优先复核",
+    "graph_unaudited_cap": "图谱来源未完整审计",
+}
+
+
+def _humanize(codes):
+    out = []
+    for c in codes or []:
+        base = c.split(":")[0]
+        out.append(REASON_TEXT.get(base, REASON_TEXT.get(c, c)))
+    # 去重保序
+    seen, res = set(), []
+    for x in out:
+        if x not in seen:
+            seen.add(x)
+            res.append(x)
+    return res
+
+
+def decision_summary(pool: str, review_reasons, exclude_reasons, ai) -> str:
+    if pool == "Exclude":
+        r = _humanize(exclude_reasons or review_reasons)
+        return "淘汰 · " + "；".join(r[:2]) if r else "淘汰"
+    if pool.startswith("Include"):
+        tail = "有 Storefront" if "With" in pool else "无 Storefront"
+        return f"纳入（{tail}）· AI {ai}"
+    r = _humanize(review_reasons)
+    head = "优先复核" if pool == "Priority-Review" else "待复核"
+    return f"{head} · " + "；".join(r[:2]) if r else head
+
+
 def score_by_module(items) -> dict:
     out = {}
     for it in items:
@@ -54,6 +105,10 @@ def decide(cand: dict, cfg: dict) -> dict:
         "ai_vetting_score": ai,
         "score_by_module": score_by_module(items),
         "gate_results": [g.to_dict() for g in gate_results],
+        "review_reasons_text": _humanize(r.get("review_reasons")),
+        "exclude_reasons_text": _humanize(r.get("exclude_reasons")),
+        "decision_summary": decision_summary(r["pool"].value, r.get("review_reasons"),
+                                             r.get("exclude_reasons"), ai),
     })
     # storefront link 展示
     if cand.get("storefront_status") == "confirmed_yes":

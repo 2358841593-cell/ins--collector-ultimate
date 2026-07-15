@@ -88,8 +88,9 @@ def assemble_one(handle, modash_rec, account, headless=True):
         "core_niche_key": derive_niche(prof),
         "general_er": _er_to_float(modash_rec.get("er")),
         "brand_account_type": "personal",
-        "discovery_source": "modash_" + (modash_rec.get("search_mode") or "search"),
+        "discovery_source": "Modash Discover / " + (modash_rec.get("search_mode") or "search"),
         "discovered_via": "modash_search",
+        "captured_at": time.strftime("%Y-%m-%d %H:%M"),
         "_profile_source": prof.get("_source"),
         # Modash 补数字段留空 → 固定 Review（modash_core_missing）
         "fake_pct": None, "creator_country": None, "top_audience_country": None,
