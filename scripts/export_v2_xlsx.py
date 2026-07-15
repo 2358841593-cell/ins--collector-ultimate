@@ -134,6 +134,15 @@ def build_workbook(decisions: dict):
             exc_reasons[r] += 1
     missing_n = sum(1 for c in cands if c.get("missing_data"))
     top_exc = "；".join(f"{k}×{v}" for k, v in exc_reasons.most_common(4)) or "—"
+    # ER 分布发现（Modash 值）：赛道互动率校准依据
+    ers = [c["general_er"] for c in cands if c.get("general_er") is not None]
+    if ers:
+        over2 = sum(1 for e in ers if e > 2.0)
+        er_finding = (f"本批 {len(ers)} 个有 Modash ER：区间 {min(ers):.2f}%–{max(ers):.2f}%，"
+                      f"其中 >2%(硬门槛)仅 {over2} 个（{over2*100//len(ers)}%）。"
+                      f"红光/LED 护肤设备赛道互动率普遍偏低，建议客户校准该赛道 ER 门槛或接受较低产出。")
+    else:
+        er_finding = "本批无 Modash ER 值（待补数）。"
 
     rows = [
         ("批次报告", "Instagram 红人筛选 · SOP V2 交付"),
@@ -152,6 +161,7 @@ def build_workbook(decisions: dict):
         ("", ""),
         ("有待补数据(Missing)候选", missing_n),
         ("主要淘汰原因", top_exc),
+        ("★ 校准发现（ER 分布）", er_finding),
         ("", ""),
         ("阅读说明", "五个 sheet 为互斥决策池，同一候选只出现一次。缺失字段显示「缺失」，不等于 0。"),
         ("", "AI Vetting Score 1-10；分层用 Normalized Total（≥75 Include / 65-75 Priority / 50-65 Review / <50 Exclude）。"),
