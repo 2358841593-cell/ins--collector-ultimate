@@ -168,6 +168,48 @@ def fetch_profile(account: str, handle: str, headless: bool = True) -> dict:
             ctx.close()
 
 
+def fetch_comments(account: str, media_pk: str, shortcode: str = "", max_n: int = 10,
+                   headless: bool = True) -> list[dict]:
+    """用登录态浏览器会话读某帖评论（web app 同款 comments 端点，非 instagrapi）。
+    返回 [{text, username, like_count}, ...]，上限 max_n。失败返回 []。"""
+    from playwright.sync_api import sync_playwright
+
+    profile_dir = PROFILE_BASE / account
+    if not profile_dir.exists():
+        return []
+    with sync_playwright() as pw:
+        ctx = pw.chromium.launch_persistent_context(
+            user_data_dir=str(profile_dir), channel="chrome", headless=headless,
+            args=["--no-first-run", "--no-default-browser-check"])
+        try:
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            ref = f"https://www.instagram.com/p/{shortcode}/" if shortcode else "https://www.instagram.com/"
+            page.goto(ref, wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(2000)
+            data = page.evaluate(
+                """async ({pk, appid}) => {
+                    const r = await fetch(`/api/v1/media/${pk}/comments/?can_support_threading=true&permalink_enabled=false`,
+                      {headers: {'x-ig-app-id': appid}, credentials: 'include'});
+                    if (!r.ok) return {__error: 'http_' + r.status};
+                    return await r.json();
+                }""",
+                {"pk": str(media_pk), "appid": IG_WEB_APP_ID},
+            )
+            comments = (data or {}).get("comments") or []
+            out = []
+            for c in comments[:max_n]:
+                out.append({
+                    "text": c.get("text") or "",
+                    "username": (c.get("user") or {}).get("username") or "",
+                    "like_count": c.get("comment_like_count") or 0,
+                })
+            return out
+        except Exception:  # noqa: BLE001
+            return []
+        finally:
+            ctx.close()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--account", required=True, help="用哪个登录态 profile 采集")

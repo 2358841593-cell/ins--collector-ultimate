@@ -20,6 +20,8 @@ from extensions.sop_v2 import content as content_mod  # noqa: E402
 from extensions.sop_v2.config import load_config  # noqa: E402
 
 _CFG = load_config()
+PENETRATE = False   # 由 CLI --penetrate 打开（Storefront 穿透较慢）
+COMMENTS = False    # 由 CLI --comments 打开（评论采集较慢）
 
 AGG = ("linktr.ee", "beacons", "ltk", "liketoknow", "shopmy", "komi.io", "stan.store",
        "linkin.bio", "milkshake", "flowpage")
@@ -97,8 +99,44 @@ def assemble_one(handle, modash_rec, account, headless=True):
         "posts": prof.get("posts"),
     }
     cand.update(content_mod.derive_content_signals(cand, _CFG))
+    if PENETRATE and cand.get("storefront_status") in ("unknown", None):
+        from extensions.sop_v2 import storefront_verify as sv
+        sv.resolve_candidate(cand, headless=True)
+    if COMMENTS:
+        _collect_comments(cand, account, headless)
     cand.pop("posts", None)   # 内容信号已派生，posts 不进候选（体积/隐私）
     return cand
+
+
+def _collect_comments(cand: dict, account: str, headless: bool):
+    """采样 Top2+Recent2 帖抓评论并分析（量小控成本）。"""
+    from extensions.sop_v2 import comments as cmt
+    posts = cand.get("posts") or []
+    if not posts:
+        return
+    by_eng = sorted(posts, key=lambda p: (p.get("like_count") or 0) + (p.get("comment_count") or 0),
+                    reverse=True)[:2]
+    by_recent = sorted(posts, key=lambda p: p.get("taken_at") or 0, reverse=True)[:2]
+    seen, sample = set(), []
+    for p in by_eng + by_recent:
+        pk = p.get("pk")
+        if pk and pk not in seen:
+            seen.add(pk)
+            sample.append(p)
+    texts = []
+    per_post = _CFG["comments"]["per_post_max"]
+    for p in sample:
+        cs = browser_collect.fetch_comments(account, p.get("pk"), p.get("code") or "",
+                                            max_n=per_post, headless=headless)
+        texts.extend(c["text"] for c in cs)
+        time.sleep(2.0)
+    res = cmt.analyze(texts)
+    cand["valid_comments"] = res["valid_comments"]
+    cand["comments_analyzed"] = res["comments_analyzed"]
+    cand["high_intent_count"] = res["high_intent_count"]
+    cand["high_intent_ratio"] = res["high_intent_ratio"]
+    cand["low_quality_ratio"] = res["low_quality_ratio"]
+    cand["high_intent_snippets"] = res["top_intent"]
 
 
 def main() -> int:
@@ -107,8 +145,13 @@ def main() -> int:
     ap.add_argument("--account", required=True, help="用哪个登录态 profile 采集")
     ap.add_argument("--out", required=True)
     ap.add_argument("--limit", type=int, default=0, help="只采前 N 个（0=全部）")
+    ap.add_argument("--penetrate", action="store_true", help="对未确认 Storefront 做浏览器穿透")
+    ap.add_argument("--comments", action="store_true", help="采样帖子抓评论并分析")
     ap.add_argument("--show-head", action="store_true")
     args = ap.parse_args()
+    global PENETRATE, COMMENTS
+    PENETRATE = args.penetrate
+    COMMENTS = args.comments
 
     pool = json.loads(Path(args.pool).read_text())
     recs = pool.get("candidates", pool)
