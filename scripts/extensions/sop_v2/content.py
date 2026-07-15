@@ -92,10 +92,11 @@ def derive_content_signals(cand: dict, cfg: dict) -> dict:
     out["device_specs_score"] = min(_distinct_hits(captions, DEVICE_SPECS), 4)
     out["skin_science_score"] = min(_distinct_hits(captions, SKIN_SCIENCE), 2)
 
-    # 互动率达标（Reels vs Static 分开，按档基准）
+    # 互动率：实算 ER 取近 N 帖（客户口径：前 10 条帖子合并算）= 硬门槛依据；
+    # Reels/Static 分开仍保留供评分参考。Modash ER 只作参考（见 gates.gate_general_er）。
     if followers > 0:
-        reels = [p for p in posts if p.get("media_type") == 2]
-        static = [p for p in posts if p.get("media_type") != 2]
+        window = int(cfg.get("real_er", {}).get("window_posts", 10))
+        recentN = posts[:window]                       # 前 N 帖（够大才准，客户定 10）
 
         def er(ps):
             if not ps:
@@ -103,6 +104,13 @@ def derive_content_signals(cand: dict, cfg: dict) -> dict:
             avg = sum((p.get("like_count") or 0) + (p.get("comment_count") or 0) for p in ps) / len(ps)
             return round(avg / followers * 100, 2)
 
+        # 实算 ER：前 N 帖合并（赞+评）/粉丝，只在拿得到赞评数时计算
+        have_counts = [p for p in recentN if p.get("like_count") is not None]
+        out["real_er"] = er(have_counts) if have_counts else None
+        out["real_er_window"] = len(have_counts)
+
+        reels = [p for p in recentN if p.get("media_type") == 2]
+        static = [p for p in recentN if p.get("media_type") != 2]
         bm = cfg["scoring"]["C"]["er_benchmark"]
         tier_mid = followers >= 100000
         reels_er, static_er = er(reels), er(static)

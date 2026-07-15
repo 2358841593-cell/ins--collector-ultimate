@@ -27,9 +27,18 @@ require_creator_equals_top_audience = true   # 不一致 → Exclude
 # ── Modash 数值硬门槛 ─────────────────────────────────────────────
 [modash_gates]
 fake_pct_exclude_at = 25.0     # >=25 Exclude（恰 25 淘汰）；<25 过
-general_er_exclude_at = 2.0    # <=2 Exclude（恰 2 淘汰）；>2 过
-# 核心字段缺任一 → 固定 Review（项目默认名单，待客户确认，见 §5 C7）
-core_fields = ["fake_pct", "general_er", "creator_country", "top_audience_country"]
+# 客户 2026-07-15 确认：ER 标准放宽，Modash ER 只作参考、不再硬淘汰（实算 ER 才是硬门槛）
+general_er_reference_only = true
+general_er_exclude_at = 2.0    # 仅当 reference_only=false 时生效（保留旧口径可回退）
+# 核心字段缺任一 → 固定 Review（general_er 已降为参考，不计入核心缺失）
+core_fields = ["fake_pct", "creator_country", "top_audience_country"]
+
+# ── 实算 ER 硬门槛（客户口径：前 10 帖赞评/粉丝；标准已放宽）──────────
+[real_er]
+window_posts = 10              # 取前 10 条帖子合并计算（够大才准）
+exclude_below = 0.5            # 实算 ER < 0.5% 才硬淘汰（放宽后只挡僵尸/刷量号）
+review_below = 1.0            # [0.5,1.0) → Review（偏低待人工判）；>=1.0 过
+missing_is_review = true       # 拿不到赞评数（未登录/私密）→ 固定 Review，不误杀
 
 # ── 受众质量分流（E 模块相关的路由触发）────────────────────────────
 [audience]
@@ -202,16 +211,37 @@ instagram_first = ["content", "sponsorship", "comments", "visual"]
 # 人工证据最高优先级；冲突记 conflict 不静默覆盖
 manual_highest = true
 
-# ── 发现（Modash 单发现通道 + 外部 handle 注入）─────────────────
+# ── 发现：本版只做「Amazon Finds 导购型」赛道（客户 2026-07-15 确认）──────────
+# 目标画像：个人红人（非品牌/店铺）+ Amazon 橱窗 + 护肤/美妆带货内容 + 评论区有购买意图。
+# 通道：Modash AI Search 带货导向多查询累积 → 浏览器浅扫过滤（登录态，零 API）。
 [discovery]
-# IG 侧不再自产发现（tagged/mention/Lookalike API 已随 instagrapi 退役）
-brand_seeds = ["omnilux", "currentbody", "therabody"]
-product_keywords = ["nanoleaf", "red light therapy", "face mask", "wand", "panel", "led mask"]
-scene_keywords = ["acne care", "anti-aging", "skin recovery", "daily routine"]
+niche = "amazon_shopping_guide"
+# Modash AI Search 种子查询（带货导向；命中"个人+橱窗+护肤/美妆带货"，而非教育号/店铺号）
+modash_queries = [
+  "amazon storefront skincare finds link in bio",
+  "shop my amazon skincare must haves beauty",
+  "amazon beauty finds skincare routine haul",
+  "amazon skincare favorites storefront affiliate",
+  "amazon must haves beauty influencer skincare",
+  "amazon finds beauty tiktok made me buy skincare",
+]
+# 橱窗信号（bio/外链命中任一 = 有 Amazon 橱窗，硬门槛）
+storefront_signals = ["amazon.com/shop", "amazon storefront", "amzn.to", "amazon.", "/shop/", "storefront"]
+# 赛道关键词（护肤/美妆导购；浅扫判赛道用）
+niche_keywords = ["skincare", "skin care", "beauty", "makeup", "amazon finds", "amazon must",
+                  "shop my", "link in bio", "serum", "retinol", "sunscreen", "routine", "glow"]
+# 排除店铺/品牌号信号（bio/名字命中 = 疑似店铺，非个人红人）
+exclude_store_signals = ["official store", "shop now", "we sell", "wholesale", "authentic",
+                         "™", "®", "worldwide shipping", "order now", "dm to order"]
 exclude_keywords = ["#shein", "#temu"]
-# 数量漏斗
-funnel = { search_page = 300, denoise = 100, ig_profile = 50, deep = 30, modash_profile = 20, include_max = 10 }
-# 两源命中优先深扫（Modash 各模板/客户回流/人工 Approved 互为独立源；IG 不再自产）
+# content.py SKU/竞品/场景命中用（护肤导购口径，替换原红光设备词）
+brand_seeds = ["cerave", "the ordinary", "cosrx", "la roche posay", "paula's choice", "beauty of joseon"]
+product_keywords = ["serum", "retinol", "niacinamide", "sunscreen", "spf", "moisturizer",
+                    "cleanser", "toner", "vitamin c", "hyaluronic"]
+scene_keywords = ["morning routine", "night routine", "acne", "anti-aging", "hyperpigmentation", "glow up"]
+# 数量漏斗（目标交付 ~30 个合格）
+funnel = { seed = 80, shallow_pass = 40, deep = 30, include_max = 30 }
+# 多源命中优先深扫（Modash 各模板/客户回流/人工 Approved 互为独立源）
 prefer_multi_source = true
 
 # ── Modash 预算纪律（引用 modash_cost_policy.toml）──────────────

@@ -34,6 +34,36 @@ def _intent(text: str):
     return None
 
 
+# 推广帖识别：caption 命中这些词 = 博主在带货/导购（复用 content.PRODUCT_REC 口径 + 电商域）
+PROMO_CAPTION_KW = [
+    "amazon find", "amazon storefront", "amazon must", "link in bio", "shop my", "linked it",
+    "use code", "discount code", "code ", "must have", "must-have", "obsessed with", "holy grail",
+    "repurchase", "haul", "restock", "linktree", "storefront", "en mi amazon", "en amazon",
+    "código", "codigo", "descuento", "link en", "enlace en", "compra", "disponible en",
+    "lo encuentras", "te dejo el link", "swipe up", "shopmy", "ltk", "liketoknow",
+]
+
+
+def is_promotional(caption: str) -> bool:
+    """caption 是否是明显的带货/导购推广帖。"""
+    c = (caption or "").lower()
+    return any(k in c for k in PROMO_CAPTION_KW)
+
+
+# 购买"考虑"问句：仅在已判定为推广帖时才算意图（context 消歧——同一句在教育帖不算）
+CONSIDER_PHRASES = [
+    "does this work", "does it work", "do they work", "did it work", "is it worth",
+    "worth it", "how do you use", "how to use", "how do i use", "for oily skin", "for dry skin",
+    "for sensitive skin", "for acne", "good for oily", "is this good for", "is it good for",
+    "which one", "which shade", "what shade", "what size", "which do you recommend",
+    "do you recommend", "would you recommend", "is it safe", "how often",
+    "funciona", "vale la pena", "cómo se usa", "como se usa", "cómo lo usas", "como lo usas",
+    "para piel grasa", "para piel seca", "para piel sensible", "para el acné", "para acne",
+    "cuál me recomiendas", "cual me recomiendas", "cuál es mejor", "cual es mejor",
+    "qué tono", "que tono", "lo recomiendas", "sirve para", "es bueno para", "cada cuánto",
+    "funciona mesmo", "vale a pena", "serve para", "recomenda",
+]
+
 # 明确购买意图短语（高精度：只留清晰买信号，不含"有效/推荐"等辩论也会中的宽词）
 INTENT_PHRASES = [
     # 求链接/在哪买（最强信号）
@@ -57,11 +87,14 @@ INTENT_PHRASES = [
 ]
 
 
-def find_intent_in_text(page_text: str, max_snippets: int = 4) -> list[str]:
+def find_intent_in_text(page_text: str, max_snippets: int = 4, promo_context: bool = False) -> list[str]:
     """从帖子页可见文字中提取"有购买意图"的评论片段（多语言）。
+    promo_context=True（已判定推广帖）时，额外纳入"考虑购买"问句（does this work / vale la pena /
+    para piel grasa 等）——同一句在教育帖不算意图，在推广帖下才算，靠上下文消歧。
     返回清洗后的短句列表；无则空。用于判断该帖评论是否有意义、是否值得截图。"""
     if not page_text:
         return []
+    phrases = INTENT_PHRASES + CONSIDER_PHRASES if promo_context else INTENT_PHRASES
     # 按行/句切分，逐段找意图短语
     segs = re.split(r"[\n\r]+|(?<=[.?!。？！])\s+", page_text)
     out, seen = [], set()
@@ -72,7 +105,7 @@ def find_intent_in_text(page_text: str, max_snippets: int = 4) -> list[str]:
         if not s or len(s) < 4 or len(s) > 140 or tl_meta.match(s):
             continue
         low = s.lower()
-        if any(ph in low for ph in INTENT_PHRASES):
+        if any(ph in low for ph in phrases):
             key = low[:40]
             if key not in seen:
                 seen.add(key)

@@ -79,13 +79,35 @@ def gate_fake(cand, cfg):
 
 
 def gate_general_er(cand, cfg):
+    """Modash General ER：客户放宽后只作参考，不再硬淘汰（reference_only=true）。"""
     v = cand.get("general_er")
     if v is None:
         return None
-    thr = cfg["modash_gates"]["general_er_exclude_at"]
+    mg = cfg["modash_gates"]
+    if mg.get("general_er_reference_only"):
+        return _g("GATE-07", GateVerdict.PASS, v, "reference", "modash_er_reference", "modash")
+    thr = mg["general_er_exclude_at"]
     if v <= thr:
         return _g("GATE-07", GateVerdict.EXCLUDE, v, f"<={thr}", "general_er_low", "modash")
     return _g("GATE-07", GateVerdict.PASS, v, f">{thr}", source="modash")
+
+
+def gate_real_er(cand, cfg):
+    """实算 ER（前 N 帖赞评/粉丝）= 硬门槛。放宽后只挡僵尸/刷量；缺数据 → 固定 Review 不误杀。"""
+    r = cfg.get("real_er")
+    if not r:
+        return None
+    v = cand.get("real_er")
+    if v is None:
+        if r.get("missing_is_review"):
+            return _g("GATE-13", GateVerdict.REVIEW, None, f">={r['review_below']}",
+                      "real_er_missing", "instagram")
+        return None
+    if v < r["exclude_below"]:
+        return _g("GATE-13", GateVerdict.EXCLUDE, v, f">={r['exclude_below']}", "real_er_low", "instagram")
+    if v < r["review_below"]:
+        return _g("GATE-13", GateVerdict.REVIEW, v, f">={r['review_below']}", "real_er_borderline", "instagram")
+    return _g("GATE-13", GateVerdict.PASS, v, f">={r['review_below']}", source="instagram")
 
 
 def gate_sponsorship(cand, cfg):
@@ -136,7 +158,7 @@ def gate_graph(cand, cfg):
 
 GATES = [
     gate_platform, gate_collectability, gate_followers, gate_country, gate_fake,
-    gate_general_er, gate_sponsorship, gate_shein_temu, gate_brand_account,
+    gate_general_er, gate_real_er, gate_sponsorship, gate_shein_temu, gate_brand_account,
     gate_storefront, gate_graph,
 ]
 
