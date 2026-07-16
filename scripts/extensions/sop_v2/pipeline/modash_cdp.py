@@ -54,6 +54,23 @@ def parse_report(data: dict, handle: str) -> dict | None:
     if langs:
         out["top_language"] = langs[0].get("code")
         out["top_language_pct"] = round(langs[0].get("weight", 0) * 100, 1)
+    # 合作品牌"有什么拿什么"：从 sponsoredPosts 的 sponsor + @mentions 收集
+    brands = []
+    seen = set()
+    for p in (pd.get("sponsoredPosts") or []):
+        cands = []
+        if p.get("sponsor"):
+            cands.append(str(p["sponsor"]).lstrip("@"))
+        for m in (p.get("mentions") or []):
+            if m:
+                cands.append(str(m).lstrip("@"))
+        for b in cands:
+            k = b.lower()
+            if b and k not in seen and len(b) < 40:
+                seen.add(k)
+                brands.append(b)
+    if brands:
+        out["brand_collaborations"] = brands[:12]
     out["modash_report"] = True
     return out
 
