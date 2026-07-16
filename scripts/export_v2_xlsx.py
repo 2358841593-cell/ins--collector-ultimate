@@ -80,7 +80,7 @@ def _cell(c, key):
             return "评论未采到（账号受限/待深采）"
         return "无明显购买意向"
     if key == "comment_ev":
-        return "查看 →" if c.get("comment_shots") else "—"
+        return "帖子 ↗" if (c.get("intent_posts") or c.get("comment_shots")) else "—"
     if key == "storefront_link":
         st = c.get("storefront_status")
         if st == "confirmed_yes":
@@ -118,6 +118,9 @@ def _url(c, key):
     if key == "profile":
         h = (c.get("handle") or "").lstrip("@")
         return c.get("profile_url") or f"https://www.instagram.com/{h}/"
+    if key == "comment_ev":       # 评论证据 → 有意图评论的帖子链接（客户点开核验"谁说了什么"）
+        ip = c.get("intent_posts") or []
+        return ip[0].get("post_url") if ip else None
     if key == "storefront_link" and c.get("storefront_status") == "confirmed_yes":
         return c.get("amazon_storefront_link")
     return None

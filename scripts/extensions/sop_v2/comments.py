@@ -138,6 +138,27 @@ def segment_comments(page_text: str) -> list[str]:
     return out
 
 
+def find_intent_comments(comments: list[dict], promo_context: bool = True, max_out: int = 6) -> list[dict]:
+    """从 {username,text} 评论对里挑有购买意图的，保留"谁说的"。
+    comments = [{'username':..., 'text':...}]。返回 [{'username','text'}]（去重、截断）。"""
+    phrases = INTENT_PHRASES + CONSIDER_PHRASES if promo_context else INTENT_PHRASES
+    out, seen = [], set()
+    for c in comments or []:
+        t = (c.get("text") or "").strip()
+        if not t or len(t) < 4 or len(t) > 200:
+            continue
+        low = t.lower()
+        if any(ph in low for ph in phrases):
+            key = low[:40]
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({"username": (c.get("username") or "").lstrip("@"), "text": t[:180]})
+            if len(out) >= max_out:
+                break
+    return out
+
+
 def _is_low_quality(text: str) -> bool:
     t = text.strip()
     if not t or EMOJI_RE.match(t) or TAG_ONLY_RE.match(t):

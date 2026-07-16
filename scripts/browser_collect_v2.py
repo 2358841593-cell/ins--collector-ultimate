@@ -434,6 +434,38 @@ _GRID_JS = r"""() => { const codes=[...document.querySelectorAll('a')].map(a=>a.
     .filter(h=>h&&/\/(p|reel)\//.test(h)); return {codes:[...new Set(codes)].slice(0,12),
     logged_out:/创建新账户|Create new account|Log into Instagram/.test(document.body.innerText.slice(0,120))}; }"""
 
+# 直接抽评论 {用户名,原话} 配对（不 OCR、不截图）：从帖子页评论 DOM 抠用户名链接 + 相邻正文
+_COMMENTS_JS = r"""() => {
+  const art=document.querySelector('article')||document.body;
+  const isUser=h=>/^\/[a-zA-Z0-9._]+\/$/.test(h||'') && !/\/(p|reel|reels|explore|stories)\//.test(h||'');
+  const out=[], seen=new Set();
+  for(const a of art.querySelectorAll('a[href]')){
+    const href=a.getAttribute('href')||''; if(!isUser(href)) continue;
+    const uname=href.replace(/\//g,'');
+    // 从用户名链接向上找含评论正文的最小容器（通常 2-4 层）
+    let box=a.parentElement, text='';
+    for(let i=0;i<4&&box;i++){
+      const t=(box.innerText||'').trim();
+      if(t.length>uname.length+3 && t.length<500){
+        const idx=t.indexOf(uname);
+        let body=(idx>=0? t.slice(idx+uname.length): t);
+        // 去时间戳/Reply/likes 等 UI 行，取评论正文首段
+        body=body.replace(/^[\s·•\n]+/,'').split(/\n/).find(l=>{
+          const s=l.trim(); return s.length>1 && !/^(\d+\s*(天|周|小时|分钟|d|w|h|min|semanas?|días?|horas?)|回复|reply|responder|like|me gusta|verified|已验证|查看翻译|ver traducción)/i.test(s);
+        }) || '';
+        text=body.trim(); break;
+      }
+      box=box.parentElement;
+    }
+    if(text.length>2 && text.length<260){
+      const key=uname+'|'+text.slice(0,24);
+      if(!seen.has(key)){ seen.add(key); out.push({username:uname, text:text.slice(0,240)}); }
+    }
+    if(out.length>=80) break;
+  }
+  return out;
+}"""
+
 
 def deep_collect(pg, cand, ev_dir, n_posts=10):
     """③深采：对已浅扫的 cand（含 codes/handle）开 N 帖 → 只在推广帖找购买意图评论+截图
@@ -459,7 +491,7 @@ def deep_collect(pg, cand, ev_dir, n_posts=10):
         codes = g.get("codes", [])
     _pause(2, 4)
 
-    posts_meta, comment_shots, intent_posts, all_snips, promo_count = [], [], [], [], 0
+    posts_meta, intent_posts, all_intent, promo_count = [], [], [], 0
     all_comments, seen_c = [], set()           # 累积评论样本（供 comments.analyze 算有效样本/信任分）
     for i, href in enumerate(codes[:n_posts]):
         purl = f"https://www.instagram.com{href}"
@@ -475,37 +507,30 @@ def deep_collect(pg, cand, ev_dir, n_posts=10):
             continue
         promo_count += 1
         _load_comments(pg, rounds=4)
-        text = pg.evaluate(_DEEP_READ_JS).get("text", "")
-        for seg in cmt_mod.segment_comments(text):    # 去重累积评论样本
-            k = seg.lower()[:40]
-            if k not in seen_c:
+        # 直接抽 {用户名,原话} 配对（不 OCR、不截图）
+        paired = pg.evaluate(_COMMENTS_JS) or []
+        for c in paired:
+            k = (c.get("username", "") + "|" + (c.get("text") or "")[:24]).lower()
+            if c.get("text") and k not in seen_c:
                 seen_c.add(k)
-                all_comments.append(seg)
-        snips = cmt_mod.find_intent_in_text(text, promo_context=True)
-        if snips:
-            all_snips.extend(snips)
-            rec = {"post_url": purl, "snippets": snips[:2], "screenshot": None, "promotional": True}
-            _scroll_snippet_into_view(pg, snips[0])
-            pg.wait_for_timeout(600)
-            shotpath = ev_dir / f"intent_{i+1:02d}.png"
-            if _shot(pg, shotpath):
-                rel = str(shotpath.relative_to(ROOT))
-                comment_shots.append(rel)
-                rec["screenshot"] = rel
-                ev.append({"type": "intent_comment", "path": rel, "source_url": purl,
-                           "captured_at": _now(), "snippets": snips[:2]})
-            else:
-                ev.append({"type": "intent_comment_link", "path": None, "source_url": purl,
-                           "captured_at": _now(), "snippets": snips[:2], "note": "截图失败,用链接核验"})
+                all_comments.append(c["text"])
+        # 有购买意图的评论 → 结构化证据（谁说了什么 + 帖子链接），不截图
+        hits = cmt_mod.find_intent_comments(paired, promo_context=True)
+        if hits:
+            for h in hits:
+                all_intent.append(f"@{h['username']}: {h['text']}" if h.get("username") else h["text"])
+            rec = {"post_url": purl, "promotional": True, "intent_comments": hits}
             intent_posts.append(rec)
+            ev.append({"type": "intent_comment", "source_url": purl, "captured_at": _now(),
+                       "comments": hits})   # 证据 = 用户名+原话+帖子链接（客户点链接可核验）
         _pause(2, 4)
 
     cand["intent_posts"] = intent_posts
-    cand["high_intent_snippets"] = all_snips[:5]     # 推广帖高精度意图原话（证据/交付展示）
-    cand["promo_intent_hits"] = len(all_snips)       # 推广帖意图短语命中数（证据口径）
+    cand["high_intent_snippets"] = all_intent[:6]    # "@user: 原话" 列表（交付展示，含谁说的）
+    cand["promo_intent_hits"] = len(all_intent)      # 推广帖意图评论数（证据口径）
     cand["promotional_post_count"] = promo_count
     cand["comments_read"] = True
-    cand["comment_shots"] = comment_shots
+    cand["comment_shots"] = []                        # 已弃截图（改结构化文本证据）
     # 评论信任分析（C 模块 + routing comments_insufficient 依赖）——喂累积评论样本
     analysis = cmt_mod.analyze(all_comments)
     cand["comments_analyzed"] = analysis["comments_analyzed"]
