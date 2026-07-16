@@ -41,9 +41,11 @@ def main() -> int:
     ap.add_argument("--resume", action="store_true")
     args = ap.parse_args()
     cfg = load_config()
+    p = cfg.get("pipeline", {})
     run_browser_stage("qualified", args.batch_id, args.limit, args.resume,
                       lambda pg, cand: collect_one(pg, cand, cfg, args.batch_id, args.posts),
-                      per_account=5)
+                      per_account=p.get("collect_per_account", 5),
+                      stale_minutes=p.get("resume_stale_minutes", 30))
     return 0
 
 

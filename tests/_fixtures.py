@@ -14,6 +14,7 @@ def clean_full(**kw):
         "fake_pct": 10.0,
         "general_er": 3.0,
         "sponsorship_saturation": 20.0,
+        "real_er": 2.5,             # 实算 ER 达标（GATE-13 PASS）
         "brand_account_type": "personal",
         "shein_temu_partnership": False,
         "discovered_via": "modash_search",

@@ -18,8 +18,10 @@ def verdict(cand):
 
 
 def base(**kw):
-    # 默认给 storefront confirmed，隔离被测门槛（storefront unknown 会独立返回 REVIEW）
-    c = {"platform": "instagram", "campaign_track": "paid", "storefront_status": "confirmed_yes"}
+    # 默认给 storefront confirmed + real_er 达标，隔离被测门槛
+    # （storefront unknown / real_er 缺失都会独立返回 REVIEW，会污染其它门槛测试）
+    c = {"platform": "instagram", "campaign_track": "paid", "storefront_status": "confirmed_yes",
+         "real_er": 2.0}
     c.update(kw)
     return c
 
@@ -46,9 +48,18 @@ class TestModashGates(unittest.TestCase):
         self.assertEqual(verdict(base(follower_count=50000, fake_pct=24.99)), GateVerdict.PASS)
         self.assertEqual(verdict(base(follower_count=50000, fake_pct=25.0)), GateVerdict.EXCLUDE)
 
-    def test_general_er(self):
-        self.assertEqual(verdict(base(follower_count=50000, general_er=2.0)), GateVerdict.EXCLUDE)
-        self.assertEqual(verdict(base(follower_count=50000, general_er=2.01)), GateVerdict.PASS)
+    def test_general_er_reference_only(self):
+        # 客户 2026-07-15 放宽：Modash General ER 降为参考、不再硬淘汰（general_er_reference_only）。
+        # 实算 ER(GATE-13) 才是硬门槛。低 Modash ER 不再 EXCLUDE。
+        self.assertEqual(verdict(base(follower_count=50000, general_er=1.0)), GateVerdict.PASS)
+        self.assertEqual(verdict(base(follower_count=50000, general_er=2.0)), GateVerdict.PASS)
+
+    def test_real_er_hard_gate(self):
+        # 实算 ER 硬门槛(GATE-13)：<0.5% EXCLUDE / [0.5,1.0) REVIEW / >=1.0 PASS / 缺失 REVIEW
+        self.assertEqual(verdict(base(follower_count=50000, real_er=0.3)), GateVerdict.EXCLUDE)
+        self.assertEqual(verdict(base(follower_count=50000, real_er=0.7)), GateVerdict.REVIEW)
+        self.assertEqual(verdict(base(follower_count=50000, real_er=1.5)), GateVerdict.PASS)
+        self.assertEqual(verdict(base(follower_count=50000, real_er=None)), GateVerdict.REVIEW)
 
 
 class TestSponsorship(unittest.TestCase):

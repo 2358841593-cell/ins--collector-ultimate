@@ -95,15 +95,8 @@ def find_intent_in_text(page_text: str, max_snippets: int = 4, promo_context: bo
     if not page_text:
         return []
     phrases = INTENT_PHRASES + CONSIDER_PHRASES if promo_context else INTENT_PHRASES
-    # 按行/句切分，逐段找意图短语
-    segs = re.split(r"[\n\r]+|(?<=[.?!。？！])\s+", page_text)
     out, seen = [], set()
-    tl_meta = re.compile(r"^\s*(\d+\s*(天|周|小时|分钟|d|w|h|min|semanas?|días?|horas?)|回复|responder|reply|"
-                         r"me gusta|likes?|verified|已验证|查看翻译|ver traducción|traducir)\s*$", re.I)
-    for s in segs:
-        s = s.strip()
-        if not s or len(s) < 4 or len(s) > 140 or tl_meta.match(s):
-            continue
+    for s in segment_comments(page_text):
         low = s.lower()
         if any(ph in low for ph in phrases):
             key = low[:40]
@@ -112,6 +105,26 @@ def find_intent_in_text(page_text: str, max_snippets: int = 4, promo_context: bo
                 out.append(s[:120])
                 if len(out) >= max_snippets:
                     break
+    return out
+
+
+_TL_META = re.compile(r"^\s*(\d+\s*(天|周|小时|分钟|d|w|h|min|semanas?|días?|horas?)|回复|responder|reply|"
+                      r"me gusta|likes?|verified|已验证|查看翻译|ver traducción|traducir|"
+                      r"following|follow|seguir|siguiendo|liked by|comment|add a comment|"
+                      r"more posts|más publicaciones)\s*$", re.I)
+
+
+def segment_comments(page_text: str) -> list[str]:
+    """把帖子页可见文字切成"候选评论行"（去 UI/时间戳/回复等噪声）。
+    供 find_intent_in_text（找购买意图）与 analyze（评论质量/有效样本数）复用。"""
+    if not page_text:
+        return []
+    out = []
+    for s in re.split(r"[\n\r]+|(?<=[.?!。？！])\s+", page_text):
+        s = s.strip()
+        if not s or len(s) < 4 or len(s) > 200 or _TL_META.match(s):
+            continue
+        out.append(s)
     return out
 
 

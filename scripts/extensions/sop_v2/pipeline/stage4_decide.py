@@ -28,8 +28,13 @@ def main() -> int:
     ap.add_argument("--batch-id", required=True)
     ap.add_argument("--track", choices=["paid", "gifting"], required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--xlsx", default=None, help="交付 XLSX 路径（默认与 --out 同目录 deliverable.xlsx）")
+    ap.add_argument("--no-xlsx", action="store_true", help="只出 decisions.json，不出交付表")
     ap.add_argument("--generated-at", default=None, help="固定时间戳（可复现）")
-    ap.add_argument("--modash-enrich", action="store_true", help="对将 Include 候选走 Modash CDP 补数")
+    ap.add_argument("--modash-csv", default=None,
+                    help="Modash Profile Report CSV：补假粉/受众/国家(解除 modash_core_missing→Include 才可能非空)")
+    ap.add_argument("--manual-csv", default=None,
+                    help="人工核验 CSV：raw_skin_grade/has_vo/paid_cpm(解除 raw_skin_or_vo_unverified→Include)")
     args = ap.parse_args()
     cfg = load_config()
 
@@ -39,9 +44,16 @@ def main() -> int:
     for c in cands:
         c.setdefault("campaign_track", args.track)
 
-    if args.modash_enrich:
-        # Modash CDP 补数占位：需已登录 Chrome。未补则候选诚实落 Review（modash_core_missing）。
-        print("⚠ --modash-enrich 需已登录 Modash 的 Chrome；本版补数为占位，缺则 Review。")
+    if args.modash_csv:
+        from extensions.sop_v2.pipeline.modash_enrich import enrich
+        r = enrich(cands, args.modash_csv)
+        print(f"Modash 补数(CSV): 匹配 {r['matched']}/{r['total']}（CSV {r['csv_rows']} 行）")
+    else:
+        print("⚠ 未提供 --modash-csv：缺假粉/受众/国家 → 候选诚实落 Review(modash_core_missing)，Include 恒空。")
+    if args.manual_csv:
+        from extensions.sop_v2.pipeline.modash_enrich import enrich_manual
+        r = enrich_manual(cands, args.manual_csv)
+        print(f"人工核验回填(Raw Skin/VO/报价): 匹配 {r.get('matched')}/{r.get('total')}")
 
     decisions = [run_v2.decide(c, cfg) for c in cands]
     for c, d in zip(cands, decisions):
@@ -59,6 +71,13 @@ def main() -> int:
     print(f"④ 决策完成 {len(decisions)} → {args.out}")
     for pool, n in Counter(d["final_pool"] for d in decisions).most_common():
         print(f"  {pool}: {n}")
+    # 自动出交付 XLSX（一条命令直达交付表）
+    if not args.no_xlsx:
+        import export_v2_xlsx
+        xlsx = args.xlsx or str(Path(args.out).with_name("deliverable.xlsx"))
+        wb = export_v2_xlsx.build_workbook(out)
+        wb.save(xlsx)
+        print(f"   交付表 → {xlsx}")
     print("status:", cc.status_dist(args.batch_id))
     return 0
 

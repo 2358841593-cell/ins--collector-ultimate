@@ -25,7 +25,8 @@ def apply_verdict(handle: str, verdict: tuple) -> str:
     return kind
 
 
-def run_browser_stage(from_status, batch_id, limit, resume, process_one, per_account=6):
+def run_browser_stage(from_status, batch_id, limit, resume, process_one, per_account=6,
+                      stale_minutes=30):
     """浏览器阶段通用循环 + 账号轮换。断点续跑靠 claim_queue 软锁（--resume 复领陈旧锁）。"""
     import browser_collect_v2 as bc
     from playwright.sync_api import sync_playwright
@@ -34,7 +35,7 @@ def run_browser_stage(from_status, batch_id, limit, resume, process_one, per_acc
     accts = bc.load_accounts()
     if not accts:
         print("✗ 无可用 IG 号"); return {"error": "no_accounts"}
-    q = cc.claim_queue(from_status, limit, batch_id, stale_minutes=30 if resume else 0)
+    q = cc.claim_queue(from_status, limit, batch_id, stale_minutes=stale_minutes if resume else 0)
     print(f"[{from_status}→] 认领 {len(q)} 个候选 · 号池 {len(accts)}", flush=True)
     counts = {"advance": 0, "reject": 0, "error": 0}
     with sync_playwright() as pw:

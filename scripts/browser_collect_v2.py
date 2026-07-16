@@ -71,20 +71,6 @@ def load_accounts(path=None):
     return out
 
 
-def make_iloader(acct, proxy):
-    """instaloader 会话（代理 + cookie），用于可靠取 profile 字段。"""
-    import instaloader
-    # max_connection_attempts=1：429 时快速失败，不做多分钟指数退避（"太慢"根因）
-    L = instaloader.Instaloader(quiet=True, request_timeout=20, max_connection_attempts=1)
-    if proxy:
-        purl = f"http://{proxy['username']}:{proxy['password']}@{proxy['server'].split('//')[-1]}" \
-            if proxy.get("username") else proxy["server"]
-        L.context._session.proxies = {"http": purl, "https": purl}
-    L.context._session.cookies.set("sessionid", acct["sessionid"], domain=".instagram.com")
-    L.context._session.cookies.set("ds_user_id", acct["ds_user_id"], domain=".instagram.com")
-    return L
-
-
 BRAND_CATEGORIES = ("cosmetic", "skin care service", "product", "shopping", "retail",
                     "brand", "store", "company", "e-commerce", "wholesale")
 # 判**品牌号淘汰**只用零歧义的零售类目——不含 "skin care service"/"cosmetic"/"product"
@@ -206,37 +192,6 @@ def fetch_profile_browser(pg, handle):
         "_scan_source": "browser", "codes": codes,
     }
     pf["core_niche_key"] = content_mod.derive_niche(bio, name)
-    return pf
-
-
-def fetch_profile_il(L, handle, use_cache=True):
-    """取 profile 浅扫字段：先查缓存库（命中新鲜即用，零 IG 请求），否则 instaloader 扫 + 回写库。"""
-    from extensions.sop_v2 import creator_cache
-    if use_cache:
-        cached = creator_cache.get(handle, max_age_days=30)
-        if cached:
-            return cached
-    import instaloader
-    try:
-        p = instaloader.Profile.from_username(L.context, handle)
-    except Exception:  # noqa: BLE001
-        return None
-    cat = (p.business_category_name or "").lower()
-    is_brand = bool(p.is_business_account) and any(k in cat for k in BRAND_CATEGORIES)
-    pf = {
-        "handle": handle,
-        "full_name": p.full_name, "follower_count": p.followers, "media_count": p.mediacount,
-        "biography": p.biography, "external_url": p.external_url or None,
-        "is_verified": p.is_verified, "is_private": p.is_private,
-        "is_business": bool(p.is_business_account), "category": p.business_category_name,
-        "brand_account_type": "brand" if is_brand else "personal",
-    }
-    # 赛道也存（浅扫可判）
-    pf["core_niche_key"] = content_mod.derive_niche(pf.get("biography"), pf.get("full_name"))
-    try:
-        creator_cache.upsert(pf)
-    except Exception:  # noqa: BLE001
-        pass
     return pf
 
 
@@ -397,6 +352,7 @@ def deep_collect(pg, cand, ev_dir, n_posts=10):
     _pause(2, 4)
 
     posts_meta, comment_shots, intent_posts, all_snips, promo_count = [], [], [], [], 0
+    all_comments, seen_c = [], set()           # 累积评论样本（供 comments.analyze 算有效样本/信任分）
     for i, href in enumerate(codes[:n_posts]):
         purl = f"https://www.instagram.com{href}"
         if not _goto(pg, purl):
@@ -412,6 +368,11 @@ def deep_collect(pg, cand, ev_dir, n_posts=10):
         promo_count += 1
         _load_comments(pg, rounds=4)
         text = pg.evaluate(_DEEP_READ_JS).get("text", "")
+        for seg in cmt_mod.segment_comments(text):    # 去重累积评论样本
+            k = seg.lower()[:40]
+            if k not in seen_c:
+                seen_c.add(k)
+                all_comments.append(seg)
         snips = cmt_mod.find_intent_in_text(text, promo_context=True)
         if snips:
             all_snips.extend(snips)
@@ -432,11 +393,20 @@ def deep_collect(pg, cand, ev_dir, n_posts=10):
         _pause(2, 4)
 
     cand["intent_posts"] = intent_posts
-    cand["high_intent_snippets"] = all_snips[:5]
-    cand["high_intent_count"] = len(all_snips)
+    cand["high_intent_snippets"] = all_snips[:5]     # 推广帖高精度意图原话（证据/交付展示）
+    cand["promo_intent_hits"] = len(all_snips)       # 推广帖意图短语命中数（证据口径）
     cand["promotional_post_count"] = promo_count
     cand["comments_read"] = True
     cand["comment_shots"] = comment_shots
+    # 评论信任分析（C 模块 + routing comments_insufficient 依赖）——喂累积评论样本
+    analysis = cmt_mod.analyze(all_comments)
+    cand["comments_analyzed"] = analysis["comments_analyzed"]
+    cand["valid_comments"] = analysis["valid_comments"]
+    cand["high_intent_count"] = analysis["high_intent_count"]   # C3 口径（有效评论中高意图数）
+    cand["high_intent_ratio"] = analysis["high_intent_ratio"]
+    cand["low_quality_ratio"] = analysis["low_quality_ratio"]
+    if analysis.get("top_intent") and not cand["high_intent_snippets"]:
+        cand["high_intent_snippets"] = analysis["top_intent"]
     cand["sampled_posts"] = posts_meta
     cand["evidence_dir"] = str(ev_dir.relative_to(ROOT))
     # 内容信号（赞助/导购/成分词 + 实算 ER，从帖子赞评/caption 派生）

@@ -255,6 +255,19 @@ email_unlock = 0
 monitoring_new = 0
 canary_before_new_action = true
 
+# ── 四阶段流水线参数（PIPELINE_SPEC.md；零硬编码，规则模块从此读）──────────
+[pipeline]
+# stage2 浅扫的**与 track 无关**宽粗筛（精确粉丝分档仍留 gate_followers）
+coarse_min_followers = 2000
+coarse_max_followers = 300000
+# 赛道白名单（core_niche_key 命中即过；否则查 bio niche_keywords）
+core_niches = ["skincare", "beauty_device", "beauty_wellness"]
+# 账号轮换：每号连续处理多少候选后换号（深采更重→更少）
+qualify_per_account = 8
+collect_per_account = 5
+# 断点续跑：locked_at 陈旧多少分钟视为孤儿可重领
+resume_stale_minutes = 30
+
 # ── 图谱边界 ─────────────────────────────────────────────────────
 [graph]
 cap_review = true            # 图谱/多跳来源未走完整审计 → 封顶 Review
