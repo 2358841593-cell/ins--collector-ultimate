@@ -438,6 +438,7 @@ _GRID_JS = r"""() => { const codes=[...document.querySelectorAll('a')].map(a=>a.
 _COMMENTS_JS = r"""() => {
   const art=document.querySelector('article')||document.body;
   const isUser=h=>/^\/[a-zA-Z0-9._]+\/$/.test(h||'') && !/\/(p|reel|reels|explore|stories)\//.test(h||'');
+  const SKIP=/^(meta|about|blog|jobs|help|api|privacy|terms|locations|instagram|threads|contact|popular|uploads|directory)$/i;
   const out=[], seen=new Set();
   for(const a of art.querySelectorAll('a[href]')){
     const href=a.getAttribute('href')||''; if(!isUser(href)) continue;
@@ -457,7 +458,7 @@ _COMMENTS_JS = r"""() => {
       }
       box=box.parentElement;
     }
-    if(text.length>2 && text.length<260){
+    if(text.length>2 && text.length<260 && !SKIP.test(uname) && !SKIP.test(text)){
       const key=uname+'|'+text.slice(0,24);
       if(!seen.has(key)){ seen.add(key); out.push({username:uname, text:text.slice(0,240)}); }
     }
@@ -502,10 +503,13 @@ def deep_collect(pg, cand, ev_dir, n_posts=10):
         likes, comments, caption = _post_stats(info.get("caption", ""))   # 赞/评/干净caption(算实算ER)
         posts_meta.append({"code": href, "caption": caption, "is_video": info.get("video"),
                            "like_count": likes, "comment_count": comments})
-        if not cmt_mod.is_promotional(caption):   # 只在明显推广/导购帖里找购买意图
+        is_promo = cmt_mod.is_promotional(caption)
+        if is_promo:
+            promo_count += 1
+        # 采评论的帖：推广帖 或 高评论帖（购买意图常出现在高互动帖，不只带货词帖）
+        if not (is_promo or (comments or 0) >= 15):
             _pause(1.5, 3)
             continue
-        promo_count += 1
         _load_comments(pg, rounds=4)
         # 直接抽 {用户名,原话} 配对（不 OCR、不截图）
         paired = pg.evaluate(_COMMENTS_JS) or []
@@ -514,32 +518,35 @@ def deep_collect(pg, cand, ev_dir, n_posts=10):
             if c.get("text") and k not in seen_c:
                 seen_c.add(k)
                 all_comments.append(c["text"])
-        # 有购买意图的评论 → 结构化证据（谁说了什么 + 帖子链接），不截图
-        hits = cmt_mod.find_intent_comments(paired, promo_context=True)
+        # 有购买意图的评论(三级) → 结构化证据（谁说了什么 + 级别 + 帖子链接），不截图
+        hits = cmt_mod.find_intent_comments(paired)
         if hits:
-            for h in hits:
-                all_intent.append(f"@{h['username']}: {h['text']}" if h.get("username") else h["text"])
-            rec = {"post_url": purl, "promotional": True, "intent_comments": hits}
-            intent_posts.append(rec)
+            all_intent.extend(hits)
+            intent_posts.append({"post_url": purl, "promotional": is_promo, "intent_comments": hits})
             ev.append({"type": "intent_comment", "source_url": purl, "captured_at": _now(),
-                       "comments": hits})   # 证据 = 用户名+原话+帖子链接（客户点链接可核验）
+                       "comments": hits})   # 证据 = 用户名+原话+级别+帖子链接（客户点链接可核验）
         _pause(2, 4)
 
     cand["intent_posts"] = intent_posts
-    cand["high_intent_snippets"] = all_intent[:6]    # "@user: 原话" 列表（交付展示，含谁说的）
-    cand["promo_intent_hits"] = len(all_intent)      # 推广帖意图评论数（证据口径）
+    tiers = {"high": 0, "medium": 0, "low": 0}
+    for x in all_intent:
+        tiers[x["grade"]] = tiers.get(x["grade"], 0) + 1
+    cand["intent_by_grade"] = tiers                  # 分级计数 高/中/低
+    cand["high_intent_count"] = tiers["high"] + tiers["medium"]   # C3 scoring 口径（强+中）
+    cand["intent_total"] = sum(tiers.values())       # 含低级（展示口径）
+    cand["high_intent_snippets"] = [f"@{x['username']}（{x['grade_zh']}）: {x['text']}"
+                                    for x in all_intent[:8]]       # 交付展示：@用户(级别): 原话
+    cand["promo_intent_hits"] = len(all_intent)
     cand["promotional_post_count"] = promo_count
     cand["comments_read"] = True
     cand["comment_shots"] = []                        # 已弃截图（改结构化文本证据）
-    # 评论信任分析（C 模块 + routing comments_insufficient 依赖）——喂累积评论样本
+    # 评论信任分析（有效样本数/低质占比，供 routing comments_insufficient）——高意图数用上面的分级口径
     analysis = cmt_mod.analyze(all_comments)
     cand["comments_analyzed"] = analysis["comments_analyzed"]
     cand["valid_comments"] = analysis["valid_comments"]
-    cand["high_intent_count"] = analysis["high_intent_count"]   # C3 口径（有效评论中高意图数）
-    cand["high_intent_ratio"] = analysis["high_intent_ratio"]
     cand["low_quality_ratio"] = analysis["low_quality_ratio"]
-    if analysis.get("top_intent") and not cand["high_intent_snippets"]:
-        cand["high_intent_snippets"] = analysis["top_intent"]
+    cand["high_intent_ratio"] = (round(cand["high_intent_count"] / analysis["valid_comments"] * 100, 1)
+                                 if analysis["valid_comments"] else None)
     cand["sampled_posts"] = posts_meta
     cand["evidence_dir"] = str(ev_dir.relative_to(ROOT))
     # 内容信号（赞助/导购/成分词 + 实算 ER，从帖子赞评/caption 派生）

@@ -138,25 +138,65 @@ def segment_comments(page_text: str) -> list[str]:
     return out
 
 
-def find_intent_comments(comments: list[dict], promo_context: bool = True, max_out: int = 6) -> list[dict]:
-    """从 {username,text} 评论对里挑有购买意图的，保留"谁说的"。
-    comments = [{'username':..., 'text':...}]。返回 [{'username','text'}]（去重、截断）。"""
-    phrases = INTENT_PHRASES + CONSIDER_PHRASES if promo_context else INTENT_PHRASES
-    out, seen = [], set()
+# 低级意图：真诚的"想要/产品热情"（不必求链接；非水军的夸赞也算）。排掉夸人/夸照片的泛词。
+LOW_INTENT = [
+    "need this", "i need this", "need it", "want this", "i want this", "want it", "i want one",
+    "obsessed", "must have", "must-have", "have to try", "gotta try", "want to try", "need to try",
+    "trying this", "on my list", "adding to my list", "wishlist", "wish list", "in love",
+    "so good", "looks amazing", "looks so good", "love this", "i love this", "love it",
+    "the formula", "game changer", "life changing", "the best", "best ever", "best product",
+    "amazing product", "obsessed with",
+    "lo quiero", "lo necesito", "necesito esto", "quiero probar", "quiero uno", "me encanta",
+    "amo esto", "el mejor", "la mejor", "increíble", "necesito uno", "quiero comprar",
+    "amei", "preciso disso", "o melhor", "maravilhoso", "adorei",
+]
+# 互赞团/夸内容/夸人 → 水军，不算意图（哪怕是"夸"）
+_POD_RE = re.compile(r"your\s+(content|videos?|reels?|feed|page|style)|content\s+(creator|is|looks)|"
+                     r"keep\s+(it\s+up|posting|going)|love\s+your|(great|amazing)\s+content|"
+                     r"nice\s+(pic|post|shot|photo)|great\s+post", re.I)
+
+
+def grade_intent(text: str):
+    """购买意图三级：high(求链接/已下单) / medium(考虑/问适用) / low(真诚产品热情/想要) / None。
+    None = 水军/夸人夸照片/纯emoji/纯tag（不算意图）。"""
+    t = (text or "").strip()
+    if not t or len(t) < 3 or EMOJI_RE.match(t) or TAG_ONLY_RE.match(t):
+        return None
+    low = t.lower()
+    if any(p in low for p in INTENT_PHRASES):
+        return "high"
+    if any(p in low for p in CONSIDER_PHRASES):
+        return "medium"
+    if _POD_RE.search(low):            # 互赞团/夸内容/夸照片 → 水军
+        return None
+    if any(p in low for p in LOW_INTENT):   # 真诚"想要/产品好"——低级意图（用户口径）
+        return "low"
+    return None
+
+
+_GRADE_ZH = {"high": "高", "medium": "中", "low": "低"}
+
+
+def find_intent_comments(comments: list[dict], promo_context: bool = True, max_out: int = 8) -> list[dict]:
+    """从 {username,text} 评论对里挑有购买意图的（三级），保留"谁说的" + 级别。
+    返回 [{'username','text','grade','grade_zh'}]（去重、按级别高→低排）。"""
+    graded, seen = [], set()
     for c in comments or []:
         t = (c.get("text") or "").strip()
-        if not t or len(t) < 4 or len(t) > 200:
+        if not t or len(t) > 220:
             continue
-        low = t.lower()
-        if any(ph in low for ph in phrases):
-            key = low[:40]
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append({"username": (c.get("username") or "").lstrip("@"), "text": t[:180]})
-            if len(out) >= max_out:
-                break
-    return out
+        g = grade_intent(t)
+        if not g:
+            continue
+        key = t.lower()[:40]
+        if key in seen:
+            continue
+        seen.add(key)
+        graded.append({"username": (c.get("username") or "").lstrip("@"), "text": t[:180],
+                       "grade": g, "grade_zh": _GRADE_ZH[g]})
+    order = {"high": 0, "medium": 1, "low": 2}
+    graded.sort(key=lambda x: order[x["grade"]])
+    return graded[:max_out]
 
 
 def _is_low_quality(text: str) -> bool:
