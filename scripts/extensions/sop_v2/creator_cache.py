@@ -210,10 +210,13 @@ def claim_queue(from_status: str, limit: int = 0, batch_id: str | None = None,
     """软锁认领：取 status=from_status 且（未锁 或 锁已陈旧=上次挂了）的行，置 locked_at=now，
     返回候选 dict（从 stage_json 还原）。断点续跑核心：已 advance 的 status 已变，不会被重取。"""
     out = []
+    # 陈旧锁判定用 Python 本地时间算 cutoff（locked_at 也是本地 ISO），
+    # 不用 SQLite 的 datetime('now')（那是 UTC，会和本地时区错位、断点续跑失效）。
+    cutoff = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - int(stale_minutes) * 60))
     with _conn() as c:
         q = ("SELECT handle, stage_json FROM creator_profiles WHERE status=? "
-             "AND (locked_at IS NULL OR datetime(locked_at) < datetime('now', ?))")
-        params = [from_status, f"-{int(stale_minutes)} minutes"]
+             "AND (locked_at IS NULL OR locked_at < ?)")
+        params = [from_status, cutoff]
         if batch_id:
             q += " AND discovery_batch=?"
             params.append(batch_id)
