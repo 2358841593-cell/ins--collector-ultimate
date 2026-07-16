@@ -34,7 +34,9 @@ from extensions.sop_v2 import content as content_mod  # noqa: E402
 from extensions.sop_v2.config import load_config  # noqa: E402
 
 _CFG = load_config()
-AGG = ("linktr.ee", "beacons", "ltk", "liketoknow", "shopmy", "komi.io", "stan.store")
+AGG = ("linktr.ee", "linktree.com", "beacons", "ltk", "liketoknow", "shopltk", "shopmy",
+       "komi.io", "stan.store", "vana.ly", "bio.site", "linkin.bio", "lnk.bio", "snipfeed",
+       "flow.page", "msha.ke", "tapl.ink", "milkshake", "campsite.bio", "withkoji")
 AMAZON = ("amazon.", "amzn.to", "/shop/", "storefront")
 
 
@@ -153,6 +155,38 @@ _PROFILE_JS = r"""() => {
 }"""
 
 
+# bio 外链在现代 IG profile 页常不是 <a href>，而是 JS 点击的截断文字——但真实 URL 仍在
+# 原始 HTML 里（实测：linktr.ee/X、vana.ly/X、l.instagram.com/?u=<编码>）。故从 pg.content() 抠。
+_BIO_LINK_DOMS = [
+    r"amazon\.[a-z.]+/shop/[\w./\-]+", r"amzn\.to/[\w\-]+", r"amazon\.[a-z.]+/[\w./\-]*shop[\w./\-]*",
+    r"linktr\.ee/[\w.\-]+", r"beacons\.ai/[\w.\-]+", r"vana\.ly/[\w.\-]+", r"stan\.store/[\w.\-]+",
+    r"shopmy\.us/[\w.\-]+", r"liketoknow\.it/[\w.\-]+", r"shopltk\.com/[\w./\-]+", r"linkin\.bio/[\w.\-]+",
+    r"bio\.site/[\w.\-]+", r"komi\.io/[\w.\-]+", r"snipfeed\.co/[\w.\-]+", r"flow\.page/[\w.\-]+",
+    r"linktree\.com/[\w.\-]+", r"lnk\.bio/[\w.\-]+", r"msha\.ke/[\w.\-]+", r"tapl\.ink/[\w.\-]+",
+]
+
+
+def _extract_bio_link(html):
+    """从 profile 页原始 HTML 抠 bio 外链（锚点抓不到时的可靠兜底）。
+    HTML 里 URL 常带 JSON 转义斜杠（linktr.ee\\/X），先归一化 \\/ → /。"""
+    if not html:
+        return None
+    h = html.replace("\\/", "/")
+    # 1) IG 的 l.instagram.com/?u=<编码> 包装（bio 外链规范形态）——解码取真 URL
+    m = re.search(r"l\.instagram\.com/\?u=([^\"'&<>\s\\]+)", h)
+    if m:
+        try:
+            return unquote(m.group(1))
+        except Exception:  # noqa: BLE001
+            pass
+    # 2) 已知 link-in-bio / 橱窗 / 联系域名裸串（精确路径，避开 amazon_media 之类误命中）
+    for pat in _BIO_LINK_DOMS:
+        m = re.search(pat, h, re.I)
+        if m:
+            return "https://" + m.group(0).rstrip("\"'\\")
+    return None
+
+
 def fetch_profile_browser(pg, handle):
     """浏览器渲染 profile 页一次拿全浅扫字段 + 品牌判定 + 帖子网格（绕开限流 API，登出态也能扫公开号）。
     返回 dict（含 codes）；纯登录墙/风控挑战 → {_wall:True}；导航失败 None。"""
@@ -180,13 +214,20 @@ def fetch_profile_browser(pg, handle):
     if not bio:                                    # og 无 bio → 退回头部文本
         bio = d.get("header") or ""
     name = (d.get("ogtitle") or "").split("(@")[0].strip() or None
+    # 外链：锚点抓到就用；否则从原始 HTML 抠（多数号 bio 链是 JS 截断文字，非锚点）
+    ext = d.get("external_url")
+    if not ext:
+        try:
+            ext = _extract_bio_link(pg.content())
+        except Exception:  # noqa: BLE001
+            ext = None
     blob = f"{name or ''} {bio}".lower()
     is_business = bool(d.get("biz_buttons")) or any(k in blob for k in BRAND_CATEGORIES)
     # 品牌号淘汰：只认**无歧义**店铺词 或 零售类目（不用宽 BRAND_CATEGORIES，避免误杀个人护肤号）
     is_brand = any(k in blob for k in BRAND_NAME_KW) or any(k in blob for k in STORE_CATEGORIES)
     pf = {
         "handle": handle, "follower_count": followers, "full_name": name,
-        "biography": bio, "external_url": d.get("external_url"),
+        "biography": bio, "external_url": ext,
         "is_private": bool(d.get("private")), "is_business": is_business,
         "category": None, "brand_account_type": "brand" if is_brand else "personal",
         "_scan_source": "browser", "codes": codes,
