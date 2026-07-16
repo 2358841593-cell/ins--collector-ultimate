@@ -35,6 +35,9 @@ def main() -> int:
                     help="Modash Profile Report CSV：补假粉/受众/国家(解除 modash_core_missing→Include 才可能非空)")
     ap.add_argument("--manual-csv", default=None,
                     help="人工核验 CSV：raw_skin_grade/has_vo/paid_cpm(解除 raw_skin_or_vo_unverified→Include)")
+    ap.add_argument("--modash-cdp", action="store_true",
+                    help="驱动已登录 Modash Chrome(9222)读 show-profile 补假粉/受众/国家(每个约1 credit)")
+    ap.add_argument("--cdp", default="http://127.0.0.1:9222")
     args = ap.parse_args()
     cfg = load_config()
 
@@ -44,12 +47,18 @@ def main() -> int:
     for c in cands:
         c.setdefault("campaign_track", args.track)
 
-    if args.modash_csv:
+    if args.modash_cdp:
+        from extensions.sop_v2.pipeline.modash_cdp import enrich_via_cdp
+        print(f"Modash 补数(CDP)：逐个读 show-profile（约 {len(cands)} credits）…")
+        r = enrich_via_cdp(cands, args.cdp)
+        print(f"Modash 补数(CDP): 命中 {r.get('matched')}/{r.get('total')}"
+              + (f"  ⚠ {r['error']}" if r.get("error") else ""))
+    elif args.modash_csv:
         from extensions.sop_v2.pipeline.modash_enrich import enrich
         r = enrich(cands, args.modash_csv)
         print(f"Modash 补数(CSV): 匹配 {r['matched']}/{r['total']}（CSV {r['csv_rows']} 行）")
     else:
-        print("⚠ 未提供 --modash-csv：缺假粉/受众/国家 → 候选诚实落 Review(modash_core_missing)，Include 恒空。")
+        print("⚠ 未提供 Modash 补数：缺假粉/受众/国家 → 候选诚实落 Review(modash_core_missing)，Include 恒空。")
     if args.manual_csv:
         from extensions.sop_v2.pipeline.modash_enrich import enrich_manual
         r = enrich_manual(cands, args.manual_csv)

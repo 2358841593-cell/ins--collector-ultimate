@@ -41,13 +41,23 @@ PROMO_CAPTION_KW = [
     "repurchase", "haul", "restock", "linktree", "storefront", "en mi amazon", "en amazon",
     "código", "codigo", "descuento", "link en", "enlace en", "compra", "disponible en",
     "lo encuentras", "te dejo el link", "swipe up", "shopmy", "ltk", "liketoknow",
+    "available now", "shop now", "grab yours", "in my bio", "tap the link", "on sale",
+    "new drop", "launching", "available at", "get yours", "order now", "pre-order",
+]
+# 产品型帖（展示具体产品即算导购帖——很多带货帖不带联盟话术，只展示产品名/品类）
+PRODUCT_TYPE_KW = [
+    "cleanser", "serum", "moisturizer", "moisturiser", "sunscreen", "spf", "toner", "retinol",
+    "niacinamide", "hyaluronic", "vitamin c", "facial oil", "face oil", "body lotion", "body butter",
+    "eye cream", "face cream", "face mask", "sheet mask", "exfoliant", "peeling", "essence",
+    "lip balm", "lip oil", "foundation", "concealer", "mascara", "lipstick", "bronzer", "blush",
+    "led mask", "gua sha", "microcurrent", "roller", "bundle", "kit", "set", "collection",
 ]
 
 
 def is_promotional(caption: str) -> bool:
-    """caption 是否是明显的带货/导购推广帖。"""
+    """caption 是否是导购/产品展示帖：命中带货话术 或 明确产品品类（展示具体产品也算）。"""
     c = (caption or "").lower()
-    return any(k in c for k in PROMO_CAPTION_KW)
+    return any(k in c for k in PROMO_CAPTION_KW) or any(k in c for k in PRODUCT_TYPE_KW)
 
 
 # 购买"考虑"问句：仅在已判定为推广帖时才算意图（context 消歧——同一句在教育帖不算）
