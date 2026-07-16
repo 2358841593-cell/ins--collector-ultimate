@@ -42,10 +42,17 @@ def main() -> int:
     args = ap.parse_args()
     cfg = load_config()
     p = cfg.get("pipeline", {})
+    # 深采用隔离号池（存在则用，否则回退默认池）
+    deep = p.get("deep_accounts_file")
+    root = Path(__file__).resolve().parents[3].parent
+    deep_file = str(root / deep) if (deep and (root / deep).exists()) else None
+    if deep and not deep_file:
+        print(f"  ⚠ 深采号池 {deep} 不存在 → 回退默认池", flush=True)
     run_browser_stage("qualified", args.batch_id, args.limit, args.resume,
                       lambda pg, cand: collect_one(pg, cand, cfg, args.batch_id, args.posts),
                       per_account=p.get("collect_per_account", 5),
-                      stale_minutes=p.get("resume_stale_minutes", 30))
+                      stale_minutes=p.get("resume_stale_minutes", 30),
+                      accounts_file=deep_file)
     return 0
 
 

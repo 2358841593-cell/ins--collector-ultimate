@@ -74,7 +74,11 @@ def _cell(c, key):
         snips = c.get("high_intent_snippets") or []
         if snips:
             return "\n".join(f"· {s}" for s in snips[:3])
-        return "无明显购买意向" if c.get("comments_read") else "待视觉读取"
+        # 区分"评论采到了但没意图" vs "评论根本没采到"——绝不把后者误标成前者
+        vc = c.get("valid_comments")
+        if vc is None or vc < 20:
+            return "评论未采到（账号受限/待深采）"
+        return "无明显购买意向"
     if key == "comment_ev":
         return "查看 →" if c.get("comment_shots") else "—"
     if key == "storefront_link":

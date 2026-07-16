@@ -26,15 +26,17 @@ def apply_verdict(handle: str, verdict: tuple) -> str:
 
 
 def run_browser_stage(from_status, batch_id, limit, resume, process_one, per_account=6,
-                      stale_minutes=30):
-    """浏览器阶段通用循环 + 账号轮换。断点续跑靠 claim_queue 软锁（--resume 复领陈旧锁）。"""
+                      stale_minutes=30, accounts_file=None):
+    """浏览器阶段通用循环 + 账号轮换。断点续跑靠 claim_queue 软锁（--resume 复领陈旧锁）。
+    accounts_file：可指定隔离号池（如深采专用），None 用默认 accounts_raw.txt。"""
     import browser_collect_v2 as bc
     from playwright.sync_api import sync_playwright
 
     proxy = bc.load_proxy()
-    accts = bc.load_accounts()
+    accts = bc.load_accounts(accounts_file)
     if not accts:
-        print("✗ 无可用 IG 号"); return {"error": "no_accounts"}
+        print(f"✗ 无可用 IG 号（{accounts_file or 'accounts_raw.txt'}）"); return {"error": "no_accounts"}
+    print(f"  号池: {accounts_file or 'accounts_raw.txt'}（{len(accts)} 个）", flush=True)
     q = cc.claim_queue(from_status, limit, batch_id, stale_minutes=stale_minutes if resume else 0)
     print(f"[{from_status}→] 认领 {len(q)} 个候选 · 号池 {len(accts)}", flush=True)
     counts = {"advance": 0, "reject": 0, "error": 0}

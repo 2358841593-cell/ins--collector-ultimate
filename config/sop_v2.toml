@@ -275,6 +275,9 @@ qualify_per_account = 8
 collect_per_account = 5
 # 断点续跑：locked_at 陈旧多少分钟视为孤儿可重领
 resume_stale_minutes = 30
+# 深采(stage3)专用隔离号池——与 stage2 浅扫池分开，单独养/轮换/歇，避免深采把浅扫号扫爆。
+# 文件不存在则回退到默认 accounts_raw.txt。
+deep_accounts_file = ".secrets/accounts_deep.txt"
 
 # ── 图谱边界 ─────────────────────────────────────────────────────
 [graph]
