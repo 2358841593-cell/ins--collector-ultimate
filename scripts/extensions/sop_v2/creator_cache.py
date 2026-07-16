@@ -220,7 +220,9 @@ def claim_queue(from_status: str, limit: int = 0, batch_id: str | None = None,
         if batch_id:
             q += " AND discovery_batch=?"
             params.append(batch_id)
-        q += " ORDER BY times_seen DESC, stage_updated_at ASC"
+        # 确认有 Amazon 橱窗的(Include 候选)优先深采；再多源命中优先；再先发现先处理
+        q += (" ORDER BY (storefront_status='confirmed_yes') DESC, "
+              "times_seen DESC, stage_updated_at ASC")
         if limit:
             q += " LIMIT ?"
             params.append(limit)

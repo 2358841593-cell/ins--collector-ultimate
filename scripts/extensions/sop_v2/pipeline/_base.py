@@ -49,8 +49,8 @@ def run_browser_stage(from_status, batch_id, limit, resume, process_one, per_acc
                 acct = accts[ai % len(accts)]; ai += 1; used = 0
                 ctx = bc.open_ctx(pw, acct, proxy)
                 pg = ctx.pages[0] if ctx.pages else ctx.new_page()
-                pg.set_default_timeout(30000)               # 看门狗：任何 Playwright 调用 >30s 失败，
-                pg.set_default_navigation_timeout(45000)    # 不让单个候选把整批挂死（修"卡死很慢"）
+                pg.set_default_timeout(20000)               # 看门狗：任何 Playwright 调用 >20s 失败，
+                pg.set_default_navigation_timeout(20000)    # 疲劳号坏加载快速失败，不磨到 45s（修"很慢"）
                 print(f"  ↻ 号 {acct['username']}", flush=True)
             used += 1
             try:
