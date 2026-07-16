@@ -141,6 +141,15 @@ _PROFILE_JS = r"""() => {
   // 商业按钮信号：只认专业号**独有**按钮（Email/Contact/Call/Book/View shop）——
   // 不含 Message/Follow（登录态看任何号都有，会让 is_business 恒真）
   const biz=/\b(Email|Correo electr|Contact options|Contactar|Call|Llamar|Book now|Reservar|View shop|Ver tienda)\b/i.test(body.slice(0,1500));
+  // bio 链接：现代 IG 渲染成叶子 <div>（非 <a>），文字以域名开头，形如
+  // "linktr.ee/xxx and 2 more" —— 完整首链就在文字里；"and N more" 表示还有隐藏链接（需点开弹层）。
+  let biolink='';
+  const domStart=/^[\s\p{Emoji}\p{So}👉➡🔗•·|]*((?:https?:\/\/)?(?:[a-z0-9-]+\.)+[a-z]{2,})(\/|\s|$)/iu;
+  for(const el of document.querySelectorAll('header a, header div, section a, section div, main div')){
+    if(el.children.length>0) continue;
+    const t=(el.innerText||'').trim();
+    if(t && t.length<200 && domStart.test(t) && !/instagram\.com|threads\.|^@/i.test(t)){ biolink=t; break; }
+  }
   // 帖子网格 shortcode
   const codes=[...document.querySelectorAll('a')].map(a=>a.getAttribute('href'))
      .filter(h=>h&&/\/(p|reel)\//.test(h));
@@ -148,11 +157,64 @@ _PROFILE_JS = r"""() => {
   const loginForm=!!document.querySelector('input[name="username"],input[name="password"]');
   return {
     ogdesc: meta('og:description')||'', ogtitle: meta('og:title')||'',
-    header: body.slice(0, 900), external_url: ext, biz_buttons: biz,
+    header: body.slice(0, 900), external_url: ext, bio_link_text: biolink, biz_buttons: biz,
     codes: [...new Set(codes)].slice(0,12), challenge, login_form: loginForm,
     private: /This account is private|Esta cuenta es privada|cuenta privada|账号私密|This Account is Private/i.test(body)
   };
 }"""
+
+
+def _first_url_from_bio(text):
+    """从 bio 链接 div 文字（'linktr.ee/x and 2 more'）取首个完整 URL。"""
+    if not text:
+        return None
+    t = re.sub(r"\s+and\s+\d+\s+more\s*$", "", text.strip(), flags=re.I)
+    m = re.search(r"((?:https?://)?(?:[a-z0-9-]+\.)+[a-z]{2,}(?:/[^\s]*)?)", t, re.I)
+    if not m:
+        return None
+    u = m.group(1).rstrip(".,)")
+    return u if u.lower().startswith("http") else "https://" + u
+
+
+def _bio_has_more(text):
+    return bool(text and re.search(r"\band\s+\d+\s+more\b", text, re.I))
+
+
+def _expand_bio_links(pg):
+    """点开 bio 链接（'and N more'）→ 读弹层里全部链接 URL。返回列表（去 IG/threads）。
+    实测可点击祖先是 <button>（链路 DIV→DIV→BUTTON）；JS .click() 不触发 IG 的 React 处理，
+    故先给该 button 打标，再用 Playwright 真点击。"""
+    try:
+        tagged = pg.evaluate(r"""() => {
+          const el=[...document.querySelectorAll('div,span')].find(e=>
+            e.children.length===0 && /\band \d+ more\b/i.test(e.innerText||''));
+          if(!el) return false;
+          let t=el; for(let i=0;i<6&&t;i++){ if(t.tagName==='BUTTON'||t.getAttribute('role')==='button'){break;} t=t.parentElement; }
+          (t||el).setAttribute('data-bioexpand','1'); return true;
+        }""")
+        if not tagged:
+            return []
+        try:
+            pg.click('[data-bioexpand="1"]', timeout=4000)
+        except Exception:  # noqa: BLE001
+            return []
+        pg.wait_for_timeout(2000)
+        urls = pg.evaluate(r"""() => {
+          const dlgs=[...document.querySelectorAll('div[role="dialog"]')];
+          const dlg=dlgs[dlgs.length-1]; if(!dlg) return [];
+          const out=new Set();
+          dlg.querySelectorAll('a[href]').forEach(a=>{const h=a.getAttribute('href')||''; if(/^https?:/.test(h)) out.add(h);});
+          dlg.querySelectorAll('div,span').forEach(e=>{ if(e.children.length===0){
+            const m=(e.innerText||'').match(/(?:[a-z0-9-]+\.)+[a-z]{2,}\/[^\s]*/i); if(m) out.add('https://'+m[0]); }});
+          return [...out];
+        }""")
+        try:
+            pg.keyboard.press("Escape")
+        except Exception:  # noqa: BLE001
+            pass
+        return [u for u in (urls or []) if not re.search(r"instagram\.com|threads\.", u, re.I)]
+    except Exception:  # noqa: BLE001
+        return []
 
 
 # bio 外链在现代 IG profile 页常不是 <a href>，而是 JS 点击的截断文字——但真实 URL 仍在
@@ -214,8 +276,8 @@ def fetch_profile_browser(pg, handle):
     if not bio:                                    # og 无 bio → 退回头部文本
         bio = d.get("header") or ""
     name = (d.get("ogtitle") or "").split("(@")[0].strip() or None
-    # 外链：锚点抓到就用；否则从原始 HTML 抠（多数号 bio 链是 JS 截断文字，非锚点）
-    ext = d.get("external_url")
+    # 外链三级取：① 锚点(l.instagram 包装) ② bio 链接 div 文字(现代 IG 主要形态) ③ 原始 HTML 兜底
+    ext = d.get("external_url") or _first_url_from_bio(d.get("bio_link_text"))
     if not ext:
         try:
             ext = _extract_bio_link(pg.content())
@@ -231,6 +293,7 @@ def fetch_profile_browser(pg, handle):
         "is_private": bool(d.get("private")), "is_business": is_business,
         "category": None, "brand_account_type": "brand" if is_brand else "personal",
         "_scan_source": "browser", "codes": codes,
+        "_bio_has_more": _bio_has_more(d.get("bio_link_text")),   # 多链接号：Amazon 可能藏在 "and N more"
     }
     pf["core_niche_key"] = content_mod.derive_niche(bio, name)
     return pf
@@ -471,32 +534,47 @@ def _cache_save(cand):
 
 
 def _resolve_storefront(cand, pg):
-    """按浏览器浅扫拿到的 external_url 判 storefront；聚合页用当前页穿透（零 API）。"""
+    """判 storefront（零 API）。收集全部 bio 链接（首链 + 多链接号弹层里的其余），
+    任一直链 Amazon → confirmed_yes；聚合链穿透找 Amazon；聚合都没穿到 → confirmed_no；否则 unknown。"""
     ext = cand.get("external_url")
-    cand["bio_links"] = [ext] if ext else []
-    joined = (ext or "").lower()
-    if not ext:
-        # 浏览器没抓到外链 ≠ 一定没橱窗（抽取可能漏）→ unknown（交 Review），绝不 confirmed_no 误杀
+    links = [ext] if ext else []
+    if cand.get("_bio_has_more"):        # "and N more"：点开弹层拿隐藏链接（Amazon 常藏这）
+        try:
+            links += _expand_bio_links(pg)
+        except Exception:  # noqa: BLE001
+            pass
+    seen, all_links = set(), []
+    for u in links:
+        if u and u not in seen:
+            seen.add(u)
+            all_links.append(u)
+    cand["bio_links"] = all_links
+    if not all_links:
+        # 没抓到外链 ≠ 一定没橱窗（抽取可能漏）→ unknown（交 Review），绝不 confirmed_no 误杀
         cand["storefront_status"] = "unknown"
         return
-    if any(a in joined for a in AMAZON):
-        cand["storefront_status"] = "confirmed_yes"
-        cand["amazon_storefront_link"] = ext
-        return
-    if any(g in joined for g in AGG):
-        cand["storefront_status"] = "unknown"
-        if _goto(pg, ext):
-            pg.wait_for_timeout(4000)
-            amz = pg.evaluate(r"""() => { const hs=[...document.querySelectorAll('a[href]')].map(a=>a.href);
-              const shop=hs.find(h=>/amazon\.[a-z.]+\/(shop|storefront)/i.test(h));
-              const any=hs.find(h=>/amazon\.|amzn\.to/i.test(h)); return shop||any||null; }""")
-            if amz:
-                cand["storefront_status"] = "confirmed_yes"
-                cand["amazon_storefront_link"] = amz
-            else:
-                cand["storefront_status"] = "confirmed_no"
-    else:
-        cand["storefront_status"] = "unknown"
+    # 1) 任意直链 Amazon
+    for u in all_links:
+        if any(a in u.lower() for a in AMAZON):
+            cand["storefront_status"] = "confirmed_yes"
+            cand["amazon_storefront_link"] = u
+            return
+    # 2) 聚合链逐个穿透找 Amazon
+    penetrated = False
+    for u in all_links:
+        if any(g in u.lower() for g in AGG):
+            penetrated = True
+            if _goto(pg, u):
+                pg.wait_for_timeout(4000)
+                amz = pg.evaluate(r"""() => { const hs=[...document.querySelectorAll('a[href]')].map(a=>a.href);
+                  const shop=hs.find(h=>/amazon\.[a-z.]+\/(shop|storefront)/i.test(h));
+                  const any=hs.find(h=>/amazon\.|amzn\.to/i.test(h)); return shop||any||null; }""")
+                if amz:
+                    cand["storefront_status"] = "confirmed_yes"
+                    cand["amazon_storefront_link"] = amz
+                    return
+    # 3) 有聚合链但都没穿到 Amazon → confirmed_no；只有非聚合外链 → unknown
+    cand["storefront_status"] = "confirmed_no" if penetrated else "unknown"
 
 
 def _to_int(s):
