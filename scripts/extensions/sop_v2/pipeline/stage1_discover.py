@@ -73,18 +73,40 @@ def discover_seeds(queries, cdp="http://127.0.0.1:9222", wait=7.0) -> list[dict]
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--batch-id", required=True)
+    ap.add_argument("--track", choices=["paid", "gifting"], default="paid",
+                    help="决定粉丝档筛选范围（paid 10K-150K / gifting 5K-50K）")
+    ap.add_argument("--target", type=int, default=0, help="累积多少 seed（默认读 config）")
+    ap.add_argument("--ai-search", action="store_true", help="用旧 AI Search 兜底（默认结构化搜索）")
     ap.add_argument("--queries", nargs="*")
     ap.add_argument("--cdp", default="http://127.0.0.1:9222")
     ap.add_argument("--wait", type=float, default=7.0)
     args = ap.parse_args()
     cfg = load_config()
-    queries = args.queries or cfg.get("discovery", {}).get("modash_queries", [])
-    if not queries:
-        print("✗ 无查询（config discovery.modash_queries 也为空）"); return 1
-    print(f"① Modash 发现：{len(queries)} 条带货查询", flush=True)
-    seeds = discover_seeds(queries, args.cdp, args.wait)
-    r = cc.seed_handles(seeds, args.batch_id)
-    print(f"发现 {len(seeds)} 个候选 → {r}")
+    disc = cfg.get("discovery", {})
+
+    if args.ai_search:                       # 旧路兜底
+        queries = args.queries or disc.get("modash_queries", [])
+        print(f"① Modash AI Search（兜底）：{len(queries)} 条查询", flush=True)
+        seeds = discover_seeds(queries, args.cdp, args.wait)
+    else:                                    # 结构化搜索（默认，主力）
+        from extensions.sop_v2.pipeline.modash_search import discover
+        t = cfg["track"][args.track]
+        lo, hi = ((t["min_followers"], t["max_followers"]) if args.track == "paid"
+                  else (t["standard_min"], t["priority_max"]))
+        filters = {"followers": {"min": lo, "max": hi},
+                   "engagementRate": {"min": disc.get("search_er_min", 0.015)}}
+        target = args.target or disc.get("search_target", 120)
+        print(f"① Modash 结构化搜索：粉丝 {lo}-{hi} · ER≥{filters['engagementRate']['min']} · 目标 {target}", flush=True)
+        r = discover(disc.get("search_query", ""), filters, target=target,
+                     max_pages=disc.get("search_max_pages", 80),
+                     require_amazon_bio=disc.get("search_require_amazon_bio", False), cdp_url=args.cdp)
+        if r.get("error"):
+            print(f"✗ {r['error']}（Chrome 需已登录 Modash 并开标签）"); return 1
+        print(f"  扫描 {r['raw_scanned']} · 保留 {r['kept']} · 过滤 {r['filtered_out']}（品牌/私密）", flush=True)
+        seeds = r["seeds"]
+
+    ing = cc.seed_handles(seeds, args.batch_id)
+    print(f"发现 {len(seeds)} 个候选 → {ing}")
     print("status:", cc.status_dist(args.batch_id))
     return 0
 

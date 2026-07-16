@@ -216,7 +216,14 @@ manual_highest = true
 # 通道：Modash AI Search 带货导向多查询累积 → 浏览器浅扫过滤（登录态，零 API）。
 [discovery]
 niche = "amazon_shopping_guide"
-# Modash AI Search 种子查询（带货导向；命中"个人+橱窗+护肤/美妆带货"，而非教育号/店铺号）
+# ── 结构化搜索发现（POST /api/search/v2/instagram + skip 分页，替换 AI Search 只捞6小号）──
+# 粉丝档用 track 范围（paid 10K-150K / gifting 5K-50K）；ER 硬筛；发现阶段预过滤品牌/私密。
+search_query = "skincare beauty creator with amazon storefront who posts product recommendations and honest reviews"
+search_er_min = 0.015          # engagementRate 结构化硬筛（0.015 = 1.5%）
+search_target = 120            # 累积多少高质量 seed（skip 分页每页 6）
+search_max_pages = 80
+search_require_amazon_bio = false  # Modash creator_description 是 AI 摘要，少含字面 amazon；橱窗留 stage2 验
+# Modash AI Search 种子查询（旧路，保留兜底；命中"个人+橱窗+护肤/美妆带货"）
 modash_queries = [
   "amazon storefront skincare finds link in bio",
   "shop my amazon skincare must haves beauty",

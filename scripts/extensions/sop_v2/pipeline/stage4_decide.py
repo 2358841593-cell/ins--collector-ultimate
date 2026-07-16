@@ -37,6 +37,8 @@ def main() -> int:
                     help="人工核验 CSV：raw_skin_grade/has_vo/paid_cpm(解除 raw_skin_or_vo_unverified→Include)")
     ap.add_argument("--modash-cdp", action="store_true",
                     help="驱动已登录 Modash Chrome(9222)读 show-profile 补假粉/受众/国家(每个约1 credit)")
+    ap.add_argument("--modash-cap", type=int, default=0,
+                    help="Modash 补数上限(省 credit)；默认读 config modash_budget.profile_per_round")
     ap.add_argument("--cdp", default="http://127.0.0.1:9222")
     args = ap.parse_args()
     cfg = load_config()
@@ -48,9 +50,20 @@ def main() -> int:
         c.setdefault("campaign_track", args.track)
 
     if args.modash_cdp:
+        from extensions.sop_v2 import gates
+        from extensions.sop_v2.contracts import GateVerdict
         from extensions.sop_v2.pipeline.modash_cdp import enrich_via_cdp
-        print(f"Modash 补数(CDP)：逐个读 show-profile（约 {len(cands)} credits）…")
-        r = enrich_via_cdp(cands, args.cdp)
+        # 省 credit：只补 shortlist——通过所有"非 Modash 硬门槛"的候选(补了才够 Include)；
+        # 已被粉丝档/实算ER/赞助/品牌等硬淘汰的，补 Modash 也白搭 → 不花这 credit。
+        cap = args.modash_cap or cfg.get("modash_budget", {}).get("profile_per_round", 20)
+        shortlist = [c for c in cands
+                     if gates.gate_summary(gates.evaluate_gates(c, cfg)) != GateVerdict.EXCLUDE]
+        # 有橱窗优先、实算 ER 高优先（好苗子先补）
+        shortlist.sort(key=lambda c: (c.get("storefront_status") == "confirmed_yes",
+                                      c.get("real_er") or 0), reverse=True)
+        shortlist = shortlist[:cap]
+        print(f"Modash 补数(CDP)：shortlist {len(shortlist)}/{len(cands)}（省 credit，上限 {cap}）…")
+        r = enrich_via_cdp(shortlist, args.cdp)
         print(f"Modash 补数(CDP): 命中 {r.get('matched')}/{r.get('total')}"
               + (f"  ⚠ {r['error']}" if r.get("error") else ""))
     elif args.modash_csv:
