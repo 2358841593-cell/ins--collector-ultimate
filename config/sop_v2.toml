@@ -224,6 +224,11 @@ search_target = 120            # 累积多少高质量 seed（skip 分页每页 
 search_max_pages = 80
 search_page_delay = 2.2         # 每页基准停顿秒（拟人，降 Modash 风控；实际随机 + 每10页长歇）
 search_require_amazon_bio = false  # Modash creator_description 是 AI 摘要，少含字面 amazon；橱窗留 stage2 验
+# ── 发现阶段受众/地区硬筛（逆向确认可用；根治"深采白耗在高假粉/非目标国号上"）──
+# filters.geo=[国家id] 筛**创作者所在地**；filters.audience.credibility=数字 筛受众可信度（0.75=假粉≤25%）。
+# 实测：baseline 2100 →(geo=US)1658 →(+cred≥0.75)1252，结果全是美国真实创作者。
+search_creator_geo_ids = [148838]        # Modash 地理 id：148838=United States（可扩 CA/UK…）
+search_audience_credibility_min = 0.75   # 受众可信度下限（0.75→假粉≤25%，发现阶段就砍高假粉）
 # Modash AI Search 种子查询（旧路，保留兜底；命中"个人+橱窗+护肤/美妆带货"）
 modash_queries = [
   "amazon storefront skincare finds link in bio",

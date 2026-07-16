@@ -95,8 +95,18 @@ def main() -> int:
                   else (t["standard_min"], t["priority_max"]))
         filters = {"followers": {"min": lo, "max": hi},
                    "engagementRate": {"min": disc.get("search_er_min", 0.015)}}
+        # 受众/地区硬筛（逆向确认字段：filters.geo 创作者地、filters.audience.credibility 受众可信度）
+        geo_ids = disc.get("search_creator_geo_ids")
+        if geo_ids:
+            filters["geo"] = list(geo_ids)
+        cred_min = disc.get("search_audience_credibility_min")
+        if cred_min:
+            filters["audience"] = {"credibility": float(cred_min)}
         target = args.target or disc.get("search_target", 120)
-        print(f"① Modash 结构化搜索：粉丝 {lo}-{hi} · ER≥{filters['engagementRate']['min']} · 目标 {target}", flush=True)
+        geo_txt = f" · 创作地{geo_ids}" if geo_ids else ""
+        cred_txt = f" · 受众可信≥{cred_min}" if cred_min else ""
+        print(f"① Modash 结构化搜索：粉丝 {lo}-{hi} · ER≥{filters['engagementRate']['min']}"
+              f"{geo_txt}{cred_txt} · 目标 {target}", flush=True)
         r = discover(disc.get("search_query", ""), filters, target=target,
                      max_pages=disc.get("search_max_pages", 80),
                      require_amazon_bio=disc.get("search_require_amazon_bio", False),
