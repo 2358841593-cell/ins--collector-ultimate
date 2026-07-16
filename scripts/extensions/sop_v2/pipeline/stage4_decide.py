@@ -69,7 +69,8 @@ def main() -> int:
         filt = {"followers": {"min": lo, "max": hi},
                 "engagementRate": {"min": disc.get("search_er_min", 0.015)}}
         print(f"Modash 补数(CDP)：shortlist {len(shortlist)}/{len(cands)}（省 credit，上限 {cap}）…")
-        r = enrich_via_cdp(shortlist, disc.get("search_query", ""), filt, args.cdp)
+        cache_dir = str(Path(args.out).with_name("modash_raw"))  # 原始报告落盘→改解析器免重付费
+        r = enrich_via_cdp(shortlist, disc.get("search_query", ""), filt, args.cdp, cache_dir=cache_dir)
         print(f"Modash 补数(CDP): 命中 {r.get('matched')}/{r.get('total')}"
               + (f"  ⚠ {r['error']}" if r.get("error") else ""))
     elif args.modash_csv:
