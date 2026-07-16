@@ -222,6 +222,7 @@ search_query = "skincare beauty creator with amazon storefront who posts product
 search_er_min = 0.015          # engagementRate 结构化硬筛（0.015 = 1.5%）
 search_target = 120            # 累积多少高质量 seed（skip 分页每页 6）
 search_max_pages = 80
+search_page_delay = 2.2         # 每页基准停顿秒（拟人，降 Modash 风控；实际随机 + 每10页长歇）
 search_require_amazon_bio = false  # Modash creator_description 是 AI 摘要，少含字面 amazon；橱窗留 stage2 验
 # Modash AI Search 种子查询（旧路，保留兜底；命中"个人+橱窗+护肤/美妆带货"）
 modash_queries = [

@@ -99,7 +99,8 @@ def main() -> int:
         print(f"① Modash 结构化搜索：粉丝 {lo}-{hi} · ER≥{filters['engagementRate']['min']} · 目标 {target}", flush=True)
         r = discover(disc.get("search_query", ""), filters, target=target,
                      max_pages=disc.get("search_max_pages", 80),
-                     require_amazon_bio=disc.get("search_require_amazon_bio", False), cdp_url=args.cdp)
+                     require_amazon_bio=disc.get("search_require_amazon_bio", False),
+                     page_delay=disc.get("search_page_delay", 2.2), cdp_url=args.cdp)
         if r.get("error"):
             print(f"✗ {r['error']}（Chrome 需已登录 Modash 并开标签）"); return 1
         print(f"  扫描 {r['raw_scanned']} · 保留 {r['kept']} · 过滤 {r['filtered_out']}（品牌/私密）", flush=True)

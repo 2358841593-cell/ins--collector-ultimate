@@ -63,8 +63,11 @@ def _keep(s: dict, require_amazon_bio: bool) -> bool:
 
 
 def discover(query: str, filters: dict, target: int = 120, max_pages: int = 80,
-             require_amazon_bio: bool = True, cdp_url: str = "http://127.0.0.1:9222") -> dict:
-    """结构化搜索 + skip 分页 + 预过滤 → 高质量 seed 列表。返回 {seeds, raw_scanned, filtered_out}。"""
+             require_amazon_bio: bool = True, page_delay: float = 2.2,
+             cdp_url: str = "http://127.0.0.1:9222") -> dict:
+    """结构化搜索 + skip 分页 + 预过滤 → 高质量 seed 列表。返回 {seeds, raw_scanned, filtered_out}。
+    page_delay：每页基准停顿秒数（拟人，降 Modash 风控），实际取 [0.7x,1.4x] 随机 + 每10页长歇。"""
+    import random
     from playwright.sync_api import sync_playwright
     seeds, seen = [], set()
     scanned = kept = 0
@@ -93,6 +96,11 @@ def discover(query: str, filters: dict, target: int = 120, max_pages: int = 80,
                         kept += 1
                 if kept >= target:
                     break
+                # 拟人节奏：随机停顿；每 10 页一段更长的歇口，更像手动翻页
+                delay = random.uniform(page_delay * 0.7, page_delay * 1.4)
+                if i and i % 10 == 0:
+                    delay += random.uniform(4, 8)
+                pg.wait_for_timeout(int(delay * 1000))
                 pg.wait_for_timeout(400)   # 拟人节奏
         finally:
             b.close()
