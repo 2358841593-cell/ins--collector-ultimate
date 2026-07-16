@@ -36,7 +36,9 @@ from extensions.sop_v2.config import load_config  # noqa: E402
 _CFG = load_config()
 AGG = ("linktr.ee", "linktree.com", "beacons", "ltk", "liketoknow", "shopltk", "shopmy",
        "komi.io", "stan.store", "vana.ly", "bio.site", "linkin.bio", "lnk.bio", "snipfeed",
-       "flow.page", "msha.ke", "tapl.ink", "milkshake", "campsite.bio", "withkoji")
+       "flow.page", "msha.ke", "tapl.ink", "milkshake", "campsite.bio", "withkoji",
+       "desty.page", "desty.link", "carrd.co", "znap.link", "hoo.be", "direct.me", "url.bio",
+       "pillar.io", "many.link", "tap.bio", "solo.to", "allmylinks", "linkpop")
 AMAZON = ("amazon.", "amzn.to", "/shop/", "storefront")
 
 
@@ -225,6 +227,8 @@ _BIO_LINK_DOMS = [
     r"shopmy\.us/[\w.\-]+", r"liketoknow\.it/[\w.\-]+", r"shopltk\.com/[\w./\-]+", r"linkin\.bio/[\w.\-]+",
     r"bio\.site/[\w.\-]+", r"komi\.io/[\w.\-]+", r"snipfeed\.co/[\w.\-]+", r"flow\.page/[\w.\-]+",
     r"linktree\.com/[\w.\-]+", r"lnk\.bio/[\w.\-]+", r"msha\.ke/[\w.\-]+", r"tapl\.ink/[\w.\-]+",
+    r"desty\.page/[\w.\-]+", r"desty\.link/[\w.\-]+", r"carrd\.co/[\w.\-]+", r"znap\.link/[\w.\-]+",
+    r"hoo\.be/[\w.\-]+", r"solo\.to/[\w.\-]+", r"allmylinks\.com/[\w.\-]+",
 ]
 
 
