@@ -24,11 +24,8 @@ def collect_fixed_review_reasons(cand: dict, cfg: dict) -> list[str]:
     vc = cand.get("valid_comments")
     if vc is None or vc < cfg["comments"]["min_valid_sample"]:
         reasons.append("comments_insufficient")
-    if cand.get("raw_skin_grade") in (None, "Pending", "C") or cand.get("has_vo") is None:
-        # C 或无证据/VO 未确认 → Review（不淘汰）
-        reasons.append("raw_skin_or_vo_unverified")
-    if cand.get("campaign_track") == "paid" and cand.get("paid_cpm") is None:
-        reasons.append("paid_quote_missing")
+    # 客户 2026-07-16：Raw Skin/VO(人工看视频) 与 CPM(需联系红人/Modash 无历史报价) 不作 Include 硬要求。
+    # 它们仍作评分项（有值才送分，无值 N/A），但不再进固定复核锁死 Review。
     ts = cand.get("target_countries_audience_pct")
     if ts is not None and ts < cfg["audience"]["target_share_partial"]:
         reasons.append("audience_target_below_35")

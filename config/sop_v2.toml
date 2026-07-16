@@ -190,13 +190,13 @@ exceptional_floor = 9.5      # 9.5+ 需六条件全过，否则封顶 9.4 [CONFL
 exceptional_cap = 9.4
 
 # ── 固定 Review（高分不得覆盖）──────────────────────────────────
+# 客户 2026-07-16：Raw Skin/VO(人工看视频) 与 Paid CPM(需联系红人、Modash 无历史报价) 不作
+# Include 硬要求 → 已从固定复核移除（仍作评分项：有值送分、无值 N/A）。
 [fixed_review]
 reasons = [
-  "modash_core_missing",     # Modash 核心字段缺失
-  "storefront_unknown",      # Storefront 未知
-  "comments_insufficient",   # 有效评论 <20
-  "raw_skin_or_vo_unverified", # Raw Skin 或 VO 未核验
-  "paid_quote_missing",      # Paid 缺实际报价
+  "modash_core_missing",     # Modash 核心字段缺失（CDP 可补）
+  "storefront_unknown",      # Storefront 未知（浏览器可确认）
+  "comments_insufficient",   # 有效评论 <20（可采集）
   "audience_target_below_35", # 目标受众合计 <35%
   "language_unmatched",      # 语言不满足或缺失
 ]

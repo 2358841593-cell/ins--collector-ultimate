@@ -49,18 +49,28 @@ def score_A(cand, cfg):
 
 def score_B(cand, cfg):
     b = cfg["scoring"]["B"]
+    is_device = cand.get("core_niche_key") == "beauty_device"   # 只有美容仪赛道才考设备规格
     items = []
     items.append(_si("B", "ingredients", cand.get("ingredients_score"), b["ingredients_max"]))
-    items.append(_si("B", "device_specs", cand.get("device_specs_score"), b["device_specs_max"]))
+    # B2 设备规格：非美容仪赛道(Amazon 护肤导购) → N/A（不适用，从分母移除，不拖分）
+    if is_device:
+        items.append(_si("B", "device_specs", cand.get("device_specs_score"), b["device_specs_max"]))
+    else:
+        items.append(_si("B", "device_specs", None, None, "not_device_niche_na"))
     items.append(_si("B", "skin_science", cand.get("skin_science_score"), b["skin_science_max"]))
-    # B4 Raw Skin：A/B/C/Pending；未核验 → 固定 Review（此处记 earned None available 4，交 routing）
+    # B4 Raw Skin：人工核验项。客户 2026-07-16：人工部分不作 Include 要求 → 未核验记 N/A（不拖分），
+    # 已核验(A/B/C) 才按档送分。
     grade = cand.get("raw_skin_grade")
-    rs = b["raw_skin"].get(grade) if grade in b["raw_skin"] else None
-    items.append(_si("B", "raw_skin", rs, 4, f"grade={grade}"))
-    # B5 VO：Yes/No/Pending；人工确认
+    if grade in b["raw_skin"]:
+        items.append(_si("B", "raw_skin", b["raw_skin"][grade], 4, f"grade={grade}"))
+    else:
+        items.append(_si("B", "raw_skin", None, None, "unverified_na"))
+    # B5 VO：人工确认。未确认 → N/A（不拖分）；确认了才送分
     vo = cand.get("has_vo")   # True/False/None(pending)
-    vo_s = b["vo_score"] if vo is True else (0 if vo is False else None)
-    items.append(_si("B", "vo", vo_s, b["vo_score"], f"vo={vo}"))
+    if vo is None:
+        items.append(_si("B", "vo", None, None, "unverified_na"))
+    else:
+        items.append(_si("B", "vo", b["vo_score"] if vo else 0, b["vo_score"], f"vo={vo}"))
     return items
 
 
@@ -71,10 +81,14 @@ def score_C(cand, cfg):
     meets = cand.get("meets_er_benchmark")
     items.append(_si("C", "ig_er", (c["ig_er_score"] if meets else 2) if meets is not None else None,
                      c["ig_er_score"], f"meets={meets}"))
-    # C2 Modash General ER
-    ger = cand.get("general_er")
-    items.append(_si("C", "modash_er", c["modash_er_score"] if (ger is not None and ger > 2.0) else
-                     (0 if ger is not None else None), c["modash_er_score"]))
+    # C2 Modash General ER：客户已把 Modash ER 降为参考（本赛道普遍<2%）→ 评分也 N/A（不拖分）。
+    # 保留旧口径可回退（reference_only=false 时按 >2% 送分）。
+    if cfg["modash_gates"].get("general_er_reference_only"):
+        items.append(_si("C", "modash_er", None, None, "modash_er_reference_na"))
+    else:
+        ger = cand.get("general_er")
+        items.append(_si("C", "modash_er", c["modash_er_score"] if (ger is not None and ger > 2.0) else
+                         (0 if ger is not None else None), c["modash_er_score"]))
     # C3 高意图评论（双条件满分）
     cnt = cand.get("high_intent_count")
     ratio = cand.get("high_intent_ratio")
@@ -129,15 +143,17 @@ def score_D(cand, cfg):
     else:
         sp = 0
     items.append(_si("D", "sponsorship_health", sp, 3, f"sat={sat}"))
-    # D5 Elite Brand History
-    elite = cand.get("elite_brand_hits")   # 命中数
-    if elite is None:
-        eb = None
+    # D5 Elite Brand（Omnilux/CurrentBody/Therabody 等设备品牌合作史）：
+    # 非美容仪赛道(Amazon 护肤导购)不适用 → N/A（不拖分）；仅美容仪赛道且有命中数才计。
+    is_device = cand.get("core_niche_key") == "beauty_device"
+    elite = cand.get("elite_brand_hits")
+    if not is_device or elite is None:
+        items.append(_si("D", "elite_brand", None, None, "not_device_niche_na"))
     else:
         eb = min(elite * d["elite_brand_each"], d["elite_brand_cap"])
         if cand.get("red_light_mask_and_vo"):
             eb = d["elite_brand_cap"]
-    items.append(_si("D", "elite_brand", eb, d["elite_brand_cap"], f"hits={elite}"))
+        items.append(_si("D", "elite_brand", eb, d["elite_brand_cap"], f"hits={elite}"))
     return items
 
 
@@ -173,14 +189,13 @@ def score_F(cand, cfg):
     f = cfg["scoring"]["F"]
     items = []
     track = cand.get("campaign_track")
-    # F1 CPM
-    if track == "gifting" and f.get("gifting_cpm_is_na", True):
-        items.append(_si("F", "cpm", None, None, "gifting_na"))
+    # F1 CPM：Modash 无历史报价、需联系红人才知 → 缺报价记 N/A（不作 Include 要求、不拖分）；
+    # 有报价(人工填/未来数据源)才按档送分。Gifting 恒 N/A。
+    cpm = cand.get("paid_cpm")
+    if (track == "gifting" and f.get("gifting_cpm_is_na", True)) or cpm is None:
+        items.append(_si("F", "cpm", None, None, "no_quote_na"))
     else:
-        cpm = cand.get("paid_cpm")
-        if cpm is None:
-            cpm_s = None   # 缺报价 → 固定 Review（routing）
-        elif cpm <= f["cpm_threshold_pass"]:
+        if cpm <= f["cpm_threshold_pass"]:
             cpm_s = f["cpm_full"]
         elif cpm <= f["cpm_threshold_exclude"]:
             cpm_s = f["cpm_review"]
