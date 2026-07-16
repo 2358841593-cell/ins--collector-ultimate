@@ -39,20 +39,29 @@ CREATE TABLE IF NOT EXISTS creator_profiles (
 """
 
 _MIGRATE = ["tier INTEGER DEFAULT 0", "client_status TEXT", "approved_at TEXT",
-            "rejected_reason TEXT", "source_batch TEXT"]
+            "rejected_reason TEXT", "source_batch TEXT",
+            # ── 四阶段流水线（PIPELINE_SPEC.md 冻结）：全部 nullable，无 DEFAULT ──
+            "status TEXT", "stage_updated_at TEXT", "locked_at TEXT", "stage_error TEXT",
+            "reject_reason TEXT", "discovery_batch TEXT", "seed_followers INTEGER",
+            "modash_er REAL", "real_er REAL", "high_intent_count INTEGER",
+            "final_pool TEXT", "evidence_dir TEXT", "stage_json TEXT"]
 _INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_brand ON creator_profiles(brand_account_type)",
     "CREATE INDEX IF NOT EXISTS idx_niche ON creator_profiles(core_niche_key)",
     "CREATE INDEX IF NOT EXISTS idx_storefront ON creator_profiles(storefront_status)",
     "CREATE INDEX IF NOT EXISTS idx_tier ON creator_profiles(tier)",
     "CREATE INDEX IF NOT EXISTS idx_cstatus ON creator_profiles(client_status)",
+    "CREATE INDEX IF NOT EXISTS idx_status ON creator_profiles(status)",
+    "CREATE INDEX IF NOT EXISTS idx_status_batch ON creator_profiles(status, discovery_batch)",
 ]
 
 
 def _conn():
     DB.parent.mkdir(parents=True, exist_ok=True)
-    c = sqlite3.connect(str(DB))
+    c = sqlite3.connect(str(DB), timeout=10)
     c.row_factory = sqlite3.Row
+    c.execute("PRAGMA journal_mode=WAL")        # 并发写不互锁
+    c.execute("PRAGMA busy_timeout=5000")
     c.executescript(_SCHEMA)                    # 建表（含全列，新库直接就位）
     have = {r["name"] for r in c.execute("PRAGMA table_info(creator_profiles)")}
     for col in _MIGRATE:                        # 旧库迁移：缺列则补
@@ -60,11 +69,19 @@ def _conn():
             c.execute(f"ALTER TABLE creator_profiles ADD COLUMN {col}")
     for idx in _INDEXES:                        # 列齐后再建索引
         c.execute(idx)
+    # 一次性回填（user_version 守卫，绝不每次 _conn 重跑）：迁移前的历史行置 decided 终态，
+    # 不进新 Amazon 导购流水线；金种子 tier/client_status 正交，不碰。
+    if c.execute("PRAGMA user_version").fetchone()[0] < 1:
+        c.execute("UPDATE creator_profiles SET status='decided', "
+                  "stage_updated_at=COALESCE(last_scanned, first_seen) WHERE status IS NULL")
+        c.execute("PRAGMA user_version=1")
     return c
 
 
 def upsert(cand: dict):
-    """写入/更新一个创作者的浅扫数据。"""
+    """浅扫回写。ON CONFLICT 只更新 SHALLOW_FIELDS + last_scanned + times_seen+1，
+    **绝不触碰** status/tier/client_status/stage_json（防清零阶段进度、防降级金种子）。
+    None 值不覆盖已有非空（COALESCE）。"""
     h = (cand.get("handle") or "").lstrip("@")
     if not h:
         return
@@ -72,15 +89,14 @@ def upsert(cand: dict):
     vals = {f: cand.get(f) for f in SHALLOW_FIELDS}
     for b in ("is_business", "is_private", "is_verified"):
         vals[b] = 1 if vals.get(b) else (0 if vals.get(b) is not None else None)
+    cols = ["handle"] + SHALLOW_FIELDS + ["first_seen", "last_scanned", "times_seen", "data_json"]
+    ins = [h] + [vals[f] for f in SHALLOW_FIELDS] + [now, now, 1, json.dumps(vals, ensure_ascii=False)]
+    set_parts = [f"{f}=COALESCE(excluded.{f}, creator_profiles.{f})" for f in SHALLOW_FIELDS]
+    set_parts += ["last_scanned=excluded.last_scanned",
+                  "times_seen=creator_profiles.times_seen+1", "data_json=excluded.data_json"]
     with _conn() as c:
-        row = c.execute("SELECT times_seen, first_seen FROM creator_profiles WHERE handle=?", (h,)).fetchone()
-        first_seen = row["first_seen"] if row else now
-        times = (row["times_seen"] + 1) if row else 1
-        cols = ["handle"] + SHALLOW_FIELDS + ["first_seen", "last_scanned", "times_seen", "data_json"]
-        placeholders = ",".join("?" * len(cols))
-        data = [h] + [vals[f] for f in SHALLOW_FIELDS] + [first_seen, now, times,
-                                                          json.dumps(vals, ensure_ascii=False)]
-        c.execute(f"INSERT OR REPLACE INTO creator_profiles ({','.join(cols)}) VALUES ({placeholders})", data)
+        c.execute(f"INSERT INTO creator_profiles ({','.join(cols)}) VALUES ({','.join('?'*len(cols))}) "
+                  f"ON CONFLICT(handle) DO UPDATE SET {', '.join(set_parts)}", ins)
 
 
 def get(handle: str, max_age_days: int = 30) -> dict | None:
@@ -113,6 +129,189 @@ def ingest_batch(candidates_path: str) -> int:
         upsert(c)
         n += 1
     return n
+
+
+# ── 四阶段流水线 API（PIPELINE_SPEC.md §5 冻结；其余模块只调这些，不写裸 SQL）──────
+def _now_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _to_int(v):
+    if v is None:
+        return None
+    s = str(v).strip().replace(",", "")
+    if not s:
+        return None
+    mult = 1
+    if s and s[-1] in "Kk":
+        mult, s = 1000, s[:-1]
+    elif s and s[-1] in "Mm":
+        mult, s = 1_000_000, s[:-1]
+    try:
+        return int(float(s) * mult)
+    except ValueError:
+        return None
+
+
+def _to_float(v):
+    if v is None:
+        return None
+    try:
+        return float(str(v).replace("%", "").strip())
+    except ValueError:
+        return None
+
+
+def _ensure_row(c, h):
+    c.execute("INSERT OR IGNORE INTO creator_profiles (handle, first_seen, last_scanned, times_seen) "
+              "VALUES (?,?,?,1)", (h, _now_iso(), _now_iso()))
+
+
+def should_ingest_seed(handle: str) -> bool:
+    """discovery 去重：客户拒绝 / 机器淘汰 / 已在库 → 不再造 seed。"""
+    h = (handle or "").lstrip("@")
+    with _conn() as c:
+        r = c.execute("SELECT status, client_status FROM creator_profiles WHERE handle=?", (h,)).fetchone()
+    if not r:
+        return True
+    return False  # 已存在（含 rejected/decided/在途）→ 不重复造 seed
+
+
+def seed_handles(recs: list[dict], batch_id: str = "") -> dict:
+    """① discovery：写种子 status=seed。recs=[{handle,followers,er}]。去重 + 多源加权。"""
+    new = deduped = skipped = 0
+    for rec in recs:
+        h = (rec.get("handle") or "").lstrip("@")
+        if not h:
+            continue
+        if not should_ingest_seed(h):
+            with _conn() as c:
+                r = c.execute("SELECT status FROM creator_profiles WHERE handle=?", (h,)).fetchone()
+                if r and r["status"] == "rejected":
+                    skipped += 1
+                else:  # 已在库 → times_seen+1（多源加权），不改 status
+                    c.execute("UPDATE creator_profiles SET times_seen=times_seen+1 WHERE handle=?", (h,))
+                    deduped += 1
+            continue
+        fol, er = _to_int(rec.get("followers")), _to_float(rec.get("er"))
+        cand = {"handle": h, "seed_followers": fol, "modash_er": er,
+                "discovery_batch": batch_id, "discovered_via": "modash_search"}
+        with _conn() as c:
+            _ensure_row(c, h)
+            c.execute("UPDATE creator_profiles SET status='seed', stage_updated_at=?, discovery_batch=?, "
+                      "seed_followers=?, modash_er=?, stage_json=?, locked_at=NULL WHERE handle=?",
+                      (_now_iso(), batch_id, fol, er, json.dumps(cand, ensure_ascii=False), h))
+        new += 1
+    return {"new_seeds": new, "deduped": deduped, "rejected_skipped": skipped}
+
+
+def claim_queue(from_status: str, limit: int = 0, batch_id: str | None = None,
+                stale_minutes: int = 30) -> list[dict]:
+    """软锁认领：取 status=from_status 且（未锁 或 锁已陈旧=上次挂了）的行，置 locked_at=now，
+    返回候选 dict（从 stage_json 还原）。断点续跑核心：已 advance 的 status 已变，不会被重取。"""
+    out = []
+    with _conn() as c:
+        q = ("SELECT handle, stage_json FROM creator_profiles WHERE status=? "
+             "AND (locked_at IS NULL OR datetime(locked_at) < datetime('now', ?))")
+        params = [from_status, f"-{int(stale_minutes)} minutes"]
+        if batch_id:
+            q += " AND discovery_batch=?"
+            params.append(batch_id)
+        q += " ORDER BY times_seen DESC, stage_updated_at ASC"
+        if limit:
+            q += " LIMIT ?"
+            params.append(limit)
+        rows = c.execute(q, params).fetchall()
+        for r in rows:
+            c.execute("UPDATE creator_profiles SET locked_at=? WHERE handle=?", (_now_iso(), r["handle"]))
+            cand = json.loads(r["stage_json"]) if r["stage_json"] else {}
+            cand["handle"] = r["handle"]
+            out.append(cand)
+    return out
+
+
+def advance(handle: str, to_status: str, cand: dict | None = None):
+    """成功推进：白名单 UPDATE stage_json（候选累积）+ 热列 + status + 清 locked_at/stage_error。
+    不碰 tier(除单调升 1)/client_status/rejected_reason（正交）。"""
+    h = (handle or "").lstrip("@")
+    with _conn() as c:
+        _ensure_row(c, h)
+        sets = ["status=?", "stage_updated_at=?", "locked_at=NULL", "stage_error=NULL"]
+        params = [to_status, _now_iso()]
+        if cand is not None:
+            sets.append("stage_json=?")
+            params.append(json.dumps(cand, ensure_ascii=False, default=str))
+            for col in ("seed_followers", "modash_er", "real_er", "high_intent_count",
+                        "final_pool", "evidence_dir"):
+                if cand.get(col) is not None:
+                    sets.append(f"{col}=?")
+                    params.append(cand.get(col))
+        params.append(h)
+        c.execute(f"UPDATE creator_profiles SET {','.join(sets)} WHERE handle=?", params)
+        if to_status in ("qualified", "collected", "decided"):
+            c.execute("UPDATE creator_profiles SET tier=MAX(COALESCE(tier,0),1) WHERE handle=?", (h,))
+
+
+def reject(handle: str, reason: str):
+    """机器淘汰（候选不合格）：status=rejected + reject_reason（区别于客户侧 rejected_reason）。"""
+    h = (handle or "").lstrip("@")
+    with _conn() as c:
+        _ensure_row(c, h)
+        c.execute("UPDATE creator_profiles SET status='rejected', reject_reason=?, stage_updated_at=?, "
+                  "locked_at=NULL WHERE handle=?", (reason, _now_iso(), h))
+
+
+def mark_error(handle: str, err: str):
+    """瞬时失败（号问题）：写 stage_error + 清 locked_at，**status 不动**（可重试，绝不烧号）。"""
+    h = (handle or "").lstrip("@")
+    with _conn() as c:
+        c.execute("UPDATE creator_profiles SET stage_error=?, locked_at=NULL WHERE handle=?",
+                  (str(err)[:120], h))
+
+
+def export_candidates(status: str, batch_id: str | None = None) -> list[dict]:
+    """把某 status 的候选从 stage_json 还原成 run_v2 可吃的 dict 列表；顺带 ig_er←real_er 显示映射。"""
+    with _conn() as c:
+        q = "SELECT handle, stage_json FROM creator_profiles WHERE status=?"
+        params = [status]
+        if batch_id:
+            q += " AND discovery_batch=?"
+            params.append(batch_id)
+        rows = c.execute(q, params).fetchall()
+    out = []
+    for r in rows:
+        cand = json.loads(r["stage_json"]) if r["stage_json"] else {}
+        cand.setdefault("handle", r["handle"])
+        if cand.get("real_er") is not None:
+            cand.setdefault("ig_er", cand.get("real_er"))
+        out.append(cand)
+    return out
+
+
+def status_dist(batch_id: str | None = None) -> dict:
+    """看板：各 status 计数。"""
+    with _conn() as c:
+        q = "SELECT status, COUNT(*) n FROM creator_profiles"
+        params = []
+        if batch_id:
+            q += " WHERE discovery_batch=?"
+            params.append(batch_id)
+        q += " GROUP BY status"
+        rows = c.execute(q, params).fetchall()
+    return {(r["status"] or "null"): r["n"] for r in rows}
+
+
+def failed_items(batch_id: str | None = None) -> list[dict]:
+    """看板：stage_error 非空 或 status=rejected 的 handle+原因。"""
+    with _conn() as c:
+        q = ("SELECT handle, status, reject_reason, stage_error FROM creator_profiles "
+             "WHERE stage_error IS NOT NULL OR status='rejected'")
+        params = []
+        if batch_id:
+            q += " AND discovery_batch=?"
+            params.append(batch_id)
+        rows = c.execute(q, params).fetchall()
+    return [dict(r) for r in rows]
 
 
 def set_tier(handle: str, tier: int):

@@ -49,10 +49,12 @@ def load_proxy():
     return {"server": url}
 
 
-def load_accounts():
-    """老号：username | pw | totp | cookie(含 sessionid+ds_user_id) | ..."""
+def load_accounts(path=None):
+    """老号：username | pw | totp | cookie(含 sessionid+ds_user_id) | ...。
+    path 默认 .secrets/accounts_raw.txt；可传备份文件路径。"""
+    src = Path(path) if path else (SECRETS / "accounts_raw.txt")
     out = []
-    for raw in (SECRETS / "accounts_raw.txt").read_text().splitlines():
+    for raw in src.read_text().splitlines():
         if not raw.strip():
             continue
         p = raw.strip().split("|")
@@ -85,10 +87,16 @@ def make_iloader(acct, proxy):
 
 BRAND_CATEGORIES = ("cosmetic", "skin care service", "product", "shopping", "retail",
                     "brand", "store", "company", "e-commerce", "wholesale")
-# bio/名字里的店铺/品牌信号（浏览器浅扫时辅助判品牌号，类目拿不到时兜底）
-BRAND_NAME_KW = ("shop", "store", "tienda", "boutique", "oficial", "official", "cosmetics",
-                 "cosmetica", "cosmética", "skincare co", "beauty co", "brand", "marca",
-                 "wholesale", "distribuidor", "laboratorio", "farmacia")
+# 判**品牌号淘汰**只用零歧义的零售类目——不含 "skin care service"/"cosmetic"/"product"
+# （皮肤科医生/个人护肤号的类目正是这些，会被误杀，dra.aliciapaola 教训）。
+STORE_CATEGORIES = ("shopping & retail", "shopping and retail", "e-commerce", "wholesale",
+                    "cosmetics store", "beauty store", "shopping mall", "clothing store",
+                    "retail company", "grocery store")
+# 店铺/品牌**无歧义**信号（店铺型名词）。刻意不含 cosmetics/cosmetica/farmacia/official 等
+# 歧义词——个人护肤博主 bio 常提这些，会误判成品牌号（dra.aliciapaola 曾被误杀）。
+BRAND_NAME_KW = ("store", "tienda", "boutique", "wholesale", "supply", "distribuidor",
+                 "e-commerce", "we sell", "dm to order", "official store", "tienda oficial",
+                 "online shop", "our shop")
 
 
 def _parse_count(s):
@@ -134,15 +142,17 @@ def _post_stats(og_desc):
 _PROFILE_JS = r"""() => {
   const meta=(p)=>{const e=document.querySelector(`meta[property="${p}"]`);return e?e.content:null;};
   const body=(document.body.innerText||'');
-  // bio 外链：头部锚点里指向 l.instagram.com/?u= 或非 instagram 域名的
+  // bio 外链：头部锚点里指向 l.instagram.com/?u= 或非 instagram/Meta 域名的（排除页脚 Meta 链接）
   let ext=null;
-  for(const a of document.querySelectorAll('header a, section a, main a')){
+  const EXCL=/instagram\.com|threads\.(net|com)|facebook\.com|meta\.com|meta\.ai|fb\.me|foa_web|help\.|privacy|about\.|\/legal\//i;
+  for(const a of document.querySelectorAll('header a, section a')){
     const h=a.getAttribute('href')||'';
     if(/l\.instagram\.com\/\?u=/.test(h)){ try{ext=decodeURIComponent(h.split('u=')[1].split('&')[0]);}catch(e){ext=h;} break; }
-    if(/^https?:\/\//.test(h) && !/instagram\.com|threads\.net|facebook\.com/.test(h)){ ext=h; break; }
+    if(/^https?:\/\//.test(h) && !EXCL.test(h)){ ext=h; break; }
   }
-  // 商业按钮信号（专业/商业号才有）
-  const biz=/\b(Email|Correo|Contact|Contactar|Message|Shop|Tienda|View shop|Book now|Reservar|Call)\b/i.test(body.slice(0,1200));
+  // 商业按钮信号：只认专业号**独有**按钮（Email/Contact/Call/Book/View shop）——
+  // 不含 Message/Follow（登录态看任何号都有，会让 is_business 恒真）
+  const biz=/\b(Email|Correo electr|Contact options|Contactar|Call|Llamar|Book now|Reservar|View shop|Ver tienda)\b/i.test(body.slice(0,1500));
   // 帖子网格 shortcode
   const codes=[...document.querySelectorAll('a')].map(a=>a.getAttribute('href'))
      .filter(h=>h&&/\/(p|reel)\//.test(h));
@@ -170,7 +180,7 @@ def fetch_profile_browser(pg, handle):
         pg.mouse.wheel(0, 1200)
         pg.wait_for_timeout(3000)
         d = pg.evaluate(_PROFILE_JS)
-    # og 元标签服务端渲染，登出/挂登录 banner 也在；据此解析粉丝/名字
+    # og 元标签服务端渲染，登出/挂登录 banner 也在；据此解析粉丝/名字/**干净 bio**
     og = d.get("ogdesc") or ""
     m = re.search(r"([\d.,]+\s*[KMkm]?)\s*(?:Followers|Seguidores|seguidores|Abonnés)", og, re.I)
     followers = _parse_count(m.group(1)) if m else None
@@ -178,21 +188,24 @@ def fetch_profile_browser(pg, handle):
     # 挑战页/纯登录墙且拿不到任何公开数据 → 判 wall（无法浅扫）
     if (d.get("challenge") or (d.get("login_form") and not followers and not codes)):
         return {"_wall": True}
-    header = d.get("header") or ""
-    hl = header.lower()
-    is_business = bool(d.get("biz_buttons")) or any(k in hl for k in BRAND_CATEGORIES)
-    name_blob = (d.get("ogtitle") or "") + " " + header
-    is_brand = is_business and (any(k in hl for k in BRAND_CATEGORIES)
-                                or any(k in name_blob.lower() for k in BRAND_NAME_KW))
+    # 干净 bio：og:description 里 'on Instagram:' 之后（避开 body.slice 的导航噪声）
+    mb = re.search(r"on Instagram:\s*", og)
+    bio = (og[mb.end():].strip() if mb else "").strip('"').strip()
+    if not bio:                                    # og 无 bio → 退回头部文本
+        bio = d.get("header") or ""
+    name = (d.get("ogtitle") or "").split("(@")[0].strip() or None
+    blob = f"{name or ''} {bio}".lower()
+    is_business = bool(d.get("biz_buttons")) or any(k in blob for k in BRAND_CATEGORIES)
+    # 品牌号淘汰：只认**无歧义**店铺词 或 零售类目（不用宽 BRAND_CATEGORIES，避免误杀个人护肤号）
+    is_brand = any(k in blob for k in BRAND_NAME_KW) or any(k in blob for k in STORE_CATEGORIES)
     pf = {
-        "handle": handle, "follower_count": followers,
-        "full_name": (d.get("ogtitle") or "").split("(@")[0].strip() or None,
-        "biography": header, "external_url": d.get("external_url"),
+        "handle": handle, "follower_count": followers, "full_name": name,
+        "biography": bio, "external_url": d.get("external_url"),
         "is_private": bool(d.get("private")), "is_business": is_business,
         "category": None, "brand_account_type": "brand" if is_brand else "personal",
         "_scan_source": "browser", "codes": codes,
     }
-    pf["core_niche_key"] = content_mod.derive_niche(pf.get("biography"), pf.get("full_name"))
+    pf["core_niche_key"] = content_mod.derive_niche(bio, name)
     return pf
 
 
@@ -343,15 +356,35 @@ def collect_candidate(pg, handle, ev_dir, n_posts=10):
         _cache_save(cand)
         return cand, ev
 
-    # 2) 帖子网格 shortcode（浏览器浅扫已拿到；缓存命中则需重取一次）
-    if not codes:
+    # 2-3) 深采（帖子网格 + 推广帖购买意图 + 实算 ER）——抽出为 deep_collect，stage3 复用
+    cand["codes"] = codes
+    return deep_collect(pg, cand, ev_dir, n_posts)
+
+
+# 深采窗口大小：og:description 里读赞/评 + 推广帖判定的帖子文本
+_DEEP_READ_JS = r"""() => {
+  const meta=(p)=>{const e=document.querySelector(`meta[property="${p}"]`);return e?e.content:null;};
+  const art=document.querySelector('article')||document.body;
+  return {caption: meta('og:description')||'', video: !!meta('og:video'),
+          text: (art.innerText||'').slice(0, 12000)}; }"""
+_GRID_JS = r"""() => { const codes=[...document.querySelectorAll('a')].map(a=>a.getAttribute('href'))
+    .filter(h=>h&&/\/(p|reel)\//.test(h)); return {codes:[...new Set(codes)].slice(0,12),
+    logged_out:/创建新账户|Create new account|Log into Instagram/.test(document.body.innerText.slice(0,120))}; }"""
+
+
+def deep_collect(pg, cand, ev_dir, n_posts=10):
+    """③深采：对已浅扫的 cand（含 codes/handle）开 N 帖 → 只在推广帖找购买意图评论+截图
+    + 帖子赞评算实算 ER。纯浏览器零 API。返回 (cand, evidence)；logged_out → (None, "logged_out")。"""
+    from extensions.sop_v2 import comments as cmt_mod
+    handle = cand.get("handle")
+    ev = []
+    ev_dir.mkdir(parents=True, exist_ok=True)
+    codes = cand.get("codes") or []
+    if not codes:  # 缓存/种子无网格 → 现取一次
         if not _goto(pg, f"https://www.instagram.com/{handle}/"):
             return cand, ev
         pg.wait_for_timeout(5000)
-        get_codes = r"""() => { const codes=[...document.querySelectorAll('a')].map(a=>a.getAttribute('href'))
-            .filter(h=>h&&/\/(p|reel)\//.test(h)); return {codes:[...new Set(codes)].slice(0,12),
-            logged_out:/创建新账户|Create new account/.test(document.body.innerText.slice(0,120))}; }"""
-        g = pg.evaluate(get_codes)
+        g = pg.evaluate(_GRID_JS)
         if g.get("logged_out"):
             return None, "logged_out"
         for _ in range(3):
@@ -359,46 +392,31 @@ def collect_candidate(pg, handle, ev_dir, n_posts=10):
                 break
             pg.mouse.wheel(0, 1200)
             pg.wait_for_timeout(3500)
-            g = pg.evaluate(get_codes)
+            g = pg.evaluate(_GRID_JS)
         codes = g.get("codes", [])
-    prof = {"codes": codes}
     _pause(2, 4)
 
-    # 2/3) 开 N 个帖子：读评论文字判购买意图 → 有意义才截图，截不到就用链接
-    from extensions.sop_v2 import comments as cmt_mod
-    codes = prof.get("codes") or []
-    posts_meta = []
-    comment_shots = []       # 有购买意图且截图成功的证据
-    intent_posts = []        # 有购买意图的帖子（链接 + 原话），截图失败也留
-    all_snips = []
-    promo_count = 0          # 采样帖里明显带货/导购的帖数（带货型红人的核心信号）
-    read_js = r"""() => {
-      const meta=(p)=>{const e=document.querySelector(`meta[property="${p}"]`);return e?e.content:null;};
-      const art=document.querySelector('article')||document.body;
-      return {caption: meta('og:description')||'', video: !!meta('og:video'),
-              text: (art.innerText||'').slice(0, 12000)}; }"""
+    posts_meta, comment_shots, intent_posts, all_snips, promo_count = [], [], [], [], 0
     for i, href in enumerate(codes[:n_posts]):
         purl = f"https://www.instagram.com{href}"
         if not _goto(pg, purl):
             continue
         pg.wait_for_timeout(3000)
-        info = pg.evaluate(read_js)
+        info = pg.evaluate(_DEEP_READ_JS)
         likes, comments, caption = _post_stats(info.get("caption", ""))   # 赞/评/干净caption(算实算ER)
         posts_meta.append({"code": href, "caption": caption, "is_video": info.get("video"),
                            "like_count": likes, "comment_count": comments})
-        # 只在"明显推广/导购帖"里找购买意图（用户要求：先找推广帖，再看意图）
-        is_promo = cmt_mod.is_promotional(caption)
-        if not is_promo:
+        if not cmt_mod.is_promotional(caption):   # 只在明显推广/导购帖里找购买意图
             _pause(1.5, 3)
             continue
         promo_count += 1
-        _load_comments(pg, rounds=4)                       # 展开更多评论
-        text = pg.evaluate(read_js).get("text", "")
-        snips = cmt_mod.find_intent_in_text(text, promo_context=True)   # 推广帖上下文放宽到"考虑购买"问句
+        _load_comments(pg, rounds=4)
+        text = pg.evaluate(_DEEP_READ_JS).get("text", "")
+        snips = cmt_mod.find_intent_in_text(text, promo_context=True)
         if snips:
             all_snips.extend(snips)
             rec = {"post_url": purl, "snippets": snips[:2], "screenshot": None, "promotional": True}
-            _scroll_snippet_into_view(pg, snips[0])        # 把意图评论滚到中央再截，保证拍到
+            _scroll_snippet_into_view(pg, snips[0])
             pg.wait_for_timeout(600)
             shotpath = ev_dir / f"intent_{i+1:02d}.png"
             if _shot(pg, shotpath):
@@ -407,29 +425,29 @@ def collect_candidate(pg, handle, ev_dir, n_posts=10):
                 rec["screenshot"] = rel
                 ev.append({"type": "intent_comment", "path": rel, "source_url": purl,
                            "captured_at": _now(), "snippets": snips[:2]})
-            else:  # 截图失败不死磕，用帖子链接给客户自行核验
+            else:
                 ev.append({"type": "intent_comment_link", "path": None, "source_url": purl,
                            "captured_at": _now(), "snippets": snips[:2], "note": "截图失败,用链接核验"})
             intent_posts.append(rec)
         _pause(2, 4)
+
     cand["intent_posts"] = intent_posts
     cand["high_intent_snippets"] = all_snips[:5]
     cand["high_intent_count"] = len(all_snips)
     cand["promotional_post_count"] = promo_count
     cand["comments_read"] = True
-
     cand["comment_shots"] = comment_shots
     cand["sampled_posts"] = posts_meta
+    cand["evidence_dir"] = str(ev_dir.relative_to(ROOT))
     # 内容信号（赞助/导购/成分词 + 实算 ER，从帖子赞评/caption 派生）
     cand["posts"] = [{"caption_text": p["caption"], "media_type": 2 if p["is_video"] else 1,
                       "like_count": p.get("like_count"), "comment_count": p.get("comment_count"),
                       "play_count": 0} for p in posts_meta]
     cand.update(content_mod.derive_content_signals(cand, _CFG))
     cand.pop("posts", None)
-    # 赛道从 bio + 全名 + caption 派生（精化 storefront 早筛时的 bio-only 判断）
     caps = " ".join(p.get("caption", "") for p in posts_meta)
     cand["core_niche_key"] = content_mod.derive_niche(cand.get("biography"), cand.get("full_name"), caps)
-    _cache_save(cand)   # 完整浅扫数据回写缓存库（storefront 已在早筛时 resolve）
+    _cache_save(cand)   # 浅扫字段回写（stage3 另经 creator_cache.advance 写 stage_json）
     return cand, ev
 
 
@@ -447,7 +465,8 @@ def _resolve_storefront(cand, pg):
     cand["bio_links"] = [ext] if ext else []
     joined = (ext or "").lower()
     if not ext:
-        cand["storefront_status"] = "confirmed_no"
+        # 浏览器没抓到外链 ≠ 一定没橱窗（抽取可能漏）→ unknown（交 Review），绝不 confirmed_no 误杀
+        cand["storefront_status"] = "unknown"
         return
     if any(a in joined for a in AMAZON):
         cand["storefront_status"] = "confirmed_yes"
