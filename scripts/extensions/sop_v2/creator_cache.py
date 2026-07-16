@@ -246,8 +246,10 @@ def advance(handle: str, to_status: str, cand: dict | None = None):
         if cand is not None:
             sets.append("stage_json=?")
             params.append(json.dumps(cand, ensure_ascii=False, default=str))
+            # 热列（claim_queue 优先级/查询/看板靠它，不能只留 stage_json）
             for col in ("seed_followers", "modash_er", "real_er", "high_intent_count",
-                        "final_pool", "evidence_dir"):
+                        "final_pool", "evidence_dir", "storefront_status", "amazon_storefront_link",
+                        "follower_count", "brand_account_type", "core_niche_key"):
                 if cand.get(col) is not None:
                     sets.append(f"{col}=?")
                     params.append(cand.get(col))
