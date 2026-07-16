@@ -82,8 +82,7 @@ def route(cand: dict, gate_results: list, score_summary: dict, cfg: dict) -> dic
     if nt >= a["priority_min"]:
         return {"pool": Pool.PRIORITY_REVIEW, "exclude_reasons": [],
                 "review_reasons": [f"score_{nt}"], "tier_by": "score"}
-    if nt >= a["review_min"]:
-        return {"pool": Pool.REVIEW, "exclude_reasons": [],
-                "review_reasons": [f"score_{nt}"], "tier_by": "score"}
-    return {"pool": Pool.EXCLUDE, "exclude_reasons": [f"low_score_{nt}"],
-            "review_reasons": [], "tier_by": "score"}
+    # 客户 2026-07-16：进了深采（过了硬门槛）的红人不因低分 Exclude——一律浮现到 Review，
+    # 交付表写清短板，让客户真实浏览判断（低分常因缺 Modash 补数，不是红人本身差）。
+    return {"pool": Pool.REVIEW, "exclude_reasons": [],
+            "review_reasons": [f"score_{nt}"], "tier_by": "score"}

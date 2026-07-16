@@ -46,7 +46,9 @@ def _seed(x: dict) -> dict:
             "is_brand": bool(x.get("is_brand")),
             "is_private": bool(x.get("is_private")),
             "bio": x.get("creator_description") or "",
-            "category": x.get("account_category")}
+            "category": x.get("account_category"),
+            # show-profile 要的哈希 ID（存下→stage4 补数免重搜；user_id 数字/serviceSdId 都不对）
+            "service_platform_id": x.get("servicePlatformId")}
 
 
 _AMAZON_BIO = ("amazon", "amzn", "storefront", "shop my", "ltk", "liketoknow", "linktr",

@@ -103,10 +103,10 @@ def gate_real_er(cand, cfg):
             return _g("GATE-13", GateVerdict.REVIEW, None, f">={r['review_below']}",
                       "real_er_missing", "instagram")
         return None
-    if v < r["exclude_below"]:
-        return _g("GATE-13", GateVerdict.EXCLUDE, v, f">={r['exclude_below']}", "real_er_low", "instagram")
+    # 客户 2026-07-16：进了深采的红人不硬排除——实算 ER 低只作 Review 浮现（交客户判断），不 Exclude。
     if v < r["review_below"]:
-        return _g("GATE-13", GateVerdict.REVIEW, v, f">={r['review_below']}", "real_er_borderline", "instagram")
+        code = "real_er_low" if v < r["exclude_below"] else "real_er_borderline"
+        return _g("GATE-13", GateVerdict.REVIEW, v, f">={r['review_below']}", code, "instagram")
     return _g("GATE-13", GateVerdict.PASS, v, f">={r['review_below']}", source="instagram")
 
 

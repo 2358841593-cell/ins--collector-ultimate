@@ -25,11 +25,8 @@ def collect_one(pg, cand, cfg, batch_id, n_posts):
     result, ev = bc.deep_collect(pg, cand, ev_dir, n_posts)
     if result is None:
         return ("error", ev or "logged_out")          # logged_out = 号问题，可重试
-    # 实算 ER 硬门槛：只挡真僵尸；缺失（None）绝不判 zombie（→ gate_real_er missing_is_review→Review）
-    rer = result.get("real_er")
-    thr = cfg.get("real_er", {}).get("exclude_below", 0.5)
-    if rer is not None and rer < thr:
-        return ("reject", "real_er_low")
+    # 深采完就进 collected——绝不在此丢弃。实算ER/意图等"不太合格"处由 routing 归池 + 交付表写明原因，
+    # 让客户真实浏览判断（某处差但有合作价值的也要浮现，不静默丢）。
     return ("advance", "collected", result)
 
 

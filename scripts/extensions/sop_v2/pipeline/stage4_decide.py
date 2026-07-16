@@ -62,8 +62,14 @@ def main() -> int:
         shortlist.sort(key=lambda c: (c.get("storefront_status") == "confirmed_yes",
                                       c.get("real_er") or 0), reverse=True)
         shortlist = shortlist[:cap]
+        disc = cfg.get("discovery", {})
+        t = cfg["track"][args.track]
+        lo, hi = ((t["min_followers"], t["max_followers"]) if args.track == "paid"
+                  else (t["standard_min"], t["priority_max"]))
+        filt = {"followers": {"min": lo, "max": hi},
+                "engagementRate": {"min": disc.get("search_er_min", 0.015)}}
         print(f"Modash 补数(CDP)：shortlist {len(shortlist)}/{len(cands)}（省 credit，上限 {cap}）…")
-        r = enrich_via_cdp(shortlist, args.cdp)
+        r = enrich_via_cdp(shortlist, disc.get("search_query", ""), filt, args.cdp)
         print(f"Modash 补数(CDP): 命中 {r.get('matched')}/{r.get('total')}"
               + (f"  ⚠ {r['error']}" if r.get("error") else ""))
     elif args.modash_csv:
