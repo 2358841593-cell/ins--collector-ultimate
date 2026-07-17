@@ -273,7 +273,8 @@ def enrich_via_cdp(cands: list[dict], query: str, filters: dict,
             if not pg:
                 return {"error": "no_modash_tab", "matched": matched, "total": len(cands),
                         "from_cache": from_cache}
-            idmap = resolve_platform_ids(pg, handles, query, filters)
+            # max_pages 给足：候选多（跨 collected+rejected）时要翻够页才建全 handle→spid 映射
+            idmap = resolve_platform_ids(pg, handles, query, filters, max_pages=80)
             for cand in need:
                 h = (cand.get("handle") or "").lstrip("@")
                 spid = idmap.get(h.lower())

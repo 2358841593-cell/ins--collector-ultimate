@@ -74,8 +74,16 @@ def main() -> int:
         t = cfg["track"][args.track]
         lo, hi = ((t["min_followers"], t["max_followers"]) if args.track == "paid"
                   else (t["standard_min"], t["priority_max"]))
+        # 补数重搜必须和 discovery 用**同一套筛选**（含 11 国地区 + 受众可信度），否则搜索空间不同、
+        # 很多号在重搜的前若干页翻不到 → spid 拿不到 → 假性"待补数"（实测命中率从 15/40 掉下来的根因）。
         filt = {"followers": {"min": lo, "max": hi},
                 "engagementRate": {"min": disc.get("search_er_min", 0.015)}}
+        geo_ids = disc.get("search_creator_geo_ids")
+        if geo_ids:
+            filt["geo"] = list(geo_ids)
+        cred_min = disc.get("search_audience_credibility_min")
+        if cred_min:
+            filt["audience"] = {"credibility": float(cred_min)}
         print(f"Modash 补数(CDP)：shortlist {len(shortlist)}/{len(active)}（省 credit，上限 {cap}）…")
         cache_dir = str(Path(args.out).with_name("modash_raw"))  # 原始报告落盘→改解析器免重付费
         r = enrich_via_cdp(shortlist, disc.get("search_query", ""), filt, args.cdp, cache_dir=cache_dir)
