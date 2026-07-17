@@ -226,9 +226,25 @@ search_page_delay = 2.2         # 每页基准停顿秒（拟人，降 Modash �
 search_require_amazon_bio = false  # Modash creator_description 是 AI 摘要，少含字面 amazon；橱窗留 stage2 验
 # ── 发现阶段受众/地区硬筛（逆向确认可用；根治"深采白耗在高假粉/非目标国号上"）──
 # filters.geo=[国家id] 筛**创作者所在地**；filters.audience.credibility=数字 筛受众可信度（0.75=假粉≤25%）。
-# 实测：baseline 2100 →(geo=US)1658 →(+cred≥0.75)1252，结果全是美国真实创作者。
-search_creator_geo_ids = [148838]        # Modash 地理 id：148838=United States（可扩 CA/UK…）
-search_audience_credibility_min = 0.75   # 受众可信度下限（0.75→假粉≤25%，发现阶段就砍高假粉）
+# 地区口径对齐客户需求 REQUIREMENTS_CHECKLIST GATE-04（目标国家 Tier1+Tier2）+ GATE-05（创作者国=Top受众国）
+# + GATE-06（假粉<25%）。geo id 由 /api/dictionary/locations?search=<国>&channel=INSTAGRAM 逆向取（type=country）。
+# Tier1 US/CA/UK/DE/IT/FR/ES + Tier2 NL/BE/CH/SE（实测 geo=[CA] total 2364→1011，生效）。
+search_creator_geo_ids = [
+  148838,   # US United States (Tier1)
+  1428125,  # CA Canada (Tier1)
+  62149,    # UK United Kingdom (Tier1)
+  51477,    # DE Germany (Tier1)
+  365331,   # IT Italy (Tier1)
+  2202162,  # FR France (Tier1)
+  1311341,  # ES Spain (Tier1)
+  2323309,  # NL Netherlands (Tier2)
+  52411,    # BE Belgium (Tier2)
+  51701,    # CH Switzerland (Tier2)
+  52822,    # SE Sweden (Tier2)
+]
+search_audience_credibility_min = 0.75   # 受众可信度下限（0.75→假粉≤25%，对齐 GATE-06，发现阶段就砍高假粉）
+# 待办（需真机点 UI 抓包逆向）：filters.audience 的**受众地区**筛字段（比创作者地更准，直接对齐 GATE-04/E3
+# 目标市场受众合计；届时创作者地筛可放宽避免误杀"本人在外、受众在目标国"的优质号）。
 # Modash AI Search 种子查询（旧路，保留兜底；命中"个人+橱窗+护肤/美妆带货"）
 modash_queries = [
   "amazon storefront skincare finds link in bio",
