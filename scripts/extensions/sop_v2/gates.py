@@ -100,11 +100,11 @@ def gate_real_er(cand, cfg):
     if not r:
         return None
     v = cand.get("real_er_median")
-    if v is None:      # 旧数据无中位字段 → 从已落库 sampled_posts 现算；再不行才回退均值
+    if v is None:      # 旧数据无中位字段 → 从已落库 sampled_posts 现算
         v = _content.median_er(cand.get("sampled_posts"), cand.get("follower_count"),
                                int(r.get("window_posts", 10)))
-    if v is None:
-        v = cand.get("real_er")
+    if v is None:      # 客户 2026-07-17：中位缺失（拿不到帖子赞评）本轮用 Modash general_er 为准
+        v = cand.get("general_er")
     if v is None:
         if r.get("missing_is_review"):
             return _g("GATE-13", GateVerdict.REVIEW, None, f">={r['review_below']}",

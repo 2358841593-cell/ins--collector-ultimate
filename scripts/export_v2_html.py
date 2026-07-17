@@ -251,12 +251,17 @@ def _typical_er(c):
 
 
 def _er_cell(c):
-    """ER 对照：中位=门槛依据（平常真实互动），均值=参考（含爆款触达）。客户 2026-07-17 口径。"""
-    mo = c.get("modash_er")
+    """ER 对照：中位=门槛依据（平常真实互动），均值=参考（含爆款触达）。客户 2026-07-17 口径。
+    中位缺失（拿不到帖子赞评）→ 本轮以 Modash general_er 为准。"""
+    mo = c.get("modash_er") if c.get("modash_er") is not None else c.get("general_er")
     mean = c.get("ig_er") if c.get("ig_er") is not None else c.get("real_er")
     med = _typical_er(c)
     parts = [f"Modash {mo}%" if mo is not None else "Modash —"]
     if med is None and mean is None:
+        # 中位/均值都拿不到 → 用 Modash 为准
+        if mo is not None:
+            parts[-1] = f'<b>Modash {mo}%（本轮为准）</b>'
+            return " / ".join(parts)
         parts.append('<span class="muted">IG 待读</span>')
         return " / ".join(parts)
     if med is not None:
