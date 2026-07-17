@@ -227,15 +227,35 @@ def _intent_cell(c):
         return '<span class="warn">评论抽取失败（待复采）</span>'   # 深采跑了但一条没抽到 = 系统侧待修
     if (vc or 0) < 20:
         return f'<span class="muted">样本偏少（{vc} 条，待补采）</span>'
-    return '<span class="muted">无明显购买意向（有效评论 {} 条）</span>'.format(vc)
+    # 诚实标注：受众语言非意图短语覆盖（英/西/葡/德/法/意）→ 不敢断言"无意向"，标待按该语言复判。
+    # 早期采的德/法/意号是用英文口径判的 0 意向，不可靠（客户实测 skincare.and.tea 德语 262 条被误判）。
+    _GRADED = ("english", "spanish", "portuguese", "german", "french", "italian")
+    lang = (c.get("top_language") or "").lower()
+    has_sample = bool(c.get("comment_sample"))
+    if lang and lang not in _GRADED:
+        return (f'<span class="warn">评论主要为{esc(c.get("top_language"))}，意图判定暂未覆盖该语言'
+                f'（有效 {vc} 条）</span>')
+    if lang in ("german", "french", "italian") and not has_sample:
+        return (f'<span class="warn">评论主要为{esc(c.get("top_language"))}，本轮英文口径可能漏判'
+                f'（有效 {vc} 条，待按该语言复判）</span>')
+    return f'<span class="muted">无明显购买意向（有效评论 {vc} 条）</span>'
 
 
 def _storefront_cell(c):
+    """客户 2026-07-17：Amazon 有就打开 Amazon 橱窗；没有就展示他实际有的橱窗（LTK/ShopMy/自营/聚合）。"""
     st = c.get("storefront_status")
     if st == "confirmed_yes":
-        u = c.get("amazon_storefront_link") or ""
-        return f'<a href="{esc(u)}" target="_blank">打开橱窗 ↗</a>'
-    return {"confirmed_no": '<span class="muted">确认无</span>',
+        u = c.get("amazon_storefront_link") or c.get("storefront_url") or ""
+        return f'<a href="{esc(u)}" target="_blank">打开 Amazon 橱窗 ↗</a>'
+    # 无 Amazon：有什么橱窗放什么
+    su, stype = c.get("storefront_url"), c.get("storefront_type")
+    if su and stype and stype != "Amazon":
+        return f'<a href="{esc(su)}" target="_blank">{esc(stype)} ↗</a>'
+    # 还有 bio 链但没归类出橱窗 → 给首个 bio 链兜底（客户可自己看）
+    bl = c.get("bio_links") or []
+    if bl:
+        return f'<a href="{esc(bl[0])}" target="_blank">链接 ↗</a>'
+    return {"confirmed_no": '<span class="muted">无 Amazon（未见其他橱窗）</span>',
             "unknown": '<span class="muted">未确认</span>'}.get(st, '<span class="muted">—</span>')
 
 

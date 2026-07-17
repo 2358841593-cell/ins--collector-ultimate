@@ -38,7 +38,9 @@ AGG = ("linktr.ee", "linktree.com", "beacons", "ltk", "liketoknow", "shopltk", "
        "komi.io", "stan.store", "vana.ly", "bio.site", "linkin.bio", "lnk.bio", "snipfeed",
        "flow.page", "msha.ke", "tapl.ink", "milkshake", "campsite.bio", "withkoji",
        "desty.page", "desty.link", "carrd.co", "znap.link", "hoo.be", "direct.me", "url.bio",
-       "pillar.io", "many.link", "tap.bio", "solo.to", "allmylinks", "linkpop")
+       "pillar.io", "many.link", "tap.bio", "solo.to", "allmylinks", "linkpop",
+       "wonderl.ink", "wonderlink", "linkme.bio", "link.me", "later.com", "lnk.to",
+       "linkr.bio", "s.shopmy", "flowcode", "koji", "gravatar")   # 补欧洲/新型聚合链
 AMAZON = ("amazon.", "amzn.to", "/shop/", "storefront")
 
 
@@ -607,6 +609,9 @@ def deep_collect(pg, cand, ev_dir, n_posts=10):
     cand["promotional_post_count"] = promo_count
     cand["comments_read"] = True
     cand["comment_shots"] = []                        # 已弃截图（改结构化文本证据）
+    # 存原始评论样本：供以后按语言重判意图（不用重采）+ 客户抽查透明。德/法/意号评论非英文，
+    # 意图短语表补齐后可对这些样本离线重判，不必重新烧号。
+    cand["comment_sample"] = all_comments[:120]
     # 评论信任分析（有效样本数/低质占比，供 routing comments_insufficient）——高意图数用上面的分级口径
     analysis = cmt_mod.analyze(all_comments)
     cand["comments_analyzed"] = analysis["comments_analyzed"]
@@ -636,12 +641,37 @@ def _cache_save(cand):
         pass
 
 
+# 社交/内容链（不算橱窗，不放进"有什么橱窗放什么"）
+_SOCIAL = ("instagram.com", "tiktok.com", "youtube.", "youtu.be", "twitter.", "x.com",
+           "facebook.", "threads.net", "pinterest.", "snapchat.", "t.me")
+_SHOP_RANK = {"Amazon": 0, "LTK": 1, "ShopMy": 2, "自营店": 3, "链接聚合": 4}
+
+
+def _shop_type(u: str):
+    """把一条链接分类成橱窗类型；社交/内容链返回 None（不算橱窗）。"""
+    l = (u or "").lower()
+    if any(a in l for a in AMAZON):
+        return "Amazon"
+    if any(k in l for k in ("liketoknow", "ltk.app", "shopltk", "ltk.to", "/ltk")):
+        return "LTK"
+    if "shopmy" in l:
+        return "ShopMy"
+    if any(g in l for g in AGG):
+        return "链接聚合"
+    if any(s in l for s in _SOCIAL):
+        return None
+    if re.search(r"/shop|/store|storefront|myshopify|bigcartel|\.store\b|boutique", l):
+        return "自营店"
+    return "自营店"     # 剩下的非社交外链，多半是个人店/官网 → 当自营橱窗展示（客户口径：有什么放什么）
+
+
 def _resolve_storefront(cand, pg):
-    """判 storefront（零 API）。收集全部 bio 链接（首链 + 多链接号弹层里的其余），
-    任一直链 Amazon → confirmed_yes；聚合链穿透找 Amazon；聚合都没穿到 → confirmed_no；否则 unknown。"""
+    """判 storefront（零 API）。Amazon 优先（confirmed_yes 供硬门槛/优先级）；**客户 2026-07-17：
+    Amazon 没有就有什么橱窗放什么**——LTK / ShopMy / 自营店 / 聚合链都抓出来存 storefront_url+type，
+    交付表照实展示，不再一个"未确认"了事。"""
     ext = cand.get("external_url")
     links = [ext] if ext else []
-    if cand.get("_bio_has_more"):        # "and N more"：点开弹层拿隐藏链接（Amazon 常藏这）
+    if cand.get("_bio_has_more"):        # "and N more"：点开弹层拿隐藏链接
         try:
             links += _expand_bio_links(pg)
         except Exception:  # noqa: BLE001
@@ -652,15 +682,28 @@ def _resolve_storefront(cand, pg):
             seen.add(u)
             all_links.append(u)
     cand["bio_links"] = all_links
+
+    def _set_other_storefront():
+        # 非 Amazon：挑最像橱窗的一条（LTK>ShopMy>自营>聚合），存下来照实展示
+        best, bt = None, None
+        for u in all_links:
+            t = _shop_type(u)
+            if t and t != "Amazon" and (bt is None or _SHOP_RANK.get(t, 9) < _SHOP_RANK.get(bt, 9)):
+                best, bt = u, t
+        if best:
+            cand["storefront_url"] = best
+            cand["storefront_type"] = bt
+
     if not all_links:
-        # 没抓到外链 ≠ 一定没橱窗（抽取可能漏）→ unknown（交 Review），绝不 confirmed_no 误杀
-        cand["storefront_status"] = "unknown"
+        cand["storefront_status"] = "unknown"     # 没抓到外链 ≠ 没橱窗 → 交 Review，不误杀
         return
     # 1) 任意直链 Amazon
     for u in all_links:
         if any(a in u.lower() for a in AMAZON):
             cand["storefront_status"] = "confirmed_yes"
             cand["amazon_storefront_link"] = u
+            cand["storefront_url"] = u
+            cand["storefront_type"] = "Amazon"
             return
     # 2) 聚合链逐个穿透找 Amazon
     penetrated = False
@@ -675,8 +718,11 @@ def _resolve_storefront(cand, pg):
                 if amz:
                     cand["storefront_status"] = "confirmed_yes"
                     cand["amazon_storefront_link"] = amz
+                    cand["storefront_url"] = amz
+                    cand["storefront_type"] = "Amazon"
                     return
-    # 3) 有聚合链但都没穿到 Amazon → confirmed_no；只有非聚合外链 → unknown
+    # 3) 无 Amazon：有什么橱窗放什么（LTK/ShopMy/自营/聚合），并按是否穿透过定 status
+    _set_other_storefront()
     cand["storefront_status"] = "confirmed_no" if penetrated else "unknown"
 
 

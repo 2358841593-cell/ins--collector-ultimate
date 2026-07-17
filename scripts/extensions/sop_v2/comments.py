@@ -72,6 +72,16 @@ CONSIDER_PHRASES = [
     "cuál me recomiendas", "cual me recomiendas", "cuál es mejor", "cual es mejor",
     "qué tono", "que tono", "lo recomiendas", "sirve para", "es bueno para", "cada cuánto",
     "funciona mesmo", "vale a pena", "serve para", "recomenda",
+    # 德语
+    "funktioniert das", "funktioniert es", "lohnt sich das", "lohnt es sich", "für fettige haut",
+    "für trockene haut", "für empfindliche haut", "gut für", "welche", "welches", "empfiehlst du",
+    "wie oft", "wie benutzt man",
+    # 法语
+    "est-ce que ça marche", "ça marche", "ça vaut le coup", "pour peau grasse", "pour peau sèche",
+    "pour peau sensible", "tu recommandes", "lequel", "laquelle", "à quelle fréquence",
+    # 意大利语
+    "funziona", "ne vale la pena", "per pelle grassa", "per pelle secca", "per pelle sensibile",
+    "lo consigli", "quale", "quanto spesso", "come si usa",
 ]
 
 # 明确购买意图短语（高精度：只留清晰买信号，不含"有效/推荐"等辩论也会中的宽词）
@@ -94,6 +104,17 @@ INTENT_PHRASES = [
     "lo acabo de comprar", "comprado ✓",
     # 明确想要 + 具体产品
     "i need this", "i want this", "lo quiero", "lo necesito", "quiero uno", "quiero comprar",
+    # 德语（DE 目标市场）
+    "wo kann ich", "wo gibt es", "wo bekomme ich", "link bitte", "wo bestellen", "wo kaufen",
+    "wie viel kostet", "was kostet", "gerade bestellt", "schon bestellt", "ich brauche das",
+    "ich will das", "muss ich haben", "wo finde ich",
+    # 法语（FR 目标市场）
+    "où acheter", "où l'acheter", "le lien svp", "le lien stp", "combien ça coûte", "c'est combien",
+    "je viens de commander", "j'ai commandé", "j'ai besoin de ça", "je le veux", "je veux ça",
+    "où le trouver",
+    # 意大利语（IT 目标市场）
+    "dove comprare", "dove lo compro", "il link per favore", "quanto costa", "appena ordinato",
+    "l'ho ordinato", "lo voglio", "mi serve questo", "dove si compra",
 ]
 
 
@@ -149,6 +170,16 @@ LOW_INTENT = [
     "lo quiero", "lo necesito", "necesito esto", "quiero probar", "quiero uno", "me encanta",
     "amo esto", "el mejor", "la mejor", "increíble", "necesito uno", "quiero comprar",
     "amei", "preciso disso", "o melhor", "maravilhoso", "adorei",
+    # 德语：真诚想要/产品热情
+    "brauche das", "will das", "ich brauche", "muss ich haben", "auf meiner liste", "liebe es",
+    "liebe das", "so gut", "so schön", "wunderschön", "das beste", "der beste", "die beste",
+    "besessen", "unbedingt", "will ich haben", "sieht toll aus", "sieht so gut aus",
+    # 法语：真诚想要/产品热情
+    "j'adore", "besoin de ça", "je veux ça", "il me faut", "sur ma liste", "le meilleur",
+    "la meilleure", "incroyable", "magnifique", "trop bien", "j'en ai besoin", "obsédée",
+    # 意大利语：真诚想要/产品热情
+    "lo adoro", "mi serve", "lo voglio", "il migliore", "la migliore", "bellissimo",
+    "bellissima", "incredibile", "ne ho bisogno", "sulla mia lista", "stupendo",
 ]
 # 互赞团/夸内容/夸人 → 水军，不算意图（哪怕是"夸"）
 _POD_RE = re.compile(r"your\s+(content|videos?|reels?|feed|page|style)|content\s+(creator|is|looks)|"
