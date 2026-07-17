@@ -303,17 +303,45 @@ def fetch_profile_browser(pg, handle):
     return pf
 
 
+# 拦掉的资源类型：抽取全程零像素依赖（_PROFILE_JS/_DEEP_READ_JS/_COMMENTS_JS/_GRID_JS 只读
+# meta 标签、innerText、a[href]），且深采已弃截图（_shot 是死代码、comment_shots 硬编码 []）。
+# 图片/视频/字体纯烧带宽和请求数——正是把隧道出口 IP 打到限流的元凶（青果默认每秒仅 5 并发）。
+# ⚠ 绝不能拦 stylesheet：_load_comments 靠 mouse.move(820,500) 这个 CSS 双栏布局算出来的硬编码
+# 坐标滚右侧评论列，拦了 CSS 布局塌成单栏，x=820 处不再是评论列 → 评论直接抽不到。
+# ⚠ 也不能拦 script：IG 评论区是 React 渲染的，拦了就没评论。
+_BLOCK_TYPES = frozenset(("image", "media", "font"))
+
+
+def _install_blockers(ctx):
+    """挂 context 级路由拦无用资源。挂 ctx 不挂 page：_base 用的是 ctx.pages[0]（预建页），
+    且 _resolve_storefront 会用同一页去聚合站穿透，context 级一并覆盖。"""
+    def _h(route):
+        try:
+            if route.request.resource_type in _BLOCK_TYPES:
+                route.abort()
+            else:
+                route.continue_()
+        except Exception:  # noqa: BLE001  页面已关等竞态
+            pass
+    ctx.route("**/*", _h)
+
+
 def open_ctx(pw, acct, proxy, headless=True):
     pd = SECRETS / "chrome-instagram-profiles" / acct["username"]
     pd.mkdir(parents=True, exist_ok=True)
     # 强制英文 UI locale：登出态页面否则随代理 IP 出中文("粉丝"/"关注")，粉丝数/类目解析全失效
     kw = dict(user_data_dir=str(pd), channel="chrome", headless=headless,
               viewport={"width": 1000, "height": 1300}, locale="en-US",
+              service_workers="block",          # SW 发起的请求会绕过 route，且 SW 自己也在重发
               extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
-              args=["--no-first-run", "--no-default-browser-check", "--lang=en-US"])
+              # 渲染器层面直接禁图：请求根本不发出，比 route 更省（route 是发出后才 abort，
+              # 每请求一次跨进程往返）。两者互补：blink 拦图、route 兜住视频/字体/漏网。
+              args=["--no-first-run", "--no-default-browser-check", "--lang=en-US",
+                    "--blink-settings=imagesEnabled=false"])
     if proxy:
         kw["proxy"] = proxy
     ctx = pw.chromium.launch_persistent_context(**kw)
+    _install_blockers(ctx)                      # 必须在任何导航前挂上
     ctx.add_cookies([
         {"name": "sessionid", "value": acct["sessionid"], "domain": ".instagram.com", "path": "/", "secure": True},
         {"name": "ds_user_id", "value": acct["ds_user_id"], "domain": ".instagram.com", "path": "/", "secure": True},
@@ -496,20 +524,17 @@ def deep_collect(pg, cand, ev_dir, n_posts=10):
     for i, href in enumerate(codes[:n_posts]):
         purl = f"https://www.instagram.com{href}"
         if not _goto(pg, purl):
-            # 实测：隧道代理/出口 IP 在高频翻帖下会被限流，表现为帖子页连续导航失败。
+            # 实测：隧道出口 IP 在高频翻帖下被限流，表现为帖子页连续导航失败。
             # 旧行为是傻等着挨个超时(45s×2/帖)、10 帖全废还静默产出空 cand（18% 的号中招）。
-            # 改：连续 3 次失败且一帖没采到 → 判定被限流，长退避给隧道换 IP 的时间，再试一次；
-            # 仍失败就判错回 qualified 重采，绝不返回空产出。
+            # ⚠ 不要 sleep 退避：HTTPS 走 CONNECT，出口 IP 在建连时就定死，Chrome 的 keep-alive
+            # 隧道在 sleep 期间不会断——醒来还是同一个被限流的 IP，重试必然再失败（实测 3✗4✗）。
+            # 正解：快速失败 → _base 收到 error 会 ctx.close() 并换号重开 context → 新 CONNECT
+            # → **新出口 IP**。这才是真正的"换 IP 退避"。
             nav_fails += 1
             if nav_fails >= 3 and not posts_meta:
-                time.sleep(random.uniform(45, 90))     # 退避窗口：等隧道轮换出口 IP
-                if not _goto(pg, purl):
-                    return None, "proxy_throttled"     # → stage3 判 error，回 qualified 待补采
-                nav_fails = 0
-            else:
-                continue
-        else:
-            nav_fails = 0
+                return None, "proxy_throttled"   # → stage3 判 error → _base 关 ctx 换号换 IP
+            continue
+        nav_fails = 0
         pg.wait_for_timeout(3000)
         info = pg.evaluate(_DEEP_READ_JS)
         likes, comments, caption = _post_stats(info.get("caption", ""))   # 赞/评/干净caption(算实算ER)
