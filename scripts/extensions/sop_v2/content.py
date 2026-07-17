@@ -52,6 +52,24 @@ def _distinct_hits(captions, terms):
     return len(seen)
 
 
+def median_er(posts, followers, window: int = 10):
+    """中位实算 ER = 前 N 帖 (赞+评) 的**中位数**/粉丝 × 100。
+
+    客户 2026-07-17 定：**中位数判硬门槛，均值作参考**。原因：均值会被单条爆款 Reel 拉爆
+    ——sav.aesthetics_ 59K 粉有 437K 赞的爆款，均值 ER 201.73% 但中位仅 1.98%（平常水平）。
+    正常号均值≈中位（melitseng 2.9/2.71），失真只发生在爆款外溢号，正是要甄别的那类。
+    posts 需含 like_count/comment_count（cand['posts'] 或已落库的 sampled_posts 均可）。"""
+    if not followers:
+        return None
+    ps = [p for p in (posts or [])[:window] if p.get("like_count") is not None]
+    if not ps:
+        return None
+    eng = sorted((p.get("like_count") or 0) + (p.get("comment_count") or 0) for p in ps)
+    n = len(eng)
+    med = eng[n // 2] if n % 2 else (eng[n // 2 - 1] + eng[n // 2]) / 2
+    return round(med / followers * 100, 2)
+
+
 def derive_content_signals(cand: dict, cfg: dict) -> dict:
     posts = cand.get("posts") or []
     followers = cand.get("follower_count") or 0
@@ -106,7 +124,8 @@ def derive_content_signals(cand: dict, cfg: dict) -> dict:
 
         # 实算 ER：前 N 帖合并（赞+评）/粉丝，只在拿得到赞评数时计算
         have_counts = [p for p in recentN if p.get("like_count") is not None]
-        out["real_er"] = er(have_counts) if have_counts else None
+        out["real_er"] = er(have_counts) if have_counts else None          # 均值：参考 + 爆款触达信号
+        out["real_er_median"] = median_er(have_counts, followers)          # 中位：硬门槛依据（客户 2026-07-17）
         out["real_er_window"] = len(have_counts)
 
         reels = [p for p in recentN if p.get("media_type") == 2]

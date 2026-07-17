@@ -93,11 +93,18 @@ def gate_general_er(cand, cfg):
 
 
 def gate_real_er(cand, cfg):
-    """实算 ER（前 N 帖赞评/粉丝）= 硬门槛。放宽后只挡僵尸/刷量；缺数据 → 固定 Review 不误杀。"""
+    """实算 ER（前 N 帖赞评/粉丝）= 硬门槛。放宽后只挡僵尸/刷量；缺数据 → 固定 Review 不误杀。
+    客户 2026-07-17：判门槛用**中位数**（抗爆款单帖拉爆均值），均值 real_er 仅作参考/触达信号。"""
+    from extensions.sop_v2 import content as _content
     r = cfg.get("real_er")
     if not r:
         return None
-    v = cand.get("real_er")
+    v = cand.get("real_er_median")
+    if v is None:      # 旧数据无中位字段 → 从已落库 sampled_posts 现算；再不行才回退均值
+        v = _content.median_er(cand.get("sampled_posts"), cand.get("follower_count"),
+                               int(r.get("window_posts", 10)))
+    if v is None:
+        v = cand.get("real_er")
     if v is None:
         if r.get("missing_is_review"):
             return _g("GATE-13", GateVerdict.REVIEW, None, f">={r['review_below']}",
