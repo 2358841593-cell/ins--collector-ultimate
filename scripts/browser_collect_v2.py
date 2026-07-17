@@ -492,10 +492,24 @@ def deep_collect(pg, cand, ev_dir, n_posts=10):
 
     posts_meta, intent_posts, all_intent, promo_count = [], [], [], 0
     all_comments, seen_c = [], set()           # 累积评论样本（供 comments.analyze 算有效样本/信任分）
+    nav_fails = 0                              # 连续帖子页导航失败数（限流探测）
     for i, href in enumerate(codes[:n_posts]):
         purl = f"https://www.instagram.com{href}"
         if not _goto(pg, purl):
-            continue
+            # 实测：隧道代理/出口 IP 在高频翻帖下会被限流，表现为帖子页连续导航失败。
+            # 旧行为是傻等着挨个超时(45s×2/帖)、10 帖全废还静默产出空 cand（18% 的号中招）。
+            # 改：连续 3 次失败且一帖没采到 → 判定被限流，长退避给隧道换 IP 的时间，再试一次；
+            # 仍失败就判错回 qualified 重采，绝不返回空产出。
+            nav_fails += 1
+            if nav_fails >= 3 and not posts_meta:
+                time.sleep(random.uniform(45, 90))     # 退避窗口：等隧道轮换出口 IP
+                if not _goto(pg, purl):
+                    return None, "proxy_throttled"     # → stage3 判 error，回 qualified 待补采
+                nav_fails = 0
+            else:
+                continue
+        else:
+            nav_fails = 0
         pg.wait_for_timeout(3000)
         info = pg.evaluate(_DEEP_READ_JS)
         likes, comments, caption = _post_stats(info.get("caption", ""))   # 赞/评/干净caption(算实算ER)
