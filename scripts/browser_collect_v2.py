@@ -434,35 +434,33 @@ _GRID_JS = r"""() => { const codes=[...document.querySelectorAll('a')].map(a=>a.
     .filter(h=>h&&/\/(p|reel)\//.test(h)); return {codes:[...new Set(codes)].slice(0,12),
     logged_out:/创建新账户|Create new account|Log into Instagram/.test(document.body.innerText.slice(0,120))}; }"""
 
-# 直接抽评论 {用户名,原话} 配对（不 OCR、不截图）：从帖子页评论 DOM 抠用户名链接 + 相邻正文
-_COMMENTS_JS = r"""() => {
-  const art=document.querySelector('article')||document.body;
-  const isUser=h=>/^\/[a-zA-Z0-9._]+\/$/.test(h||'') && !/\/(p|reel|reels|explore|stories)\//.test(h||'');
-  const SKIP=/^(meta|about|blog|jobs|help|api|privacy|terms|locations|instagram|threads|contact|popular|uploads|directory)$/i;
+# 直接抽评论 {用户名,原话} 配对（不 OCR、不截图）。2026-07 实测：IG 帖子页**无 <article>**，
+# 评论正文在 span[dir=auto]，与用户名链接是**兄弟节点**（旧代码在父链找正文→抽 0，dra.aliciapaola/
+# rusky1415 教训）。新法：遍历 dir=auto 文本块 → 就近祖先取用户名 → 滤 UI 噪声（时间戳/赞数/回复/
+# 翻译/导航）→ 排除帖主 caption。owner 传帖主 handle。
+_COMMENTS_JS = r"""(owner) => {
+  const isUser=h=>/^\/[a-zA-Z0-9._]+\/$/.test(h||'') && !/\/(p|reel|reels|explore|stories|direct)\//.test(h||'');
+  // UI 噪声：时间戳(20w/5d/3h) / 赞数回复 / 翻译 / 导航项 / follow 等——非评论正文
+  const NOISE=/^(\d+\s*(w|d|h|m|s|y)|\d[\d,.]*\s*(likes?|replies|reply)|reply|responder|see translation|hide|view( all)?( replies| \d)|查看翻译|ver traducci|verified|已验证|edited|editado|now|me gusta|author|pinned|más|more|profile|home|search|explore|reels|messages|notifications|create|settings|switch appearance|log ?out|meta|threads|about|help|press|api|jobs|privacy|terms|following|follow|message)$/i;
+  const SKIPUSER=/^(meta|about|blog|jobs|help|api|privacy|terms|locations|instagram|threads|contact|popular|uploads|directory|explore|reels|p|reel|accounts|emails)$/i;
   const out=[], seen=new Set();
-  for(const a of art.querySelectorAll('a[href]')){
-    const href=a.getAttribute('href')||''; if(!isUser(href)) continue;
-    const uname=href.replace(/\//g,'');
-    // 从用户名链接向上找含评论正文的最小容器（通常 2-4 层）
-    let box=a.parentElement, text='';
-    for(let i=0;i<4&&box;i++){
-      const t=(box.innerText||'').trim();
-      if(t.length>uname.length+3 && t.length<500){
-        const idx=t.indexOf(uname);
-        let body=(idx>=0? t.slice(idx+uname.length): t);
-        // 去时间戳/Reply/likes 等 UI 行，取评论正文首段
-        body=body.replace(/^[\s·•\n]+/,'').split(/\n/).find(l=>{
-          const s=l.trim(); return s.length>1 && !/^(\d+\s*(天|周|小时|分钟|d|w|h|min|semanas?|días?|horas?)|回复|reply|responder|like|me gusta|verified|已验证|查看翻译|ver traducción)/i.test(s);
-        }) || '';
-        text=body.trim(); break;
-      }
+  for(const s of document.querySelectorAll('span[dir="auto"], div[dir="auto"]')){
+    let txt=(s.innerText||'').trim();
+    if(txt.length<2 || txt.length>400 || NOISE.test(txt)) continue;
+    // 就近祖先里的用户名链接（评论作者）
+    let box=s, uname='';
+    for(let i=0;i<7&&box;i++){
+      const a=[...box.querySelectorAll('a[href]')].find(a=>isUser(a.getAttribute('href')));
+      if(a){ uname=a.getAttribute('href').replace(/\//g,''); break; }
       box=box.parentElement;
     }
-    if(text.length>2 && text.length<260 && !SKIP.test(uname) && !SKIP.test(text)){
-      const key=uname+'|'+text.slice(0,24);
-      if(!seen.has(key)){ seen.add(key); out.push({username:uname, text:text.slice(0,240)}); }
-    }
-    if(out.length>=80) break;
+    if(!uname || SKIPUSER.test(uname)) continue;
+    if(owner && uname===owner) continue;                  // 帖主 caption/自评不算评论
+    if(txt.startsWith(uname+' ')) txt=txt.slice(uname.length).trim();
+    if(txt===uname || txt.length<2 || NOISE.test(txt)) continue;
+    const key=uname+'|'+txt.slice(0,24);
+    if(!seen.has(key)){ seen.add(key); out.push({username:uname, text:txt.slice(0,240)}); }
+    if(out.length>=100) break;
   }
   return out;
 }"""
@@ -511,8 +509,12 @@ def deep_collect(pg, cand, ev_dir, n_posts=10):
             _pause(1.5, 3)
             continue
         _load_comments(pg, rounds=4)
-        # 直接抽 {用户名,原话} 配对（不 OCR、不截图）
-        paired = pg.evaluate(_COMMENTS_JS) or []
+        # 直接抽 {用户名,原话} 配对（owner=帖主，排除其 caption；不 OCR、不截图）
+        paired = pg.evaluate(_COMMENTS_JS, handle) or []
+        # 自检：og 显示评论多但抽得少 → 评论区没完全展开，再加载一轮重抽（防"抽 0/抽少"）
+        if (comments or 0) >= 15 and len(paired) < max(5, (comments or 0) // 3):
+            _load_comments(pg, rounds=3)
+            paired = pg.evaluate(_COMMENTS_JS, handle) or []
         for c in paired:
             k = (c.get("username", "") + "|" + (c.get("text") or "")[:24]).lower()
             if c.get("text") and k not in seen_c:
