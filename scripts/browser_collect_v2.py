@@ -597,8 +597,12 @@ def deep_collect(pg, cand, ev_dir, n_posts=10):
     cand["intent_by_grade"] = tiers                  # 分级计数 高/中/低
     cand["high_intent_count"] = tiers["high"] + tiers["medium"]   # C3 scoring 口径（强+中）
     cand["intent_total"] = sum(tiers.values())       # 含低级（展示口径）
+    # ⚠ 展示必须**按级别排序**再取前 8——all_intent 是按帖子顺序累积的，高/中意向若出现在靠后帖子，
+    # 会被前面一堆低意向挤出前 8 截掉（客户实测：表头 高1中1低35 却只展示低）。高→中→低，最有价值的先露。
+    _go = {"high": 0, "medium": 1, "low": 2}
+    ranked = sorted(all_intent, key=lambda x: _go.get(x.get("grade"), 3))
     cand["high_intent_snippets"] = [f"@{x['username']}（{x['grade_zh']}）: {x['text']}"
-                                    for x in all_intent[:8]]       # 交付展示：@用户(级别): 原话
+                                    for x in ranked[:8]]           # 交付展示：@用户(级别): 原话，高在前
     cand["promo_intent_hits"] = len(all_intent)
     cand["promotional_post_count"] = promo_count
     cand["comments_read"] = True
