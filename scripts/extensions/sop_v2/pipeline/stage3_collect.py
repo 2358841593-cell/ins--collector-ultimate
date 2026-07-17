@@ -29,6 +29,10 @@ def collect_one(pg, cand, cfg, batch_id, n_posts):
     # 判 error 报 stage_error 回退 qualified 重试，绝不静默进 collected。
     if not result.get("comments_read") or "sampled_posts" not in result:
         return ("error", "deep_no_output")
+    # 网格有帖子 code 却一帖都没采到 = 帖子页导航全失败（代理抖动/限流），不是"真没帖"→ 判 error 重试。
+    # （livvvmarkley/mirandacorneliusbeauty 教训：codes=12 但 sampled_posts=0 仍被放行进 collected）
+    if result.get("codes") and not result.get("sampled_posts"):
+        return ("error", "deep_all_posts_failed")
     # 深采完就进 collected——绝不在此丢弃。实算ER/意图等"不太合格"处由 routing 归池 + 交付表写明原因，
     # 让客户真实浏览判断（某处差但有合作价值的也要浮现，不静默丢）。
     return ("advance", "collected", result)
