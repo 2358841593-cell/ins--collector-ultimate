@@ -239,11 +239,35 @@ def _storefront_cell(c):
             "unknown": '<span class="muted">未确认</span>'}.get(st, '<span class="muted">—</span>')
 
 
+def _typical_er(c):
+    """中位数 ER（抗爆款单帖拉爆均值）：从已存 sampled_posts 现算，无需重采。
+    客户口径的 real_er 是"前10帖**均值**(赞+评)/粉丝"——一条爆款 Reel 触达远超粉丝时会把均值拉到
+    100%+，歪曲典型互动。中位数给出"这个号平常大概什么水平"。"""
+    posts = [p for p in (c.get("sampled_posts") or []) if p.get("like_count") is not None]
+    f = c.get("follower_count")
+    if not posts or not f:
+        return None
+    eng = sorted((p.get("like_count") or 0) + (p.get("comment_count") or 0) for p in posts)
+    n = len(eng)
+    med = eng[n // 2] if n % 2 else (eng[n // 2 - 1] + eng[n // 2]) / 2
+    return round(med / f * 100, 2)
+
+
 def _er_cell(c):
     mo, ig = c.get("modash_er"), c.get("ig_er") if c.get("ig_er") is not None else c.get("real_er")
-    parts = [f"Modash {mo}%" if mo is not None else "Modash —",
-             f'<b>IG实算 {ig}%</b>' if ig is not None else '<span class="muted">IG 待读</span>']
-    return " / ".join(parts)
+    parts = [f"Modash {mo}%" if mo is not None else "Modash —"]
+    if ig is None:
+        parts.append('<span class="muted">IG 待读</span>')
+        return " / ".join(parts)
+    parts.append(f'<b>IG实算 {ig}%</b>')
+    out = " / ".join(parts)
+    # 爆款外溢：均值 >100% 说明 Reels 触达远超粉丝数——真实且是强触达信号，但要讲清楚，
+    # 否则客户看到"ER 201%"只会以为系统坏了。补中位数给出典型水平。
+    if ig > 100:
+        med = _typical_er(c)
+        out += ('<div class="aud"><span class="warn">爆款外溢</span>：Reels 触达远超粉丝数'
+                + (f'，典型(中位) {med}%' if med is not None else '') + '</div>')
+    return out
 
 
 def _row(c):
