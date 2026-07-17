@@ -377,6 +377,81 @@ def failed_items(batch_id: str | None = None) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def incomplete_items(batch_id: str | None = None) -> list[dict]:
+    """采集完整性审计：找出"跑过但没真拿到东西"的号——代理抖动/限流/抽取失败导致的静默不完整。
+
+    只报**确定异常**，不误报真·低互动小号（本就没评论的号不算失败）：
+      - 网格有帖子 code 却 0 帖采到 → 帖子页导航全失败（抖动）
+      - 帖子里有评论(comment_count≥5)却一条没抽到 → 评论抽取失败
+      - 采到帖且有赞数却算不出 ER → ER 派生异常
+      - stage_error 非空 → 已记录的失败（含 deep_all_posts_failed/logged_out 等）
+    返回 [{handle, status, stage_error, reasons[]}]，供 audit_collect 报表 + --requeue 回头补采。"""
+    with _conn() as c:
+        # 括号必须有：AND 比 OR 结合更紧，漏了会让 batch 过滤对 status 条件失效（跨批次误报）
+        q = ("SELECT handle, status, stage_error, stage_json FROM creator_profiles "
+             "WHERE (status IN ('qualified','collected','decided') OR stage_error IS NOT NULL)")
+        params = []
+        if batch_id:
+            q += " AND discovery_batch=?"
+            params.append(batch_id)
+        rows = c.execute(q, params).fetchall()
+    out = []
+    for r in rows:
+        try:
+            sj = json.loads(r["stage_json"]) if r["stage_json"] else {}
+        except Exception:  # noqa: BLE001
+            sj = {}
+        reasons = []
+        if r["stage_error"]:
+            reasons.append(f"错误:{r['stage_error']}")
+        if r["status"] in ("collected", "decided") and sj.get("comments_read"):
+            posts = sj.get("sampled_posts") or []
+            if sj.get("codes") and not posts:
+                reasons.append(f"帖子全失败(网格 {len(sj['codes'])} 帖，0 采到)")
+            elif posts:
+                withc = sum(1 for p in posts if (p.get("comment_count") or 0) >= 5)
+                if withc and not (sj.get("comments_analyzed") or 0):
+                    reasons.append(f"评论抽取失败({withc} 帖有评论却抽 0)")
+                if sj.get("real_er") is None and any(p.get("like_count") is not None for p in posts):
+                    reasons.append("采到赞数却算不出 ER")
+        if reasons:
+            out.append({"handle": r["handle"], "status": r["status"],
+                        "stage_error": r["stage_error"], "reasons": reasons})
+    return out
+
+
+# 重采时要清掉的深采派生字段（保留浅扫/Modash 数据，只重跑深采部分）
+_DEEP_FIELDS = ("comments_read", "sampled_posts", "comments_analyzed", "valid_comments",
+                "low_quality_ratio", "high_intent_ratio", "intent_posts", "intent_by_grade",
+                "high_intent_count", "intent_total", "high_intent_snippets", "promo_intent_hits",
+                "promotional_post_count", "real_er", "real_er_median", "real_er_window",
+                "comment_shots", "evidence_dir")
+
+
+def requeue_for_recollect(handles) -> int:
+    """把不完整/失败的号退回 qualified 等待重采（"不完整再出来"）：清深采派生字段、
+    保留浅扫+Modash 数据、清 locked_at 让 claim_queue 能重新认领。返回处理数。"""
+    n = 0
+    with _conn() as c:
+        for h in handles:
+            h = (h or "").lstrip("@")
+            r = c.execute("SELECT stage_json FROM creator_profiles WHERE handle=?", (h,)).fetchone()
+            if not r:
+                continue
+            try:
+                sj = json.loads(r["stage_json"]) if r["stage_json"] else {}
+            except Exception:  # noqa: BLE001
+                sj = {}
+            for k in _DEEP_FIELDS:
+                sj.pop(k, None)
+            sj.pop("final_pool", None)
+            c.execute("UPDATE creator_profiles SET status='qualified', stage_json=?, "
+                      "real_er=NULL, high_intent_count=NULL, final_pool=NULL, locked_at=NULL "
+                      "WHERE handle=?", (json.dumps(sj, ensure_ascii=False), h))
+            n += 1
+    return n
+
+
 def set_tier(handle: str, tier: int):
     """决策后把完整候选标为 tier1（候选库）。"""
     h = (handle or "").lstrip("@")
