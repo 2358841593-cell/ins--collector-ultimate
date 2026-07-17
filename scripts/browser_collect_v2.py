@@ -42,15 +42,25 @@ AGG = ("linktr.ee", "linktree.com", "beacons", "ltk", "liketoknow", "shopltk", "
 AMAZON = ("amazon.", "amzn.to", "/shop/", "storefront")
 
 
-def load_proxy():
+def load_proxy(session: str | None = None, ttl: int = 900):
+    """读代理。session 给定则用青果 sticky 参数 `-S-{通道}-T-{秒}` 把出口 IP 固定住。
+
+    ⚠ 根因（2026-07-17 实测）：默认隧道是"每请求随机换 IP"——浏览器一个页面并行 40+ 连接，
+    每条连接一个不同出口 IP，导致**同一个登录 session 的流量散在几十个 IP 上打 IG**，被判成
+    盗号级异常 → 挑战/限流（"越跑越挂"的真相）。绑定 session 名 → 同通道同 IP，一账号一 IP、
+    一条会话跑到底，像真人。实测 overseas.tunnel.qg.net 支持 -S-/-T-（同名 sticky、异名换 IP）。"""
     f = SECRETS / "proxy.txt"
     if not f.exists():
         return None
     url = f.read_text().strip()
     m = re.match(r"https?://([^:]+):([^@]+)@(.+)", url)
-    if m:
-        return {"server": f"http://{m.group(3)}", "username": m.group(1), "password": m.group(2)}
-    return {"server": url}
+    if not m:
+        return {"server": url}
+    user = m.group(1)
+    if session:
+        safe = re.sub(r"[^a-zA-Z0-9]", "", session)[:16] or "s"   # 通道名只保守用字母数字
+        user = f"{user}-S-{safe}-T-{int(ttl)}"
+    return {"server": f"http://{m.group(3)}", "username": user, "password": m.group(2)}
 
 
 def load_accounts(path=None):
@@ -353,13 +363,25 @@ def _pause(a=4.0, b=8.0):
     time.sleep(random.uniform(a, b))
 
 
+LAST_NAV_ERR = None   # 最近一次导航失败的真面目（超时/HTTP状态/网络错误）——供诊断，别再对着黑盒猜
+
+
 def _goto(pg, url, tries=2):
-    """代理抖动时重试导航。"""
+    """代理抖动时重试导航。失败时把真实原因记进 LAST_NAV_ERR（区分 timeout / net 错 / 非200）。"""
+    global LAST_NAV_ERR
     for t in range(tries):
         try:
-            pg.goto(url, wait_until="domcontentloaded", timeout=45000)
+            resp = pg.goto(url, wait_until="domcontentloaded", timeout=45000)
+            # goto 成功但状态非 2xx/3xx（如 429 限流 / 302 跳登录）也算问题，记下来
+            st = resp.status if resp else None
+            if st and st >= 400:
+                LAST_NAV_ERR = f"HTTP{st}"
+                time.sleep(random.uniform(2, 4)); continue
+            LAST_NAV_ERR = None
             return True
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            msg = f"{type(e).__name__}:{str(e)[:60]}"
+            LAST_NAV_ERR = ("timeout" if "Timeout" in type(e).__name__ else msg)
             time.sleep(random.uniform(2, 4))
     return False
 

@@ -33,11 +33,10 @@ def run_browser_stage(from_status, batch_id, limit, resume, process_one, per_acc
     import browser_collect_v2 as bc
     from playwright.sync_api import sync_playwright
 
-    proxy = bc.load_proxy()
     accts = bc.load_accounts(accounts_file)
     if not accts:
         print(f"✗ 无可用 IG 号（{accounts_file or 'accounts_raw.txt'}）"); return {"error": "no_accounts"}
-    print(f"  号池: {accounts_file or 'accounts_raw.txt'}（{len(accts)} 个）", flush=True)
+    print(f"  号池: {accounts_file or 'accounts_raw.txt'}（{len(accts)} 个）· 代理 sticky（一账号块一 IP）", flush=True)
     q = cc.claim_queue(from_status, limit, batch_id, stale_minutes=stale_minutes if resume else 0)
     print(f"[{from_status}→] 认领 {len(q)} 个候选 · 号池 {len(accts)}", flush=True)
     counts = {"advance": 0, "reject": 0, "error": 0}
@@ -50,6 +49,9 @@ def run_browser_stage(from_status, batch_id, limit, resume, process_one, per_acc
                 if ctx:
                     ctx.close()
                 acct = accts[ai % len(accts)]; ai += 1; used = 0
+                # 每个账号块一条独立 sticky 通道 → 一个固定出口 IP 跑完整块（不再让一个 session
+                # 的流量散在几十个随机 IP 上）。通道名带块序号 ai：换块=换IP；限流回收后重开也拿新IP。
+                proxy = bc.load_proxy(session=f"b{ai}{acct['username'][:6]}")
                 ctx = bc.open_ctx(pw, acct, proxy)
                 pg = ctx.pages[0] if ctx.pages else ctx.new_page()
                 pg.set_default_timeout(20000)               # 看门狗：任何 Playwright 调用 >20s 失败，
