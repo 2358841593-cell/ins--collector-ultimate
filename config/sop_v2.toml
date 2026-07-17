@@ -166,6 +166,9 @@ language_score = 2            # 匹配且 >=50%；否则/缺失 Review
 
 # F 经济性与触达准备 15
 [scoring.F]
+# 客户 2026-07-17：CPM 计算公式待补 → 本轮整个经济性/触达模块不计入评分（全 N/A，不拖分）。
+# 补了 CPM 公式后把这行改 false 即恢复 cpm/budget_tier/contact/risk 计分。
+defer_this_round = true
 # CPM 得分 [CONFLICT-F1分档，§5 C3]：覆盖 §6F "1-1.5倍=4"
 cpm_full = 8                  # <=$35=8
 cpm_review = 4               # ($35,$40]=4 且 Review

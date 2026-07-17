@@ -188,6 +188,12 @@ def score_E(cand, cfg):
 def score_F(cand, cfg):
     f = cfg["scoring"]["F"]
     items = []
+    # 客户 2026-07-17：CPM 计算公式待补，**本轮整个经济性/触达模块不计入评分**——全 N/A（从分母移除，
+    # 不拖分）。以后补了 CPM 公式，把 config [scoring.F] defer_this_round 关掉即恢复。
+    if f.get("defer_this_round"):
+        for it in ("cpm", "budget_tier", "contact", "risk"):
+            items.append(_si("F", it, None, None, "deferred_pending_cpm_formula"))
+        return items
     track = cand.get("campaign_track")
     # F1 CPM：Modash 无历史报价、需联系红人才知 → 缺报价记 N/A（不作 Include 要求、不拖分）；
     # 有报价(人工填/未来数据源)才按档送分。Gifting 恒 N/A。
