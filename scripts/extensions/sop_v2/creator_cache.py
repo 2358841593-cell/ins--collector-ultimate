@@ -44,7 +44,7 @@ _MIGRATE = ["tier INTEGER DEFAULT 0", "client_status TEXT", "approved_at TEXT",
             "status TEXT", "stage_updated_at TEXT", "locked_at TEXT", "stage_error TEXT",
             "reject_reason TEXT", "discovery_batch TEXT", "seed_followers INTEGER",
             "modash_er REAL", "real_er REAL", "high_intent_count INTEGER",
-            "final_pool TEXT", "evidence_dir TEXT", "stage_json TEXT"]
+            "final_pool TEXT", "evidence_dir TEXT", "stage_json TEXT", "client_note TEXT"]
 _INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_brand ON creator_profiles(brand_account_type)",
     "CREATE INDEX IF NOT EXISTS idx_niche ON creator_profiles(core_niche_key)",
@@ -476,6 +476,14 @@ def mark_rejected(handle: str, reason: str = "", batch_id: str = ""):
     with _conn() as c:
         c.execute("""UPDATE creator_profiles SET client_status='rejected', rejected_reason=?, source_batch=?
                      WHERE handle=?""", (reason, batch_id, h))
+
+
+def set_client_note(handle: str, note: str):
+    """存客户在交付表里填的原因备注（正交，不改 status/门槛）。"""
+    h = (handle or "").lstrip("@")
+    with _conn() as c:
+        _ensure_row(c, h)
+        c.execute("UPDATE creator_profiles SET client_note=? WHERE handle=?", (note[:500], h))
 
 
 def is_rejected(handle: str) -> bool:

@@ -24,12 +24,86 @@ NICHE_ZH = {"skincare": "护肤", "beauty_device": "美容仪", "beauty_wellness
             "lifestyle": "生活方式", "other": "其他"}
 GRADE_CLASS = {"高": "g-hi", "中": "g-mid", "低": "g-lo"}
 
-COLS = ["验收", "红人", "粉丝", "赛道", "购买意向评论（谁说了什么）", "Amazon 橱窗",
+COLS = ["客户选择", "验收", "红人", "粉丝", "赛道", "购买意向评论（谁说了什么）", "Amazon 橱窗",
         "合作品牌", "赞助", "Fake%", "受众画像（Modash）", "ER 对照", "AI", "结论", "待补 / 原因"]
+
+
+def _decide_cell(c):
+    """客户交互：合适/不合适/待定 三选 + 原因输入。状态存浏览器本地，一键导出回传。"""
+    h = (c.get("handle") or "").lstrip("@")
+    return (f'<div class="dec" data-h="{esc(h)}" data-pool="{esc(c.get("final_pool",""))}" '
+            f'data-score="{esc(c.get("ai_vetting_score"))}">'
+            '<div class="dbtns">'
+            "<button class=\"db yes\" onclick=\"mark(this,'合适')\">合适</button>"
+            "<button class=\"db no\" onclick=\"mark(this,'不合适')\">不合适</button>"
+            "<button class=\"db maybe\" onclick=\"mark(this,'待定')\">待定</button>"
+            '</div>'
+            '<input class="dr" placeholder="原因…" oninput="saveR(this)">'
+            '</div>')
 
 
 def esc(x):
     return html.escape(str(x)) if x is not None else ""
+
+
+# 客户交互 JS：三选 + 原因存浏览器本地（不丢），一键导出 JSON 回传。自包含、离线可用、无外部依赖。
+_INTERACT_JS = """<script>
+(function(){
+  var B = window.__BATCH__ || 'batch';
+  var CLS = {'合适':'yes','不合适':'no','待定':'maybe'};
+  function key(h){ return 'dec_'+B+'_'+h; }
+  function save(h,v,r){ localStorage.setItem(key(h), JSON.stringify({verdict:v, reason:r})); }
+  window.mark = function(btn, v){
+    var dec = btn.closest('.dec');
+    dec.querySelectorAll('.db').forEach(function(b){ b.classList.remove('on'); });
+    if(dec.dataset.verdict === v){ dec.dataset.verdict=''; }   // 再点一次取消
+    else { dec.dataset.verdict = v; btn.classList.add('on'); }
+    save(dec.dataset.h, dec.dataset.verdict, dec.querySelector('.dr').value);
+    summary();
+  };
+  window.saveR = function(inp){
+    var dec = inp.closest('.dec'); save(dec.dataset.h, dec.dataset.verdict||'', inp.value);
+  };
+  function restore(){
+    document.querySelectorAll('.dec').forEach(function(dec){
+      var raw = localStorage.getItem(key(dec.dataset.h)); if(!raw) return;
+      var d; try{ d = JSON.parse(raw); }catch(e){ return; }
+      if(d.verdict){ dec.dataset.verdict = d.verdict;
+        var b = dec.querySelector('.db.'+CLS[d.verdict]); if(b) b.classList.add('on'); }
+      if(d.reason) dec.querySelector('.dr').value = d.reason;
+    });
+  }
+  function summary(){
+    var y=0,n=0,m=0,t=0;
+    document.querySelectorAll('.dec').forEach(function(dec){ t++;
+      var v=dec.dataset.verdict; if(v==='合适')y++; else if(v==='不合适')n++; else if(v==='待定')m++; });
+    document.getElementById('cstat').textContent =
+      '✓合适 '+y+'  ✗不合适 '+n+'  待定 '+m+'  未选 '+(t-y-n-m)+' / 共 '+t;
+  }
+  window.exportDecisions = function(){
+    var out = [];
+    document.querySelectorAll('.dec').forEach(function(dec){
+      var v = dec.dataset.verdict || '';
+      var r = (dec.querySelector('.dr').value||'').trim();
+      if(v || r) out.push({handle:dec.dataset.h, verdict:v, reason:r,
+                           pool:dec.dataset.pool, score:dec.dataset.score});
+    });
+    if(!out.length){ alert('还没做任何选择'); return; }
+    var payload = {batch:B, exported_at:new Date().toISOString(), decisions:out};
+    var blob = new Blob([JSON.stringify(payload, null, 2)], {type:'application/json'});
+    var a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+    a.download = 'client_decisions_'+B+'.json'; a.click();
+  };
+  window.clearDecisions = function(){
+    if(!confirm('清空本机所有选择？')) return;
+    document.querySelectorAll('.dec').forEach(function(dec){ localStorage.removeItem(key(dec.dataset.h));
+      dec.dataset.verdict=''; dec.querySelectorAll('.db').forEach(function(b){b.classList.remove('on');});
+      dec.querySelector('.dr').value=''; });
+    summary();
+  };
+  restore(); summary();
+})();
+</script>"""
 
 
 def _na(c):
@@ -303,6 +377,7 @@ def _row(c):
     brands = c.get("brand_collaborations") or []
     reasons = (c.get("review_reasons_text") or []) + (c.get("exclude_reasons_text") or [])
     cells = [
+        _decide_cell(c),
         f'<span class="badge {POOL_CLASS.get(pool,"rev")}">{esc(POOL_ZH.get(pool,pool))}</span>',
         f'<a href="{esc(prof)}" target="_blank">@{esc(h)}</a><div class="sub">{esc(c.get("full_name") or "")}</div>',
         esc(f'{(c.get("follower_count") or 0):,}') if c.get("follower_count") else "—",
@@ -350,7 +425,7 @@ def build_html(decisions) -> str:
 <style>
 *{{box-sizing:border-box}}
 body{{margin:0;font:14px/1.6 -apple-system,'PingFang SC','Microsoft YaHei',sans-serif;color:#1c2b28;background:#f6f8f7}}
-.wrap{{max-width:1500px;margin:0 auto;padding:28px 20px 60px}}
+.wrap{{max-width:1560px;margin:0 auto;padding:28px 20px 84px}}
 h1{{font-size:22px;margin:0 0 4px}} .meta{{color:#5e6672;font-size:13px;margin-bottom:20px}}
 .cards{{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:8px}}
 .card{{flex:1;min-width:120px;background:#fff;border:1px solid #e3e8e6;border-radius:12px;padding:14px 16px;border-top:3px solid #ccc}}
@@ -388,13 +463,31 @@ tr.det details[open] summary{{border-bottom:1px solid #e3e8e6}}
 .grp .gt{{font-weight:700;color:#1f4e4a;font-size:12.5px;margin-bottom:6px}}
 .kv{{display:flex;gap:8px;font-size:12.5px;padding:2px 0;align-items:baseline}}
 .kv .k{{color:#7b857f;min-width:96px;flex-shrink:0}} .kv .v{{color:#2a3a36;word-break:break-word}}
+.dec{{display:flex;flex-direction:column;gap:4px;min-width:100px}}
+.dbtns{{display:flex;gap:3px}}
+.db{{cursor:pointer;border:1px solid #d3dbd8;background:#fff;border-radius:6px;padding:3px 4px;font-size:11px;color:#41504c;flex:1}}
+.db:hover{{background:#f0f4f2}} .db.on{{color:#fff;font-weight:600}}
+.db.yes.on{{background:#1e7a47;border-color:#1e7a47}}
+.db.no.on{{background:#c0554f;border-color:#c0554f}}
+.db.maybe.on{{background:#b98b2e;border-color:#b98b2e}}
+.dr{{border:1px solid #e0e6e3;border-radius:6px;padding:3px 6px;font-size:11px;width:100%}}
+tr:has(.db.yes.on) td{{background:#f2fbf6!important}}
+tr:has(.db.no.on) td{{background:#fdf5f4!important}}
+#cbar{{position:fixed;left:0;right:0;bottom:0;background:#1f4e4a;color:#fff;display:flex;justify-content:space-between;align-items:center;gap:12px;padding:10px 22px;font-size:13px;z-index:200;box-shadow:0 -2px 10px rgba(0,0,0,.18);flex-wrap:wrap}}
+#cbar .r{{display:flex;gap:10px;align-items:center}}
+#cbar button{{background:#3a9d6a;color:#fff;border:0;border-radius:8px;padding:8px 16px;font-size:13px;font-weight:600;cursor:pointer}}
+#cbar button:hover{{background:#2f8659}} #cbar button.ghost{{background:transparent;border:1px solid #5c8478}}
 </style></head><body><div class="wrap">
 <h1>Instagram 红人筛选 · 交付表</h1>
 <div class="meta">批次 {esc(meta.get('batch_id',''))} · {esc(meta.get('campaign_track',''))} · 生成 {esc(decisions.get('generated_at',''))} · 候选 {len(cands)} · 确认 Amazon 橱窗 {sf}</div>
 <div class="cards">{cards}</div>
-<div class="note"><b>阅读说明：</b>五池互斥，一人一池，『验收』色标区分。<b>购买意向评论分三级</b>——高(求链接/已下单)·中(考虑/问适用)·低(真诚产品热情，非水军)，均标明"谁说了什么"，点『看帖 ↗』核验。<b>每行下方『▸ 完整 Modash 画像』可展开</b>：真人/机器人拆解、点赞者画像(更难造假)、受众国家/城市/年龄/性别/语言/兴趣、跨平台账号、涨粉趋势、赞助帖样例——Modash 一次补数拿到的全部维度。『Modash 无』=Modash 本身没有该字段，『待补数』=尚未补。ER 对照：Modash（参考）+ IG 实算（近帖赞评，硬门槛）。</div>
+<div class="note"><b>如何使用（客户）：</b>最左列『客户选择』直接点 <b>合适 / 不合适 / 待定</b>，可在下方填『原因』。选择<b>自动存本机浏览器</b>（关页不丢，随时接着选）。选完点底部 <b>⬇ 导出客户决策</b> 下载一个 JSON 文件，<b>回传给我们</b>即可——我们据此更新入选/排除。<br><b>阅读说明：</b>五池互斥，一人一池。<b>购买意向评论分三级</b>——高(求链接/已下单)·中(考虑/问适用)·低(真诚产品热情，非水军)，标明"谁说了什么"，点『看帖 ↗』核验。<b>每行下方『▸ 完整 Modash 画像』可展开</b>：真人/机器人拆解、点赞者画像、受众国家/年龄/性别/语言、跨平台、涨粉、赞助帖。<b>橱窗</b>：有 Amazon 打开 Amazon 橱窗，没有则展示其实际橱窗(LTK/自营店/聚合链)。ER：Modash(参考) + IG 实算中位(门槛依据，抗爆款)。</div>
 {''.join(sections)}
-</div></body></html>"""
+</div>
+<div id="cbar"><span id="cstat"></span><div class="r"><button class="ghost" onclick="clearDecisions()">清空</button><button onclick="exportDecisions()">⬇ 导出客户决策</button></div></div>
+<script>window.__BATCH__={json.dumps(meta.get('batch_id',''))};</script>
+{_INTERACT_JS}
+</body></html>"""
 
 
 def main() -> int:
