@@ -74,11 +74,15 @@ def _cell(c, key):
         snips = c.get("high_intent_snippets") or []
         if snips:
             return "\n".join(f"· {s}" for s in snips[:3])
-        # 区分"评论采到了但没意图" vs "评论根本没采到"——绝不把后者误标成前者
+        # 四态区分：深采未跑 / 抽取失败(系统侧) / 样本偏少 / 真没意图——别把抽取失败甩锅成账号受限
+        if not c.get("comments_read"):
+            return "评论待采集（深采未完成）"
         vc = c.get("valid_comments")
-        if vc is None or vc < 20:
-            return "评论未采到（账号受限/待深采）"
-        return "无明显购买意向"
+        if (c.get("comments_analyzed") or 0) == 0:
+            return "评论抽取失败（待复采）"
+        if (vc or 0) < 20:
+            return f"样本偏少（{vc} 条，待补采）"
+        return f"无明显购买意向（有效评论 {vc} 条）"
     if key == "comment_ev":
         return "帖子 ↗" if (c.get("intent_posts") or c.get("comment_shots")) else "—"
     if key == "storefront_link":

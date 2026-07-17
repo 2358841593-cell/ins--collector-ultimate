@@ -219,10 +219,15 @@ def _intent_cell(c):
         head = (f'<div class="tier">高{g.get("high",0)} 中{g.get("medium",0)} 低{g.get("low",0)}'
                 + (f' · <a href="{esc(post_url)}" target="_blank">看帖 ↗</a>' if post_url else '') + '</div>')
         return head + "".join(rows)
+    # 无意图片段：区分四种性质不同的情况，别把"我们抽取失败"甩锅成"账号受限"
+    if not c.get("comments_read"):
+        return '<span class="muted">评论待采集（深采未完成）</span>'
     vc = c.get("valid_comments")
-    if vc is None or vc < 20:
-        return '<span class="muted">评论未采到（账号受限/待深采）</span>'
-    return '<span class="muted">无明显购买意向</span>'
+    if (c.get("comments_analyzed") or 0) == 0:
+        return '<span class="warn">评论抽取失败（待复采）</span>'   # 深采跑了但一条没抽到 = 系统侧待修
+    if (vc or 0) < 20:
+        return f'<span class="muted">样本偏少（{vc} 条，待补采）</span>'
+    return '<span class="muted">无明显购买意向（有效评论 {} 条）</span>'.format(vc)
 
 
 def _storefront_cell(c):
@@ -320,7 +325,7 @@ a{{color:#1a6e64;text-decoration:none}} a:hover{{text-decoration:underline}}
 .tier{{font-size:11.5px;color:#5e6672;margin-bottom:3px}}
 td b{{color:#1c2b28}}
 .aud{{display:block;font-size:12px;color:#41504c}}
-.ok{{color:#1e7a47;font-weight:600}} .bad{{color:#c0554f;font-weight:600}}
+.ok{{color:#1e7a47;font-weight:600}} .bad{{color:#c0554f;font-weight:600}} .warn{{color:#b06a1e;font-weight:600}}
 tr.det td{{padding:0;border-top:0;background:#fff!important}}
 tr.det details{{margin:0}}
 tr.det summary{{cursor:pointer;padding:8px 14px;color:#1a6e64;font-size:12.5px;background:#f3f7f5;user-select:none;list-style:none}}

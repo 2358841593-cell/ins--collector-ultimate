@@ -24,7 +24,11 @@ def collect_one(pg, cand, cfg, batch_id, n_posts):
     ev_dir = bc.EVIDENCE_ROOT / batch_id / h
     result, ev = bc.deep_collect(pg, cand, ev_dir, n_posts)
     if result is None:
-        return ("error", ev or "logged_out")          # logged_out = 号问题，可重试
+        return ("error", ev or "logged_out")          # logged_out/grid_nav_failed = 号问题，可重试
+    # 产出完整性校验：深采真跑过必写 comments_read + sampled_posts。缺 = 零产出被静默放行（历史 bug）→
+    # 判 error 报 stage_error 回退 qualified 重试，绝不静默进 collected。
+    if not result.get("comments_read") or "sampled_posts" not in result:
+        return ("error", "deep_no_output")
     # 深采完就进 collected——绝不在此丢弃。实算ER/意图等"不太合格"处由 routing 归池 + 交付表写明原因，
     # 让客户真实浏览判断（某处差但有合作价值的也要浮现，不静默丢）。
     return ("advance", "collected", result)

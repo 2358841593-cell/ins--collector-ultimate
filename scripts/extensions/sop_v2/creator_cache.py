@@ -235,6 +235,23 @@ def claim_queue(from_status: str, limit: int = 0, batch_id: str | None = None,
     return out
 
 
+# 热列（claim_queue 优先级/查询/看板靠它，不能只留 stage_json）——advance/reject 共用
+_HOT_COLS = ("seed_followers", "modash_er", "real_er", "high_intent_count",
+             "final_pool", "evidence_dir", "storefront_status", "amazon_storefront_link",
+             "follower_count", "brand_account_type", "core_niche_key")
+
+
+def _stage_json_and_hot(cand: dict):
+    """把 cand 序列化成 stage_json + 抽出热列，返回 (sets, params) 片段。"""
+    sets = ["stage_json=?"]
+    params = [json.dumps(cand, ensure_ascii=False, default=str)]
+    for col in _HOT_COLS:
+        if cand.get(col) is not None:
+            sets.append(f"{col}=?")
+            params.append(cand.get(col))
+    return sets, params
+
+
 def advance(handle: str, to_status: str, cand: dict | None = None):
     """成功推进：白名单 UPDATE stage_json（候选累积）+ 热列 + status + 清 locked_at/stage_error。
     不碰 tier(除单调升 1)/client_status/rejected_reason（正交）。"""
@@ -244,28 +261,30 @@ def advance(handle: str, to_status: str, cand: dict | None = None):
         sets = ["status=?", "stage_updated_at=?", "locked_at=NULL", "stage_error=NULL"]
         params = [to_status, _now_iso()]
         if cand is not None:
-            sets.append("stage_json=?")
-            params.append(json.dumps(cand, ensure_ascii=False, default=str))
-            # 热列（claim_queue 优先级/查询/看板靠它，不能只留 stage_json）
-            for col in ("seed_followers", "modash_er", "real_er", "high_intent_count",
-                        "final_pool", "evidence_dir", "storefront_status", "amazon_storefront_link",
-                        "follower_count", "brand_account_type", "core_niche_key"):
-                if cand.get(col) is not None:
-                    sets.append(f"{col}=?")
-                    params.append(cand.get(col))
+            s2, p2 = _stage_json_and_hot(cand)
+            sets += s2
+            params += p2
         params.append(h)
         c.execute(f"UPDATE creator_profiles SET {','.join(sets)} WHERE handle=?", params)
         if to_status in ("qualified", "collected", "decided"):
             c.execute("UPDATE creator_profiles SET tier=MAX(COALESCE(tier,0),1) WHERE handle=?", (h,))
 
 
-def reject(handle: str, reason: str):
-    """机器淘汰（候选不合格）：status=rejected + reject_reason（区别于客户侧 rejected_reason）。"""
+def reject(handle: str, reason: str, cand: dict | None = None):
+    """机器淘汰（候选不合格）：status=rejected + reject_reason（区别于客户侧 rejected_reason）。
+    cand 给定则回写 stage_json + 热列——被淘汰号也留住已抓浅扫数据（客户铁律：抓过有数据必体现，
+    进 Exclude 池仍要展示画像+淘汰原因，不再 silently drop）。"""
     h = (handle or "").lstrip("@")
     with _conn() as c:
         _ensure_row(c, h)
-        c.execute("UPDATE creator_profiles SET status='rejected', reject_reason=?, stage_updated_at=?, "
-                  "locked_at=NULL WHERE handle=?", (reason, _now_iso(), h))
+        sets = ["status='rejected'", "reject_reason=?", "stage_updated_at=?", "locked_at=NULL"]
+        params = [reason, _now_iso()]
+        if cand is not None:
+            s2, p2 = _stage_json_and_hot(cand)
+            sets += s2
+            params += p2
+        params.append(h)
+        c.execute(f"UPDATE creator_profiles SET {','.join(sets)} WHERE handle=?", params)
 
 
 def mark_error(handle: str, err: str):
@@ -291,6 +310,43 @@ def export_candidates(status: str, batch_id: str | None = None) -> list[dict]:
         cand.setdefault("handle", r["handle"])
         if cand.get("real_er") is not None:
             cand.setdefault("ig_er", cand.get("real_er"))
+        out.append(cand)
+    return out
+
+
+# 客户铁律：抓过就纳入——非 seed（浅扫过及以上）都算"有数据"，全进交付各归其池
+_DATA_STATUSES = ("qualified", "collected", "decided", "rejected")
+
+
+def export_all_with_data(batch_ids=None) -> list[dict]:
+    """汇总导出所有"抓过有数据"的候选（非 seed：qualified/collected/decided/rejected），跨 batch 可选。
+    每个 cand 塞入 _status/_reject_reason/_discovery_batch，供 stage4 归池 + 交付标注来源池与淘汰原因。
+    stage_json 缺失的历史号（早 reject 未回写）用热列兜底最小 cand（handle + 已存字段 + 淘汰原因），
+    至少以 handle+原因 出现在 Exclude 池——落实"抓过就要体现，不 silently drop"。"""
+    cols = ("follower_count", "storefront_status", "amazon_storefront_link", "real_er",
+            "brand_account_type", "core_niche_key", "full_name", "biography", "final_pool")
+    with _conn() as c:
+        # discovery_batch NOT NULL：排除 user_version<1 的历史终态回填（非本流水线"抓过"的候选）
+        q = ("SELECT handle, status, reject_reason, discovery_batch, stage_json, "
+             + ", ".join(cols) + " FROM creator_profiles WHERE discovery_batch IS NOT NULL AND status IN (%s)"
+             % ",".join("?" * len(_DATA_STATUSES)))
+        params = list(_DATA_STATUSES)
+        if batch_ids:
+            q += " AND discovery_batch IN (%s)" % ",".join("?" * len(batch_ids))
+            params += list(batch_ids)
+        rows = c.execute(q, params).fetchall()
+    out = []
+    for r in rows:
+        cand = json.loads(r["stage_json"]) if r["stage_json"] else {}
+        cand.setdefault("handle", r["handle"])
+        for col in cols:                       # 热列兜底：stage_json 空的历史号至少给出已存浅扫字段
+            if cand.get(col) is None and r[col] is not None:
+                cand[col] = r[col]
+        if cand.get("real_er") is not None:
+            cand.setdefault("ig_er", cand.get("real_er"))
+        cand["_status"] = r["status"]
+        cand["_reject_reason"] = r["reject_reason"]
+        cand["_discovery_batch"] = r["discovery_batch"]
         out.append(cand)
     return out
 

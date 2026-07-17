@@ -27,6 +27,11 @@ from extensions.sop_v2.contracts import GateVerdict  # noqa: E402
 REASON_TEXT = {
     "followers_out_of_range": "粉丝档超出范围",
     "gifting_out_of_range": "Gifting 粉丝档超出范围",
+    # stage2/3 机器淘汰原因（rejected 号进 Exclude 池写明）
+    "private": "私密账号",
+    "brand_account": "品牌/官方号（非个人创作者）",
+    "no_amazon_storefront": "无 Amazon 橱窗（非本赛道导购）",
+    "off_niche": "非目标赛道（护肤/美妆导购）",
     "fake_followers_high": "假粉 ≥ 25%",
     "general_er_low": "Modash General ER ≤ 2%",
     "real_er_low": "实算 ER 过低（僵尸/刷量嫌疑）",
@@ -114,6 +119,29 @@ def decide(cand: dict, cfg: dict) -> dict:
                                              r.get("exclude_reasons"), ai),
     })
     # storefront link 展示
+    if cand.get("storefront_status") == "confirmed_yes":
+        rec["amazon_storefront_link"] = cand.get("amazon_storefront_link") or cand.get("external_url")
+    return rec
+
+
+def decide_rejected(cand: dict, cfg: dict | None = None) -> dict:
+    """机器淘汰号（stage2/3 已 reject，_reject_reason 携带原因）：直接归 Exclude 池并写明原因。
+    不跑完整 decide——它们缺 Modash/深采数据，跑评分/门槛会误判。客户铁律：淘汰也要体现，
+    带已抓浅扫数据（粉丝/橱窗/赛道）展示，让客户浏览判断，不 silently drop。"""
+    reason = cand.get("_reject_reason") or "rejected"
+    rec = dict(cand)
+    txt = _humanize([reason])
+    rec.update({
+        "final_pool": "Exclude",
+        "review_reasons": [],
+        "exclude_reasons": [reason],
+        "review_reasons_text": [],
+        "exclude_reasons_text": txt,
+        "tier_by": "stage_reject",
+        "normalized_total": None,
+        "ai_vetting_score": None,
+        "decision_summary": "机器淘汰（发现/浅扫阶段）：" + "；".join(txt),
+    })
     if cand.get("storefront_status") == "confirmed_yes":
         rec["amazon_storefront_link"] = cand.get("amazon_storefront_link") or cand.get("external_url")
     return rec

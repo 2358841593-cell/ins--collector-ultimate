@@ -478,7 +478,7 @@ def deep_collect(pg, cand, ev_dir, n_posts=10):
     codes = cand.get("codes") or []
     if not codes:  # 缓存/种子无网格 → 现取一次
         if not _goto(pg, f"https://www.instagram.com/{handle}/"):
-            return cand, ev
+            return None, "grid_nav_failed"   # 导航失败=号问题，报错重试，绝不返回半成品 cand 静默进 collected
         pg.wait_for_timeout(5000)
         g = pg.evaluate(_GRID_JS)
         if g.get("logged_out"):

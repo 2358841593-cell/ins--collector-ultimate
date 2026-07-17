@@ -32,23 +32,24 @@ def qualify_one(pg, cand, cfg):
     cand.update(pf)
     cand["codes"] = codes                             # 深采复用，省网格重取
     # ── 便宜硬门槛（仅候选不合格才 reject）──
+    # 均带 cand 回写：淘汰号也留住已抓浅扫数据（粉丝/bio/橱窗/赛道），进 Exclude 池可展示（客户铁律）
     if cand.get("is_private"):
-        return ("reject", "private")
+        return ("reject", "private", cand)
     if cand.get("brand_account_type") == "brand":
-        return ("reject", "brand_account")
+        return ("reject", "brand_account", cand)
     f = cand.get("follower_count")
     lo, hi = p.get("coarse_min_followers", 2000), p.get("coarse_max_followers", 300000)
     if f is not None and (f < lo or f > hi):           # 与 track 无关的宽粗筛
-        return ("reject", "followers_out_of_range")
+        return ("reject", "followers_out_of_range", cand)
     bc._resolve_storefront(cand, pg)
     if cand.get("storefront_status") == "confirmed_no":
-        return ("reject", "no_amazon_storefront")
+        return ("reject", "no_amazon_storefront", cand)
     niche = cand.get("core_niche_key")
     if niche not in p.get("core_niches", ["skincare", "beauty_device", "beauty_wellness"]):
         bio = (cand.get("biography") or "").lower()
         nk = cfg.get("discovery", {}).get("niche_keywords", [])
         if not any(k in bio for k in nk):
-            return ("reject", "off_niche")
+            return ("reject", "off_niche", cand)
     return ("advance", "qualified", cand)
 
 

@@ -27,6 +27,8 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--batch-id", required=True)
     ap.add_argument("--track", choices=["paid", "gifting"], required=True)
+    ap.add_argument("--all-batches", action="store_true",
+                    help="跨所有 batch 汇总有数据候选（默认仅本 batch）")
     ap.add_argument("--out", required=True)
     ap.add_argument("--xlsx", default=None, help="交付 XLSX 路径（默认与 --out 同目录 deliverable.xlsx）")
     ap.add_argument("--no-xlsx", action="store_true", help="只出 decisions.json，不出交付表")
@@ -43,20 +45,26 @@ def main() -> int:
     args = ap.parse_args()
     cfg = load_config()
 
-    cands = cc.export_candidates("collected", args.batch_id)
+    # 客户铁律：抓过就纳入——拉所有有数据候选（非 seed），rejected 也进（Exclude 池写明原因，不 silently drop）
+    scope = None if args.all_batches else [args.batch_id]
+    cands = cc.export_all_with_data(scope)
     if not cands:
-        print("✗ 无 collected 候选（先跑 stage3）"); return 1
-    for c in cands:
+        print("✗ 无有数据候选（先跑 stage2/3）"); return 1
+    active = [c for c in cands if c.get("_status") != "rejected"]     # 走完整 decide
+    rejected = [c for c in cands if c.get("_status") == "rejected"]   # 直接归 Exclude 写原因
+    for c in active:
         c.setdefault("campaign_track", args.track)
+    scope_txt = "跨全部 batch" if args.all_batches else f"batch {args.batch_id}"
+    print(f"纳入 {len(cands)}（{scope_txt}）：活跃 {len(active)}(qualified/collected/decided) + 机器淘汰 {len(rejected)}")
 
     if args.modash_cdp:
         from extensions.sop_v2 import gates
         from extensions.sop_v2.contracts import GateVerdict
         from extensions.sop_v2.pipeline.modash_cdp import enrich_via_cdp
-        # 省 credit：只补 shortlist——通过所有"非 Modash 硬门槛"的候选(补了才够 Include)；
-        # 已被粉丝档/实算ER/赞助/品牌等硬淘汰的，补 Modash 也白搭 → 不花这 credit。
+        # 省 credit：只补 active 里通过"非 Modash 硬门槛"的候选(补了才够 Include)；
+        # 已被硬淘汰或机器 reject 的，补 Modash 也白搭 → 不花这 credit。
         cap = args.modash_cap or cfg.get("modash_budget", {}).get("profile_per_round", 20)
-        shortlist = [c for c in cands
+        shortlist = [c for c in active
                      if gates.gate_summary(gates.evaluate_gates(c, cfg)) != GateVerdict.EXCLUDE]
         # 有橱窗优先、实算 ER 高优先（好苗子先补）
         shortlist.sort(key=lambda c: (c.get("storefront_status") == "confirmed_yes",
@@ -68,29 +76,35 @@ def main() -> int:
                   else (t["standard_min"], t["priority_max"]))
         filt = {"followers": {"min": lo, "max": hi},
                 "engagementRate": {"min": disc.get("search_er_min", 0.015)}}
-        print(f"Modash 补数(CDP)：shortlist {len(shortlist)}/{len(cands)}（省 credit，上限 {cap}）…")
+        print(f"Modash 补数(CDP)：shortlist {len(shortlist)}/{len(active)}（省 credit，上限 {cap}）…")
         cache_dir = str(Path(args.out).with_name("modash_raw"))  # 原始报告落盘→改解析器免重付费
         r = enrich_via_cdp(shortlist, disc.get("search_query", ""), filt, args.cdp, cache_dir=cache_dir)
         print(f"Modash 补数(CDP): 命中 {r.get('matched')}/{r.get('total')}"
               + (f"  ⚠ {r['error']}" if r.get("error") else ""))
     elif args.modash_csv:
         from extensions.sop_v2.pipeline.modash_enrich import enrich
-        r = enrich(cands, args.modash_csv)
+        r = enrich(active, args.modash_csv)
         print(f"Modash 补数(CSV): 匹配 {r['matched']}/{r['total']}（CSV {r['csv_rows']} 行）")
     else:
-        print("⚠ 未提供 Modash 补数：缺假粉/受众/国家 → 候选诚实落 Review(modash_core_missing)，Include 恒空。")
+        print("⚠ 未提供 Modash 补数：缺假粉/受众/国家 → 候选诚实落 Review(modash_core_missing)。")
     if args.manual_csv:
         from extensions.sop_v2.pipeline.modash_enrich import enrich_manual
-        r = enrich_manual(cands, args.manual_csv)
+        r = enrich_manual(active, args.manual_csv)
         print(f"人工核验回填(Raw Skin/VO/报价): 匹配 {r.get('matched')}/{r.get('total')}")
 
-    decisions = [run_v2.decide(c, cfg) for c in cands]
-    for c, d in zip(cands, decisions):
-        cc.advance(c["handle"], "decided", {**c, "final_pool": d["final_pool"]})
+    # 活跃号走完整 decide；机器淘汰号直接归 Exclude 写原因（客户铁律：淘汰也要体现）
+    decisions = [run_v2.decide(c, cfg) for c in active] + [run_v2.decide_rejected(c, cfg) for c in rejected]
+    # 只推进"真正深采完"的（collected/decided）→ decided；qualified 留 qualified（可再深采）、rejected 留 rejected
+    for c, d in zip(active, decisions):
+        if c.get("_status") in ("collected", "decided"):
+            cc.advance(c["handle"], "decided", {**c, "final_pool": d["final_pool"]})
+    assert len(decisions) == len(cands), f"对账失败：决策 {len(decisions)} ≠ 候选 {len(cands)}（疑 silent drop）"
 
+    batches = sorted({c.get("_discovery_batch") for c in cands if c.get("_discovery_batch")})
     out = {
         "generated_at": args.generated_at or time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "manifest": {"batch_id": args.batch_id, "sop_version": cfg.get("sop_version", ""),
+        "manifest": {"batch_id": args.batch_id, "batches": batches,
+                     "sop_version": cfg.get("sop_version", ""),
                      "campaign_track": args.track, "config_sha256": config_sha256(None),
                      "candidate_count": len(decisions)},
         "candidates": decisions,

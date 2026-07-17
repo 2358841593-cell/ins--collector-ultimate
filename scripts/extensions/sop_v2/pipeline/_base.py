@@ -19,7 +19,8 @@ def apply_verdict(handle: str, verdict: tuple) -> str:
     if kind == "advance":
         cc.advance(handle, verdict[1], verdict[2])
     elif kind == "reject":
-        cc.reject(handle, verdict[1])
+        # ('reject', reason[, cand])：带 cand 则回写已抓浅扫数据（铁律：淘汰也要留数据进 Exclude 池）
+        cc.reject(handle, verdict[1], verdict[2] if len(verdict) > 2 else None)
     else:  # error → 号问题，可重试
         cc.mark_error(handle, verdict[1])
     return kind
