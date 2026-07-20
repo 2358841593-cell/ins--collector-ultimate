@@ -25,7 +25,7 @@ NICHE_ZH = {"skincare": "护肤", "beauty_device": "美容仪", "beauty_wellness
 GRADE_CLASS = {"高": "g-hi", "中": "g-mid", "低": "g-lo"}
 
 COLS = ["客户选择", "验收", "红人", "粉丝", "赛道", "购买意向评论（谁说了什么）", "Amazon 橱窗",
-        "合作品牌", "赞助", "Fake%", "受众画像（Modash）", "ER 对照", "AI", "结论", "待补 / 原因"]
+        "合作品牌", "赞助", "Fake%", "受众画像（第三方核验）", "ER 对照", "AI", "结论", "待补 / 原因"]
 
 
 def _decide_cell(c):
@@ -107,8 +107,8 @@ _INTERACT_JS = """<script>
 
 
 def _na(c):
-    # 有 Modash 报告但字段空 = Modash 本身没有；没报告 = 待补数（区分"Modash无"和"我们没采"）
-    return '<span class="muted">Modash 无</span>' if c.get("modash_report") else '<span class="muted">待补数</span>'
+    # 有第三方报告但字段空 = 数据源本身没有；没报告 = 待补数（区分"数据源无"和"我们没采"）
+    return '<span class="muted">数据源无</span>' if c.get("modash_report") else '<span class="muted">待补数</span>'
 
 
 def _fake_cell(c):
@@ -158,11 +158,11 @@ def _kv(label, val_html):
 
 
 def _detail_panel(c, ncols):
-    """每个红人的完整 Modash 画像（可折叠）：一次 credit 拿到的全部维度都铺出来。"""
+    """每个红人的完整受众画像（可折叠）：一次 credit 拿到的全部维度都铺出来。"""
     h = (c.get("handle") or "").lstrip("@")
     if not c.get("modash_report"):
-        inner = '<div class="dl-note">此红人尚未做 Modash 补数（待补数）。</div>'
-        return (f'<tr class="det"><td colspan="{ncols}"><details><summary>▸ 完整 Modash 画像 · @{esc(h)}</summary>'
+        inner = '<div class="dl-note">此红人尚未做第三方受众核验（待补数）。</div>'
+        return (f'<tr class="det"><td colspan="{ncols}"><details><summary>▸ 完整受众画像 · @{esc(h)}</summary>'
                 f'{inner}</details></td></tr>')
     blocks = []
 
@@ -271,8 +271,8 @@ def _detail_panel(c, ncols):
         blocks.append('<div class="grp"><div class="gt">赞助帖样例</div><div class="kv"><span class="v">'
                       + "　".join(items) + '</span></div></div>')
 
-    inner = "".join(blocks) or '<div class="dl-note">Modash 报告已拉取，但受众明细为空（Modash 无此号画像数据）。</div>'
-    return (f'<tr class="det"><td colspan="{ncols}"><details><summary>▸ 完整 Modash 画像 · @{esc(h)}'
+    inner = "".join(blocks) or '<div class="dl-note">第三方受众报告已拉取，但明细为空（数据源无此号画像数据）。</div>'
+    return (f'<tr class="det"><td colspan="{ncols}"><details><summary>▸ 完整受众画像 · @{esc(h)}'
             f'</summary><div class="dl">{inner}</div></details></td></tr>')
 
 
@@ -350,11 +350,11 @@ def _er_cell(c):
     mo = c.get("modash_er") if c.get("modash_er") is not None else c.get("general_er")
     mean = c.get("ig_er") if c.get("ig_er") is not None else c.get("real_er")
     med = _typical_er(c)
-    parts = [f"Modash {mo}%" if mo is not None else "Modash —"]
+    parts = [f"第三方 {mo}%" if mo is not None else "第三方 —"]
     if med is None and mean is None:
         # 中位/均值都拿不到 → 用 Modash 为准
         if mo is not None:
-            parts[-1] = f'<b>Modash {mo}%（本轮为准）</b>'
+            parts[-1] = f'<b>第三方 {mo}%（本轮为准）</b>'
             return " / ".join(parts)
         parts.append('<span class="muted">IG 待读</span>')
         return " / ".join(parts)
@@ -481,7 +481,7 @@ tr:has(.db.no.on) td{{background:#fdf5f4!important}}
 <h1>Instagram 红人筛选 · 交付表</h1>
 <div class="meta">批次 {esc(meta.get('batch_id',''))} · {esc(meta.get('campaign_track',''))} · 生成 {esc(decisions.get('generated_at',''))} · 候选 {len(cands)} · 确认 Amazon 橱窗 {sf}</div>
 <div class="cards">{cards}</div>
-<div class="note"><b>如何使用（客户）：</b>最左列『客户选择』直接点 <b>合适 / 不合适 / 待定</b>，可在下方填『原因』。选择<b>自动存本机浏览器</b>（关页不丢，随时接着选）。选完点底部 <b>⬇ 导出客户决策</b> 下载一个 JSON 文件，<b>回传给我们</b>即可——我们据此更新入选/排除。<br><b>阅读说明：</b>五池互斥，一人一池。<b>购买意向评论分三级</b>——高(求链接/已下单)·中(考虑/问适用)·低(真诚产品热情，非水军)，标明"谁说了什么"，点『看帖 ↗』核验。<b>每行下方『▸ 完整 Modash 画像』可展开</b>：真人/机器人拆解、点赞者画像、受众国家/年龄/性别/语言、跨平台、涨粉、赞助帖。<b>橱窗</b>：有 Amazon 打开 Amazon 橱窗，没有则展示其实际橱窗(LTK/自营店/聚合链)。ER：Modash(参考) + IG 实算中位(门槛依据，抗爆款)。</div>
+<div class="note"><b>如何使用（客户）：</b>最左列『客户选择』直接点 <b>合适 / 不合适 / 待定</b>，可在下方填『原因』。选择<b>自动存本机浏览器</b>（关页不丢，随时接着选）。选完点底部 <b>⬇ 导出客户决策</b> 下载一个 JSON 文件，<b>回传给我们</b>即可——我们据此更新入选/排除。<br><b>阅读说明：</b>五池互斥，一人一池。<b>购买意向评论分三级</b>——高(求链接/已下单)·中(考虑/问适用)·低(真诚产品热情，非水军)，标明"谁说了什么"，点『看帖 ↗』核验。<b>每行下方『▸ 完整受众画像』可展开</b>：真人/机器人拆解、点赞者画像、受众国家/年龄/性别/语言、跨平台、涨粉、赞助帖（接入权威第三方受众数据源交叉核验）。<b>橱窗</b>：有 Amazon 打开 Amazon 橱窗，没有则展示其实际橱窗(LTK/自营店/聚合链)。ER：第三方受众数据(参考) + IG 实算中位(门槛依据，抗爆款)。</div>
 {''.join(sections)}
 </div>
 <div id="cbar"><span id="cstat"></span><div class="r"><button class="ghost" onclick="clearDecisions()">清空</button><button onclick="exportDecisions()">⬇ 导出客户决策</button></div></div>

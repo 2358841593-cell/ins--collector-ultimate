@@ -45,7 +45,7 @@ REASON_TEXT = {
     "non_personal_creator": "非个人创作者（品牌号）",
     "medical_studio_default": "医生/诊所账号待客户批示",
     "storefront_unknown": "Storefront 状态未确认",
-    "modash_core_missing": "缺 Modash 核心补数（假粉/国家/受众）",
+    "modash_core_missing": "缺第三方受众核验（假粉/国家/受众）",
     "comments_insufficient": "有效评论样本不足",
     "raw_skin_or_vo_unverified": "Raw Skin / VO 未人工核验",
     "paid_quote_missing": "缺实际报价",
