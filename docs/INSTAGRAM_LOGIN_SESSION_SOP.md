@@ -1,5 +1,11 @@
 # Instagram 登录与暖 Session 最终方案
 
+> **Legacy / 非 V2 默认流程**：本文描述 `instagrapi + account_pool.py` 的暖 Session
+> 方案，仅用于历史复现。当前 SOP V2 使用 Playwright persistent Chrome profile，运行时不做
+> password/TOTP 登录。当前账号、Cookie、代理与轮换设计见
+> [`ACCOUNT_POOL_ARCHITECTURE.md`](ACCOUNT_POOL_ARCHITECTURE.md)，新批次按
+> [`sop_v2/RUNBOOK.md`](sop_v2/RUNBOOK.md) 执行。
+
 本方案解决以下重复问题：普通 Chrome 已登录但脚本接不到、全新 Chrome 被判
 “登录信息有误”、只注入 `sessionid` 导致设备 Cookie 丢失、保存 session 后又
 回退到密码冷登录。

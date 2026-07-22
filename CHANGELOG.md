@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.0 - 2026-07-22
+
+### 文档与仓库边界
+
+- 将 README 的默认生产入口从 Legacy `discover.py/account_pool.py` 纠正为 SOP V2 四阶段流水线。
+- 重写当前系统架构，补充 Modash-first、浏览器采集、SQLite 状态机、Gates/A-F/五池和客户反馈设计。
+- 新增账号池、Persistent Chrome Profile、Sticky Proxy、轮换、错误恢复和目标 Account Lease 专项设计。
+- 明确 Legacy instagrapi 管道边界以及配置、测试、证据和顶层 Runner 的已知漂移。
+- 账号、密码、TOTP、Cookie、代理、Chrome Profile 和真实运行数据继续严格排除在 Git 之外。
+
 ## 0.1.1 - 2026-07-14
 
 ### 文档

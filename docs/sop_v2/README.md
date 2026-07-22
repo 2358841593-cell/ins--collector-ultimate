@@ -1,9 +1,25 @@
-# SOP V2 开发与验收索引
+# SOP V2 文档索引
 
-该目录是后续开发的需求基线，按以下顺序使用：
+当前生产主线是 Modash-first、Instagram browser-only 的四阶段流水线。
 
-1. `REQUIREMENTS_CHECKLIST.md`：逐条开发、测试和验收的唯一操作清单。
-2. `GAP_AND_IMPLEMENTATION_PLAN.md`：现有能力、缺口、实现路径和优先级。
-3. `FINAL_DELIVERABLES.md`：最终要交给客户的文件、字段、证据和说明。
+建议阅读顺序：
 
-执行原则：以当前已验证项目为原型做增量增强；监控功能不进入本项目；Modash 只在主链路缺数据时做成本可控的补充。
+1. [`../../README.md`](../../README.md)：系统定位、当前入口和端到端总览；
+2. [`../ARCHITECTURE.md`](../ARCHITECTURE.md)：当前组件、数据和决策架构；
+3. [`../ACCOUNT_POOL_ARCHITECTURE.md`](../ACCOUNT_POOL_ARCHITECTURE.md)：账号、会话、代理与轮换；
+4. [`PIPELINE_SPEC.md`](PIPELINE_SPEC.md)：状态机、软锁和数据库 API；
+5. [`RUNBOOK.md`](RUNBOOK.md)：分阶段运行命令；
+6. [`STRATEGY_LOCK.md`](STRATEGY_LOCK.md)：经实测锁定的采集策略；
+7. [`SYSTEM_STATUS.md`](SYSTEM_STATUS.md)：截至文档日期的完成度与延后项；
+8. [`FINAL_DELIVERABLES.md`](FINAL_DELIVERABLES.md)：交付字段和目标结构。
+
+事实源说明：
+
+- `config/sop_v2.toml` 是 V2 规则配置；
+- `scripts/extensions/sop_v2/pipeline/` 与 `scripts/browser_collect_v2.py` 是运行事实；
+- `REQUIREMENTS_CHECKLIST.md`、`GAP_AND_IMPLEMENTATION_PLAN.md`、`DEV_EXECUTION_CHECKLIST.md`
+  是需求与演进记录，不是实时完成度的唯一来源；
+- 根目录 `FLOWCHART.md`、`PIPELINE_LOGIC.md`、`EXECUTION_PLAN.md`、`RESEARCH.md` 和
+  `TWO_TIER_DESIGN.md` 主要描述 Legacy 或历史方案。
+
+账号、密码、TOTP、Cookie、代理凭据、Chrome profile、数据库、证据和交付件均不得进入 Git。

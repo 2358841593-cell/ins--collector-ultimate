@@ -1,402 +1,346 @@
-# Instagram 红人筛选与交付系统
+# Instagram Creator Vetting & Delivery
 
-**一句话**：你告诉我们要推什么（护肤 / 美容仪 + 想上 Amazon），系统就从全网"海选"出一批真正合适的带货红人 —— 每个都带**赛道对口度、Amazon 橱窗核验、评论真实性、评分依据、现场截图证据**，产出一份**可直接验收的 Excel**。
+这是一个面向 Amazon Finds、护肤和美妆场景的 Instagram 创作者发现、采集、审核与交付系统。
 
-当前仓库只有一个生产入口。早期“演示功能”已经整理为仓库根目录的稳定主项目，历史 MVP 和内容监控不再作为并列运行时依赖。后续需求采用增量模块接入，不搬动已验证的采集、账号池、漏斗、评分和交付脚本。
+当前唯一默认生产主线是 SOP V2 四阶段流水线：
 
-## 它解决的痛点
+```text
+Modash 发现 → Instagram 浏览器浅扫 → 帖子/评论深采 → 离线决策与五池交付
+```
 
-- **大网红又贵又假** —— 性价比与信任度最优的是 **1万–15万粉的"腰部红人"**：像朋友推荐，不像恰饭。
-- **难辨"真带货型"** —— 很多发护肤的只是晒生活，并没有 Amazon 橱窗、也不会真导购。
-- **数据可能是刷的** —— 互赞团 / 水军让数据好看，却没人真买。
+Instagram 侧只使用 Playwright 驱动的登录态 Chrome profile。`discover.py`、
+`discover_graph.py`、`account_pool.py` 和 `instagram_session.py` 属于 Legacy
+instagrapi 链路，仅为历史复现和兼容保留，不是新批次的默认入口。
 
-→ 系统专门把**又对口、又真实、又能带货**的红人挑出来，并把**证据**摆给你看（不是黑箱、不是 AI 臆测）。
+> 当前规则以 [`config/sop_v2.toml`](config/sop_v2.toml) 和实际代码为准；
+> 状态机与模块边界见 [`docs/sop_v2/PIPELINE_SPEC.md`](docs/sop_v2/PIPELINE_SPEC.md)，
+> 操作命令见 [`docs/sop_v2/RUNBOOK.md`](docs/sop_v2/RUNBOOK.md)。
 
-两个入口，共用同一账号池与漏斗 / 评分逻辑：
-- **`discover.py`** —— 线性主管道（种子→回扫→漏斗→评论→评分→输出）→ 直接出 **Excel**
-- **`discover_graph.py`** —— 复合引擎（图谱扩散 + 多跳滚雪球 + 社区中心性）→ **两层索引库**，可秒查复用
+## 系统范围
 
-> ⚠️ **这是公开代码仓库，不是数据备份仓库**。账号凭证、Cookie、暖 Session、
-> 真实数据库、日志、截图和客户交付件均不入库。克隆后使用
-> `scripts/import_pool.py` 导入本机账号，并按
-> [`docs/INSTAGRAM_LOGIN_SESSION_SOP.md`](docs/INSTAGRAM_LOGIN_SESSION_SOP.md)
-> 建立本地暖 Session。
+系统负责：
 
-新开发者请从 [`docs/DEVELOPER_HANDOFF.md`](docs/DEVELOPER_HANDOFF.md) 开始，
-再按 [`docs/sop_v2/REQUIREMENTS_CHECKLIST.md`](docs/sop_v2/REQUIREMENTS_CHECKLIST.md)
-逐项开发和验收。
+- 从 Modash 结构化搜索产生候选 Handle；
+- 浏览器读取 Instagram Profile、Bio、外链、帖子和评论；
+- 识别品牌号、私密号、赛道、Storefront、推广内容和评论购买意图；
+- 从帖子赞评计算真实互动率，并与第三方受众数据合并；
+- 执行硬门禁、A-F 可解释评分、固定 Review 和五池互斥路由；
+- 输出 `decisions.json`、客户 XLSX 和可选 HTML；
+- 回收客户批准/拒绝结果，沉淀金种子和负向标签。
 
----
+系统不发送邮件或 DM，也不执行 Gift、Campaign、Payment。缺失数据使用
+`unknown`/`N/A`/`Review` 表达，不伪造、不把缺失静默当作 0。
 
-## 完整架构与端到端流程
-
-下图同时标出**当前已经稳定运行的主链路**与**SOP V2 的增量目标**。阅读顺序从上到下：
-任务与账号通道 → 发现采集 → 当前筛选 → 多源证据 → V2 决策 → 交付 → 客户反馈回流。
+## 当前架构
 
 ```mermaid
 flowchart TB
-    subgraph INPUT["1. 任务、配置与种子"]
-        direction TB
-        TASK["客户任务<br/>产品 / 市场 / Paid 或 Gifting"]
-        CONFIG["config/seeds.toml<br/>品牌、关键词、阈值"]
-        APPROVED["客户已批准红人<br/>下一批 Lookalike 种子"]
-    end
+    CFG["config/sop_v2.toml<br/>Track、门禁、评分、采集参数"]
+    MODASH["已登录 Modash Chrome<br/>CDP 9222"]
+    ACCOUNTS["浏览器账号文件<br/>浅扫池 / 深采池"]
+    PROXY["住宅代理<br/>账号块 Sticky 出口"]
 
-    subgraph AUTH["2. 身份与采集通道（本机安全边界）"]
-        direction TB
-        LOCAL[".secrets/account_pool.json<br/>凭据仅留本机"]:::security
-        LOGIN{"account_pool.py<br/>恢复优先级"}:::decision
-        WARM["① 暖 Session<br/>data/session/"]:::security
-        COOKIE["② 完整浏览器 Cookie<br/>private + public jar"]:::security
-        COLD["③ 密码 + TOTP<br/>一次性最后兜底"]:::risk
-        BROWSER["普通 Chrome<br/>或独立 CDP Chrome"]:::external
-        EXPORT["Cookie 导出器<br/>CDP / macOS profile"]:::security
-        BOOT["instagram_session.py<br/>全量注入 + 暖复载验证"]:::security
-        ROTATE["账号轮换 / cooldown<br/>失败隔离 / 请求节流"]:::stable
+    S1["Stage 1 · Discover<br/>Modash 结构化搜索"]
+    S2["Stage 2 · Qualify<br/>Profile / Bio / 类目 / Storefront / 赛道"]
+    S3["Stage 3 · Collect<br/>帖子 / 评论意图 / 实算 ER / 内容信号"]
+    S4["Stage 4 · Decide<br/>补数 → Gates → A-F → Routing → Export"]
 
-        LOCAL --> LOGIN
-        LOGIN -->|"优先"| WARM
-        LOGIN -->|"暖会话失效"| COOKIE
-        LOGIN -->|"两者均失效"| COLD
-        BROWSER --> EXPORT --> BOOT --> COOKIE
-        WARM --> ROTATE
-        COOKIE --> ROTATE
-        COLD --> ROTATE
-    end
+    DB[("creator_cache.db<br/>status / tier / client_status<br/>stage_json + soft lock")]
+    ERR["瞬时采集错误<br/>mark_error，状态不推进"]
+    EVIDENCE["结构化评论证据<br/>原话 + 用户名 + 帖子 URL"]
+    OUT["data/runs/&lt;batch_id&gt;/<br/>decisions.json + deliverable.xlsx"]
+    FEEDBACK["客户反馈<br/>approved / rejected / pending"]
 
-    subgraph DISCOVERY["3. Instagram 发现与原始采集（稳定核心）"]
-        direction TB
-        SOURCES["品牌 tagged / mention<br/>产品与竞品关键词 / Lookalike"]:::stable
-        LINEAR["discover.py<br/>线性生产管道"]:::stable
-        GRAPH["discover_graph.py<br/>多跳扩散 / PageRank / 索引"]:::stable
-        CANDIDATES["候选池<br/>handle 去重 + discovery source"]:::stable
-        COLLECT["profile + bio links<br/>近帖 / Reels / 评论 / 来源证据"]:::stable
-
-        SOURCES --> LINEAR --> CANDIDATES
-        SOURCES --> GRAPH --> CANDIDATES
-        CANDIDATES --> COLLECT
-    end
-
-    subgraph CORE["4. 当前筛选、分析与可复用资产（稳定核心）"]
-        direction TB
-        BASIC_GATE{"现有基础门槛<br/>私密 / 粉丝 / 品牌号 / 赞助"}:::decision
-        EARLY_EXCLUDE["当前排除记录<br/>reason + source"]:::risk
-        CONTENT["内容相关性与专业度<br/>Amazon / 成分 / 设备规格"]:::stable
-        COMMENTS["评论信任分析<br/>购买意图 / bot / pod / 低质比例"]:::stable
-        CURRENT_SCORE["现有可解释评分<br/>score_breakdown"]:::stable
-        VERIFY["verify_browser.py<br/>bio 聚合页 / Amazon / 截图"]:::stable
-        CACHE["scan cache / JSON / CSV<br/>离线重跑输入"]:::storage
-        POD["pod_accounts.json<br/>本地水军与互赞团库"]:::storage
-        DB["discovery.db<br/>Tier 1 / Tier 2 / FTS5 / runs"]:::storage
-        CURRENT_DELIVERY["当前交付链<br/>Excel + HTML 审计报告"]:::stable
-
-        COLLECT --> BASIC_GATE
-        BASIC_GATE -->|"未通过"| EARLY_EXCLUDE
-        BASIC_GATE -->|"通过"| CONTENT --> COMMENTS --> CURRENT_SCORE
-        POD -.->|"过滤已知低质账号"| COMMENTS
-        CURRENT_SCORE --> VERIFY --> CURRENT_DELIVERY
-        CURRENT_SCORE --> CACHE --> DB
-        VERIFY --> DB
-    end
-
-    subgraph EVIDENCE["5. 多源证据合同（V2 增量接入点）"]
-        direction TB
-        IG_EVIDENCE["Instagram 原始值<br/>profile / posts / comments"]:::stable
-        MODASH["Modash 定向补数<br/>Fake / ER / Country / Audience"]:::external
-        BROWSER_EVIDENCE["浏览器证据<br/>Storefront / LTK / 页面时间"]:::external
-        MANUAL["人工证据<br/>Raw Skin / VO / 风险 / 实际报价"]:::external
-        FIELD["FieldEvidence<br/>value + raw + source + time + evidence"]:::planned
-
-        IG_EVIDENCE --> FIELD
-        MODASH --> FIELD
-        BROWSER_EVIDENCE --> FIELD
-        MANUAL --> FIELD
-    end
-
-    subgraph SOPV2["6. SOP V2 决策引擎（目标架构，待增量开发）"]
-        direction TB
-        TRACK{"Campaign Track<br/>Paid / Gifting"}:::decision
-        HARD_GATES["严格硬门槛<br/>国家 / Fake / General ER / 赞助 / SHEIN-Temu"]:::planned
-        GATE_EXCLUDE["Exclude<br/>硬红线 + 证据"]:::risk
-        AF_SCORE["A-F 六模块 100 分<br/>N/A 分母归一化"]:::planned
-        AI_SCORE["AI Vetting Score<br/>1-10 + 9.5 特殊封顶"]:::planned
-        FIXED_REVIEW{"固定待补项?<br/>Modash / 评论 / Storefront / VO / 报价"}:::decision
-        ROUTE{"五池互斥路由"}:::decision
-        INCLUDE_YES["Include<br/>With Storefront"]:::planned
-        INCLUDE_NO["Include<br/>Without Storefront"]:::planned
-        PRIORITY["Priority Review"]:::planned
-        REVIEW["Review"]:::planned
-
-        FIELD --> TRACK --> HARD_GATES
-        HARD_GATES -->|"命中红线"| GATE_EXCLUDE
-        HARD_GATES -->|"全部通过"| AF_SCORE --> AI_SCORE --> FIXED_REVIEW
-        FIXED_REVIEW -->|"有固定待补项"| PRIORITY
-        FIXED_REVIEW -->|"证据完整"| ROUTE
-        ROUTE --> INCLUDE_YES
-        ROUTE --> INCLUDE_NO
-        ROUTE --> PRIORITY
-        ROUTE --> REVIEW
-    end
-
-    subgraph DELIVERY["7. 批次审计与客户交付"]
-        direction TB
-        MANIFEST["Batch Manifest<br/>SOP / config / source SHA-256"]:::planned
-        EVIDENCE_INDEX["Evidence Index<br/>字段 / Gate / Score 可追溯"]:::planned
-        XLSX["五池 XLSX<br/>Summary + Data Dictionary"]:::planned
-        HTML["自包含 HTML<br/>审计与新旧评分对照"]:::planned
-        LOCAL_OUTPUT["reports/deliveries/<br/>本地交付目录，不进公开仓库"]:::storage
-    end
-
-    subgraph FEEDBACK["8. 客户反馈与下一批优化"]
-        direction TB
-        HERMAN["Herman Approval<br/>Herman's Feedback"]:::external
-        IMPORT["按 batch_id + handle 回导"]:::planned
-        POSITIVE["批准者<br/>回流 Lookalike 种子"]:::planned
-        NEGATIVE["拒绝者<br/>保留负向标签与原因"]:::planned
-        RULE_CHANGE["仅客户明确确认<br/>才修改下一版 config / SOP"]:::planned
-    end
-
-    TASK --> SOURCES
-    CONFIG --> SOURCES
-    APPROVED --> SOURCES
-    ROTATE --> LINEAR
-    ROTATE --> GRAPH
-
-    CACHE --> IG_EVIDENCE
-    VERIFY --> BROWSER_EVIDENCE
-    FIELD --> EVIDENCE_INDEX
-
-    INCLUDE_YES --> XLSX
-    INCLUDE_NO --> XLSX
-    PRIORITY --> XLSX
-    REVIEW --> XLSX
-    GATE_EXCLUDE --> XLSX
-    TRACK --> MANIFEST
-    FIELD --> MANIFEST
-    EVIDENCE_INDEX --> XLSX
-    EVIDENCE_INDEX --> HTML
-    XLSX --> LOCAL_OUTPUT
-    HTML --> LOCAL_OUTPUT
-
-    XLSX --> HERMAN --> IMPORT
-    IMPORT --> POSITIVE --> APPROVED
-    IMPORT --> NEGATIVE --> RULE_CHANGE --> CONFIG
-
-    BOUNDARY["系统边界<br/>不发送邮件/DM，不执行 Gift/Campaign/Payment<br/>内容监控项目保持独立，Modash 失败不阻断 Instagram 主流程"]:::boundary
-    BOUNDARY -.-> AUTH
-    BOUNDARY -.-> EVIDENCE
-    BOUNDARY -.-> DELIVERY
-
-    subgraph LEGEND["图例"]
-        direction TB
-        LEGEND_STABLE["蓝色：已稳定运行"]:::stable
-        LEGEND_SECURITY["绿色：本机登录安全链"]:::security
-        LEGEND_PLANNED["橙色虚线：SOP V2 待开发"]:::planned
-        LEGEND_EXTERNAL["紫色：外部或人工证据"]:::external
-        LEGEND_STORAGE["灰色：本地数据与产物"]:::storage
-    end
-
-    classDef stable fill:#E8F1FF,stroke:#2563EB,color:#0F172A,stroke-width:1.5px;
-    classDef security fill:#ECFDF3,stroke:#16A34A,color:#0F172A,stroke-width:1.5px;
-    classDef planned fill:#FFF7ED,stroke:#EA580C,color:#0F172A,stroke-width:1.5px,stroke-dasharray:5 3;
-    classDef external fill:#F5F3FF,stroke:#7C3AED,color:#0F172A,stroke-width:1.5px;
-    classDef storage fill:#F8FAFC,stroke:#64748B,color:#0F172A,stroke-width:1.5px;
-    classDef decision fill:#FEF3C7,stroke:#D97706,color:#0F172A,stroke-width:1.5px;
-    classDef risk fill:#FEF2F2,stroke:#DC2626,color:#0F172A,stroke-width:1.5px;
-    classDef boundary fill:#FFFFFF,stroke:#334155,color:#0F172A,stroke-width:2px,stroke-dasharray:3 3;
+    CFG --> S1
+    MODASH --> S1
+    S1 -->|"seed"| DB
+    DB --> S2
+    ACCOUNTS --> S2
+    PROXY --> S2
+    S2 -->|"qualified / rejected"| DB
+    DB --> S3
+    ACCOUNTS --> S3
+    PROXY --> S3
+    S3 -->|"collected"| DB
+    S3 --> EVIDENCE
+    DB --> S4
+    MODASH -->|"CDP 或 CSV"| S4
+    S4 -->|"decided + final_pool"| DB
+    S4 --> OUT
+    S2 -. "账号、代理或导航错误" .-> ERR
+    S3 -. "账号、代理或导航错误" .-> ERR
+    ERR --> DB
+    OUT --> FEEDBACK --> DB
+    FEEDBACK -. "后续 Lookalike 种子" .-> S1
 ```
 
-图中橙色虚线节点是目标能力，不代表已经完成；当前完成度以
-[`docs/sop_v2/REQUIREMENTS_CHECKLIST.md`](docs/sop_v2/REQUIREMENTS_CHECKLIST.md) 的状态列为准。
+详细组件设计见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)，账号、会话、
+代理和轮换细节见
+[`docs/ACCOUNT_POOL_ARCHITECTURE.md`](docs/ACCOUNT_POOL_ARCHITECTURE.md)。
 
-| 阶段 | 主要实现 | 当前状态 | 关键产物 |
-|---|---|---|---|
-| 身份与采集通道 | `account_pool.py`、`instagram_session.py`、CDP/普通 Chrome Cookie 导出 | 已稳定 | 可轮换的私有 API Client、暖 Session |
-| 发现与采集 | `discover.py`、`discover_graph.py` | 已稳定 | 去重候选、profile、帖子、评论、来源证据 |
-| 当前筛选与评分 | 现有漏斗、评论防刷、`score_breakdown` | 已稳定 | scan cache、当前候选/排除结果 |
-| 浏览器与数据资产 | `verify_browser.py`、`discovery.db`、`pod_accounts.json` | 已稳定 | Storefront 证据、两层库、水军库 |
-| 多源证据合同 | Instagram + Modash + 浏览器 + 人工/报价 | 部分/待开发 | `FieldEvidence`、Evidence Index |
-| SOP V2 决策 | 严格 Gates、A-F 100 分、五池互斥路由 | 待开发 | GateResult、AI Vetting Score、五池结果 |
-| 交付与反馈 | 五池 XLSX、HTML、Manifest、Herman 回导 | 部分/待开发 | 可审计交付包、下一批种子与反馈标签 |
+## 四阶段流水线
 
----
+| 阶段 | 输入 | 主要职责 | 状态输出 | 是否需要 IG 账号 |
+|---|---|---|---|---|
+| Stage 1 Discover | Modash CDP、SOP 配置 | 结构化搜索、分页、去重、写入候选 | `seed` | 否 |
+| Stage 2 Qualify | `seed`、浅扫账号池 | Profile、宽粉丝筛选、品牌/私密、Bio、Storefront、赛道 | `qualified` / `rejected` | 是 |
+| Stage 3 Collect | `qualified`、深采账号池 | 前 N 帖、推广/高评论帖评论、购买意图、真实 ER、内容信号 | `collected`；错误保持原态 | 是 |
+| Stage 4 Decide | 所有有数据候选、第三方/人工补数 | 硬门禁、A-F、N/A 归一化、固定 Review、五池、导出 | `decided + final_pool` | 否 |
 
-## 越运行越优化：三库 + 自我强化飞轮
+Stage 1 默认调用 Modash `/api/search/v2/instagram`；旧 AI Search DOM 抽取只作为
+`--ai-search` 兜底。Stage 4 支持 Modash CSV 或 CDP 报告补数；缺少第三方核心字段时，
+候选诚实进入 Review，不视为流水线故障。
 
-这套系统**越跑越值钱**：每一轮把扫过的红人沉淀进库、把最优质的晋升为"金种子"，下一轮**用金种子去扩散** ——
-种子越优质，发现越精准，库越大越是独家数据资产。日常逐渐从"每次全网爬"变成"先查库、不够才补货"，**越用越快、越用越准**。
-
-**三个库各司其职：**
-
-| 库 | 存什么 | 价值 |
-|----|--------|------|
-| 🚫 **水军库** `pod_accounts.json` | 互赞团 / 水军用户名，跨 run 累积 | 扫到直接略过 → 过滤提质 |
-| 📥 **基本库 Tier1** `creator_index` | 所有爬过的创作者（去重累积） | 原始资产 + 图谱节点池 |
-| ⭐ **高质量库 Tier2** `creator_index` | 严格门槛晋升的电商对口精英 | **价值最高**：够大够全可直接卖数据 / 建数据站 |
-
-**晋升门槛**（全部满足才从 Tier1 → Tier2）：Amazon 橱窗已核实 · 赛道核心对口 · 粉丝 1万–15万 · 互动率达标 · 评论信任 ≥ 中 · 综合评分 ≥ 阈值。
+### 状态机
 
 ```mermaid
-flowchart LR
-    S["🌱 种子<br/>冷启动: 品牌/关键词"] --> C["🔍 爬取 + 评估<br/>漏斗 · 评分 · 核验"]
-    C --> T1["📥 基本库 Tier1<br/>所有爬过的"]
-    T1 -->|"达晋升门槛"| T2["⭐ 高质量库 Tier2<br/>电商对口精英"]
-    T2 -->|"取相似号/同帖共现<br/>当作更优的下一轮种子"| S
-    POD["🚫 水军库"] -.->|"命中即略过"| C
-    T2 -->|"日常先查库, 不够才补货"| DEL["📦 秒级交付"]
+stateDiagram-v2
+    [*] --> seed
+    seed --> qualified
+    seed --> rejected
+    qualified --> collected
+    qualified --> rejected
+    collected --> decided
+    rejected --> [*]
+    decided --> [*]
 ```
 
-> 现状：三库定位与字段已全部就位；**晋升自动化 + 金种子飞轮**随账号池扩大后启用（设计见 `docs/TWO_TIER_DESIGN.md`）。
+数据库中的三类状态彼此正交：
 
----
+- `status`：候选走到哪一阶段；
+- `tier`：数据资产等级，客户批准者可晋升 Tier 2；
+- `client_status`：客户侧 `approved/rejected/pending`。
 
-## 目标画像
+`locked_at` 用于候选软锁，`stage_error` 保存最后一次瞬时错误，`stage_json`
+累积各阶段事实。业务不合格进入 `rejected`；登录墙、challenge、代理和导航错误只写
+`stage_error`，不应被误判为业务淘汰。
 
-- 内容以产品推荐为主（Amazon Finds / Must Haves），非泛生活方式
-- 粉丝 10K–150K，社区信任度高（评论区有真实购买意图）
-- Bio 有成熟 Amazon Storefront（直链或经 Linktree/Beacons/LTK）
-- 对护肤 / 美容仪器有专业认知（成分、波长、irradiance）
-- 赞助内容不过度饱和（近 15 帖 ≤ 40%）
+## 决策与交付
 
-不做 TikTok；不做全 IG 穷尽搜索；不编造粉丝画像。
+Stage 4 的决策顺序为：
 
----
-
-## 项目结构
-
-```
-营销/
-  README.md  VERSION  CHANGELOG.md  requirements.txt  .gitignore
-  config/
-    seeds.toml              # 品牌/关键词/lookalike 种子与阈值
-  scripts/
-    discover.py             # 线性生产管道：发现→回扫→漏斗→评论→评分→交付
-    discover_graph.py       # 图谱扩散、多跳发现、索引和复用
-    account_pool.py         # 暖Session→完整Cookie→一次性冷登录，轮换与冷却
-    instagram_session.py    # 全量Cookie注入、暖复载验证、账号池合并
-    export_browser_cookies.py        # 从CDP Chrome导出Cookie
-    export_chrome_profile_cookies.py # 从macOS普通Chrome本机导出Cookie
-    start_instagram_cdp.zsh          # 安全启动独立Chrome/CDP
-    stop_instagram_cdp.zsh           # 按profile归属安全停止
-    verify_browser.py       # 真浏览器核验 Amazon / 聚合页并留证
-    build_report.py         # 生成自包含 HTML 审计报告
-    export_xlsx.py          # 生成客户交付 Excel
-    db.py                   # 本地 SQLite 初始化、查询和去重
-    import_pool.py          # 本机账号池导入
-    extensions/
-      sop_v2/               # 客户 SOP V2 增量开发区
-      integrations/modash/  # Modash 可选补充层
-    dev/                    # 账号、接口和恢复诊断工具
-  docs/
-    DEVELOPER_HANDOFF.md    # 新开发者接手入口
-    ARCHITECTURE.md         # 稳定核心与增量改造边界
-    INSTAGRAM_LOGIN_SESSION_SOP.md # 登录与暖Session最终方案
-    sop_v2/                 # 完整需求、差距、验收清单和交付规范
-    FLOWCHART.md  PIPELINE_LOGIC.md  REQUIREMENTS.md
-    EXECUTION_PLAN.md  RESEARCH.md  TWO_TIER_DESIGN.md
-  data/
-    README.md               # 本地数据目录契约
-    session/ runs/ modash/  # 本机生成，不提交运行内容
-    source/ batches/ manual_evidence/ # 输入、批次与人工证据占位
-  reports/deliveries/       # 本地最终交付目录
-  samples/README.md         # 脱敏样例规则，不含真实交付
-  tests/
-    test_instagram_session.py
-    fixtures/
-  .secrets/                 # 本机凭据和浏览器状态，不进入仓库
+```text
+多源字段合并 → Hard Gates → Fixed Review → A-F Scoring → N/A 归一化 → 五池路由
 ```
 
----
+A-F 分别覆盖内容赛道、专业表达、社区信任、商业基础、受众质量和经济性。
+当前配置将 F 模块整体延期为 N/A；N/A 从适用分母移除，而不是记 0 分。
 
-## 环境
+最终路由定义五个互斥池：
+
+1. `Include-With-Storefront`
+2. `Include-Without-Storefront`
+3. `Priority-Review`
+4. `Review`
+5. `Exclude`
+
+当前实现仍有一个已知冲突：路由支持 `Include-Without-Storefront`，但 Stage 2 会提前
+淘汰 `confirmed_no`，所以该池在主流水线中基本不可达。提交新业务规则前需要统一这一口径。
+
+主要产物：
+
+```text
+data/creator_cache.db
+data/runs/<batch_id>/decisions.json
+data/runs/<batch_id>/deliverable.xlsx
+data/evidence/<batch_id>/<handle>/
+```
+
+当前评论证据以“用户名 + 评论原话 + 意图级别 + 帖子 URL”为主；历史文档中的评论截图
+不是当前主流程的稳定承诺。
+
+## V2 账号、会话与代理
+
+当前 V2 不调用 `AccountPool` 类。所谓账号池实际是账号文件加顺序轮询：
+
+```text
+浅扫账号文件 → 每号默认 8 个候选 → 换 Context / Sticky 通道
+深采账号文件 → 每号默认 3 个候选 → 换 Context / Sticky 通道
+error         → 当前候选 mark_error → 关闭 Context → 下一账号处理下一候选
+```
+
+每个账号使用独立 persistent Chrome profile；运行时只解析并注入
+`sessionid + ds_user_id`，不执行密码/TOTP 登录。每个账号处理块使用一条 Sticky 代理通道，
+同时屏蔽图片、视频和字体以降低带宽与请求压力。
+
+需要注意：
+
+- V2 尚无持久账号 cooldown、连续错误自动停用或账号租约；
+- 错误后不会在本轮用下一账号重试同一候选；
+- 代理缺失时当前代码会静默直连；
+- 深采账号文件缺失时会回退浅扫池；
+- 健康检查报告尚未接入调度；
+- 完整 Cookie/UA 实现存在于 `session_v2.py`，但主流程尚未使用。
+
+不要把 Legacy `account_pool.py` 的 cooldown、暖 Session 和一次性冷登录能力误认为
+V2 已经具备。完整分析和目标状态机见
+[`docs/ACCOUNT_POOL_ARCHITECTURE.md`](docs/ACCOUNT_POOL_ARCHITECTURE.md)。
+
+## 凭据边界
+
+账号、密码、TOTP、Cookie、代理凭据和 Chrome profile 均不得进入 Git。它们只保留在
+操作机 `.secrets/`，该目录已被 `.gitignore` 整体排除。数据库、客户输入、评论证据、
+截图、日志和交付物同样只保留在本地忽略目录。
+
+仓库只记录账号文件的格式、池角色和操作流程，不保存真实账号值。需要向另一台操作机
+迁移凭据时，应使用团队密码管理器或仓库外的加密传输渠道。
+
+## 安装
+
+要求 Python 3.11+、Google Chrome 和 GnuPG：
 
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
-.venv/bin/python -m playwright install chromium   # verify_browser 用；或用系统 Chrome(channel)
+.venv/bin/python -m playwright install chromium
 ```
 
-账号只保存在各开发者本机 `.secrets/`。首次使用时导入：
+首次运行前需要：
+
+1. 恢复或准备浅扫账号文件、深采账号文件和代理配置；
+2. 确保敏感文件权限为 `0600`；
+3. 使用独立的 Instagram Chrome profile，不与 Modash Chrome 混用；
+4. 启动并登录用于 Modash 的 Chrome CDP 9222；
+5. 人工排除已登出、challenge 或 suspended 的账号。
+
+项目不会自动处理验证码或真人验证。
+
+## 正确运行方式
+
+推荐分阶段执行，便于检查漏斗和提供 Stage 4 补数：
+
 ```bash
-.venv/bin/python scripts/import_pool.py < accounts.txt   # username----password----totp_secret
+cd scripts
+BID=SKIN-YYYYMMDD
+
+# 1. Modash 发现
+PYTHONPATH=. ../.venv/bin/python -m extensions.sop_v2.pipeline.stage1_discover \
+  --batch-id "$BID" --track paid
+
+# 2. Instagram 浏览器浅扫
+PYTHONPATH=. ../.venv/bin/python -m extensions.sop_v2.pipeline.stage2_qualify \
+  --batch-id "$BID" --resume
+
+# 3. 帖子与评论深采
+PYTHONPATH=. ../.venv/bin/python -m extensions.sop_v2.pipeline.stage3_collect \
+  --batch-id "$BID" --posts 10 --resume
+
+# 4A. 使用 Modash CDP 补数并交付
+PYTHONPATH=. ../.venv/bin/python -m extensions.sop_v2.pipeline.stage4_decide \
+  --batch-id "$BID" --track paid \
+  --out "../data/runs/$BID/decisions.json" \
+  --modash-cdp
+
+# 4B. 或使用已导出的 CSV
+PYTHONPATH=. ../.venv/bin/python -m extensions.sop_v2.pipeline.stage4_decide \
+  --batch-id "$BID" --track paid \
+  --out "../data/runs/$BID/decisions.json" \
+  --modash-csv "../data/source/$BID-modash.csv" \
+  --manual-csv "../data/source/$BID-manual.csv"
 ```
 
----
-
-## 运行
+快速串行入口：
 
 ```bash
-# 1) 发现（账号池轮换，默认；扩展种子源；全量加 --max-candidates 0 --wait-pool）
-.venv/bin/python scripts/discover.py --expand-all --max-candidates 100 --wait-pool --no-proxy
-
-# 2) 浏览器核验（对 review 候选：Amazon 穿透 + 视觉 + 截图存证）
-.venv/bin/python scripts/verify_browser.py
-
-# 3) 出交付 Excel
-.venv/bin/python scripts/export_xlsx.py
-
-# 4)（可选）出 HTML 仪表盘 / 查本地库
-.venv/bin/python scripts/build_report.py
-.venv/bin/python scripts/db.py list --fit 对口 --min-score 30
-
-# 5)（复合引擎）多跳爬取建索引+图谱；查库/排序不碰账号
-.venv/bin/python scripts/discover_graph.py ingest --hops 2 --budget 200 --wait-pool
-.venv/bin/python scripts/discover_graph.py search --fit 对口 --amazon --min-followers 10000
-.venv/bin/python scripts/discover_graph.py stats          # 索引/图统计
+PYTHONPATH=. ../.venv/bin/python -m extensions.sop_v2.pipeline.run_pipeline \
+  --batch-id "$BID" --track paid --resume
 ```
 
-### 关键开关
+一键入口目前不会转发 Modash/人工补数参数，完整交付优先使用分阶段命令。
 
-| 参数 | 说明 |
-|------|------|
-| `--expand-all` | 启用关键词搜索(search_users) + Lookalike(fbsearch_suggested_profiles) 种子扩展 |
-| `--max-candidates N` | 候选上限（0=全量） |
-| `--wait-pool` | 账号池全冷却时等最早账号恢复再继续（全量必备） |
-| `--from-scan FILE` | 从扫描缓存离线重跑漏斗/评分（不烧号调参） |
-| `--no-comments` | 跳过评论分析（快扫只要名单） |
-| `--rotate-every N` / `--cooldown M` | 单号 N 次轮换 / 冷却 M 分钟 |
+查看状态：
 
-种子/关键词/阈值在 `config/seeds.toml`；运行结束自动入 `data/discovery.db`。
+```bash
+cd ..
+PYTHONPATH=scripts .venv/bin/python -m extensions.sop_v2.creator_cache stats
+```
 
----
+## 客户反馈回流
 
-## 账号池运维铁律（重要）
+交互式 HTML 导出的客户选择可以回流：
 
-登录走三级：① 暖缓存 session（`data/session/`）→ ② 完整浏览器 Cookie → ③ 密码+TOTP 冷登录。
-**冷登录是唯一会触发 Instagram 风控（UFAC 人工验证墙）的动作**，因此：
+```bash
+PYTHONPATH=scripts .venv/bin/python \
+  -m extensions.sop_v2.pipeline.ingest_client_decisions \
+  --file client_decisions_<batch_id>.json
+```
 
-- **永不删 `data/session/`**。删了等于强制全员冷登录 → 群体撞验证墙（上次 19/20 个号就这么烧的）。
-- **每个号一生只冷登录一次**（代码强制，`data/session/cold_attempted.json` 跨 run 持久记录）：
-  成功即缓存、之后全程暖恢复；失败也消耗额度、永不重试 → 杜绝"反复冷登录"。
-- **cookie / 暖恢复优先**，能不冷登录就不冷登录。
-- 浏览器登录态接入、完整 Cookie 固化和故障恢复统一按
-  [`docs/INSTAGRAM_LOGIN_SESSION_SOP.md`](docs/INSTAGRAM_LOGIN_SESSION_SOP.md) 执行；
-  禁止只复制 `sessionid` 或为同一个账号创建重复记录。
-- 单一机房 IP 下 bulk cookie 可用率偏低（实测一批 20 个 cookie 仅 3~4 个直接可用），属正常损耗，
-  靠持续补**干净未挂验证**的好号解决，不靠换登录方式（密码/cookie 撞的是同一道验证墙）。
+- `approved` / `collaborated`：晋升 Tier 2 金种子；
+- `rejected`：保留客户拒绝状态和原因；
+- `pending`：不改变资产等级；
+- 客户反馈不会自动改写 SOP 配置。
 
----
+从金种子自动发起下一轮 Modash Lookalike 仍是待接能力。
 
-## 交付物
+## 项目结构
 
-当前稳定链路以单一 Excel 为主要客户交付，运行产物写入
-`reports/deliveries/`。现有版本包含四个 sheet：
+```text
+config/
+  sop_v2.toml                         当前 V2 规则
+  seeds.toml                          Legacy 发现配置
+scripts/
+  browser_collect_v2.py               V2 浏览器采集器
+  export_v2_xlsx.py                   V2 XLSX
+  export_v2_html.py                   V2 HTML
+  extensions/sop_v2/
+    creator_cache.py                  SQLite 状态、缓存、软锁、客户反馈
+    gates.py / scoring.py / routing.py
+    pipeline/
+      stage1_discover.py
+      stage2_qualify.py
+      stage3_collect.py
+      stage4_decide.py
+      run_pipeline.py
+  discover.py / discover_graph.py     Legacy
+  account_pool.py                     Legacy instagrapi 账号池
+docs/
+  ARCHITECTURE.md                     当前完整架构
+  ACCOUNT_POOL_ARCHITECTURE.md        账号、会话、代理与轮换专项设计
+  sop_v2/PIPELINE_SPEC.md             状态机和模块边界
+  sop_v2/RUNBOOK.md                   操作手册
+data/
+  creator_cache.db                    本地状态库，不入 Git
+  runs/ / evidence/                   本地批次与证据，不入 Git
+```
 
-1. **候选红人** —— 首列『验收建议』(重点候选/建议纳入/待人工核验/倾向排除) 直接分流；
-   赛道·对口度 / Amazon橱窗 / 互动率 / 评论信任 / 评分 / **①②③④客户需求达成** /
-   主页·bio·橱窗**活链接抽查** / 证据截图内链；**表底「Modash 缺口说明」**
-2. **证据截图** —— 浏览器核验现场截图（嵌入）
-3. **已排除** —— 含原因
-4. **说明** —— 怎么用 / 字段释义 / 证据路径 / Modash 局限
+## Legacy 边界
 
-SOP V2 的目标交付将升级为五个互斥决策池及 Evidence Index、Data Dictionary，
-详见 [`docs/sop_v2/FINAL_DELIVERABLES.md`](docs/sop_v2/FINAL_DELIVERABLES.md)。
-公开仓库不包含真实交付样例；脱敏规则见 `samples/README.md`。
+以下组件可能调用 Instagram 私有 API，甚至回退到密码/TOTP 冷登录：
 
----
+- `scripts/discover.py`
+- `scripts/discover_graph.py`
+- `scripts/account_pool.py`
+- `scripts/instagram_session.py`
+- `config/seeds.toml`
+- `docs/INSTAGRAM_LOGIN_SESSION_SOP.md`
 
-## 已知瓶颈
+除非明确进行历史复现，不要将它们作为 V2 新批次入口。Legacy 账号池具有请求级轮换、
+持久 cooldown 和一次性冷登录纪律，但没有接入当前浏览器流水线。
 
-organic IG 无法在扫描前按「有 Amazon 橱窗 + 护肤垂类」预筛 → 合格红人产出有限；
-Save 率/DM、粉丝画像、假粉比例 IG 不公开。**这些靠 Modash bio 搜索 + 画像 API 解决**
-（详见交付 Excel 底部与 `docs/FLOWCHART.md` 优化点）。
+## 已知设计债务
+
+- Storefront 双轨规则与 Stage 2 早筛冲突；
+- V2 账号池没有统一健康状态、cooldown、租约和同候选换号重试；
+- Sticky 代理 TTL、真实出口和失败归因缺少可观测性；
+- `FieldEvidence` 与正式 Batch Manifest 尚未贯通全部 Gate/Score 输出；
+- 配置、文档、代码和部分边界测试存在规则漂移；
+- `run_pipeline` 的 track 传递、阶段退出码和补数参数仍需收口；
+- 当前评论证据以结构化文本为主，历史截图承诺已经过期；
+- 同一创作者跨批次/跨 Track 仍由全局 Handle 主键限制。
+
+这些问题不妨碍单机串行小批次运行，但在无人值守、并发和长期资产化之前需要处理。
+
+## 文档导航
+
+| 文档 | 定位 |
+|---|---|
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | 当前系统完整架构与细节设计 |
+| [`docs/ACCOUNT_POOL_ARCHITECTURE.md`](docs/ACCOUNT_POOL_ARCHITECTURE.md) | 账号、Cookie、Profile、代理、轮换与错误恢复 |
+| [`docs/sop_v2/PIPELINE_SPEC.md`](docs/sop_v2/PIPELINE_SPEC.md) | 四阶段状态机和数据库 API |
+| [`docs/sop_v2/RUNBOOK.md`](docs/sop_v2/RUNBOOK.md) | 实际运行命令 |
+| [`docs/sop_v2/STRATEGY_LOCK.md`](docs/sop_v2/STRATEGY_LOCK.md) | 经实测锁定的采集策略 |
+| [`docs/sop_v2/SYSTEM_STATUS.md`](docs/sop_v2/SYSTEM_STATUS.md) | 截至文档日期的完成度与延后项 |
+| [`docs/sop_v2/FINAL_DELIVERABLES.md`](docs/sop_v2/FINAL_DELIVERABLES.md) | 交付字段与目标结构 |
+
+`REQUIREMENTS_CHECKLIST.md`、根目录旧 `FLOWCHART/PIPELINE_LOGIC/EXECUTION_PLAN` 等文档
+记录的是需求 Baseline 或历史设计，不应覆盖当前代码事实。

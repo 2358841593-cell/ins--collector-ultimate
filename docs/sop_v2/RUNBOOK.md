@@ -21,11 +21,13 @@ cd /path/to/ins-collector
 ### 1.2 秘钥文件（`.secrets/`，已 gitignore，绝不提交）
 | 文件 | 格式 | 说明 |
 |---|---|---|
-| `accounts_raw.txt` | `username\|pw\|totp\|ds_user_id=..;sessionid=..\|email\|date` 每行一号 | IG 号池(stage2/3 用)。只需 cookie 段的 sessionid+ds_user_id 有效 |
+| `accounts_raw.txt` | pipe 分隔账号行，Cookie 段含 `ds_user_id`、`sessionid` | Stage 2 浅扫池；V2 不读取密码/TOTP |
+| `accounts_deep.txt` | 与浅扫池同格式 | Stage 3 隔离深采池；缺失时回退浅扫池 |
 | `proxy.txt` | `http://user:pass@host:port` | 住宅代理(换 IP 绕限流)，一行 |
 
-- 号从供应商来。**开跑前先验证号能登录**（见 1.4），死号/风控挑战号剔除。
-- `.secrets/` 下的 `accounts_cooled_*.txt` / `accounts_v2.txt` 是历史备份，不参与运行。
+- 号从供应商来。**开跑前分别验证浅扫池和深采池**，死号/风控挑战号剔除。
+- `.secrets/` 下的 `accounts_cooled_*.txt` / `accounts_v2.txt` 是历史备份，不参与主流程。
+- 账号、密码、TOTP、Cookie、代理凭据和 Chrome profile 只留操作机，禁止提交 Git。
 
 ### 1.3 Modash（stage1 找种子 + stage4 补数）
 - **stage1**：在一个 Chrome 里登录 Modash 并保持标签打开，用 **CDP 端口 9222** 启动它：
@@ -35,11 +37,15 @@ cd /path/to/ins-collector
   （用你日常登录 Modash 的 Chrome profile；stage1 只读 AI Search 预览，不消耗 Profile 额度。）
 - **stage4 补数**：在 Modash 对 shortlist 导出 **Profile Report CSV**（假粉/受众/国家/ER），喂 `--modash-csv`。这是解除 Include 恒空的关键（见 §4）。
 
-### 1.4 账号健康自检（强烈建议开跑前跑）
+### 1.4 账号健康自检
 ```bash
 PYTHONPATH=scripts .venv/bin/python scripts/dev/test_login_state.py .secrets/accounts_raw.txt
-# 每号输出 ✅已登录 / 🔴已登出 / 🟡风控挑战。只留 ✅ 的进 accounts_raw.txt。
+PYTHONPATH=scripts .venv/bin/python scripts/dev/test_login_state.py .secrets/accounts_deep.txt
+# 每号输出已登录 / 已登出 / 风控挑战。只留确认健康的账号。
 ```
+
+当前健康工具尚未接入 Pipeline，且检查出口与生产 Sticky 模型不完全一致；结果用于人工预筛，
+不是自动调度状态。详见 [`../ACCOUNT_POOL_ARCHITECTURE.md`](../ACCOUNT_POOL_ARCHITECTURE.md)。
 
 ## 2. 跑一批（分阶段，推荐）
 
@@ -49,7 +55,7 @@ cd scripts
 BID=SKIN-20260716            # 批次 id，自定
 
 # ① 找种子（需 Chrome 开着已登录 Modash + 9222）
-PYTHONPATH=. ../.venv/bin/python -m extensions.sop_v2.pipeline.stage1_discover --batch-id $BID
+PYTHONPATH=. ../.venv/bin/python -m extensions.sop_v2.pipeline.stage1_discover --batch-id $BID --track paid
 
 # ② 浅扫合格（需 IG 号；--limit 控制本轮数量；--resume 断点续跑）
 PYTHONPATH=. ../.venv/bin/python -m extensions.sop_v2.pipeline.stage2_qualify --batch-id $BID
@@ -57,7 +63,7 @@ PYTHONPATH=. ../.venv/bin/python -m extensions.sop_v2.pipeline.stage2_qualify --
 # ③ 深采意图+实算ER（需 IG 号；--posts 10 = 前10帖算实算ER）
 PYTHONPATH=. ../.venv/bin/python -m extensions.sop_v2.pipeline.stage3_collect --batch-id $BID --posts 10
 
-# ④ 决策+交付（--modash-csv 解除 modash_core_missing；--manual-csv 回填 Raw Skin/VO）
+# ④ 决策+交付（Modash 核心字段缺失会诚实进入 Review；人工 CSV 为可选补充）
 PYTHONPATH=. ../.venv/bin/python -m extensions.sop_v2.pipeline.stage4_decide --batch-id $BID --track paid \
     --out ../data/runs/$BID/decisions.json \
     --modash-csv ../data/source/$BID-modash.csv \
@@ -74,23 +80,25 @@ PYTHONPATH=. ../.venv/bin/python -m extensions.sop_v2.pipeline.run_pipeline --ba
 ```bash
 PYTHONPATH=scripts .venv/bin/python -m extensions.sop_v2.creator_cache stats      # 各 status 计数 + 品牌/橱窗/金种子
 ```
-- 某阶段中途挂（账号冷却/被 kill）→ 同命令加 `--resume` 重跑，只处理未完成项（软锁 `locked_at` 陈旧回收）。
-- 号问题（登录墙/挑战/超时）→ 该候选 `mark_error`，**status 不动**，换号 `--resume` 即恢复，**绝不烧号**。
-- 候选不合格（品牌/无橱窗/私密/非赛道/实算ER<0.5%）→ `rejected` + `reject_reason`，不再进后续阶段。
+- 某阶段中途挂（账号疲劳/被 kill）→ 同命令加 `--resume` 重跑未完成项（软锁 `locked_at` 陈旧回收）。
+- 登录墙/挑战/超时 → 当前候选 `mark_error`、status 不动；本轮不会立即拿下一账号重试同一候选，需后续重跑。
+- 候选明确不合格（品牌/私密/宽粉丝范围/非赛道等）→ `rejected + reject_reason`。
+- V2 当前没有持久账号 cooldown、连续错误自动停用和 Account Lease；不要并行启动多个浏览器 worker。
 
-## 4. 为什么要 Modash CSV + 人工 CSV（Include 才非空）
+## 4. Modash 与人工补数
 
-routing 有**高分不覆盖的固定 Review**项。纯自动流水线拿不到的两类数据必须补，否则候选全钉 Review、Include 恒空：
-- **`--modash-csv`**：补 `fake_pct / creator_country / top_audience_country`（Modash Profile Report 导出）→ 解除 `modash_core_missing`。
-- **`--manual-csv`**：人工核验 `raw_skin_grade(A/B/C) / has_vo(1/0) / paid_cpm`（SOP §B4/B5 人工步骤）→ 解除 `raw_skin_or_vo_unverified`。
-  CSV 列：`handle,raw_skin_grade,has_vo,paid_cpm[,shein_temu]`。
-- 两者补齐后，候选按分数落 Include(≥75) / Priority-Review(65–75) / Review。**不补则诚实落 Review（不伪造数据）**。
+Routing 对第三方核心字段缺失设置固定 Review：
+
+- `--modash-cdp` 或 `--modash-csv`：补 `fake_pct / creator_country / top_audience_country` 等；
+- `--manual-csv`：可补 Raw Skin、VO、报价、SHEIN/Temu 等人工事实；
+- 当前 F 经济性模块整体延期为 N/A，Raw Skin/VO/报价不再是所有候选的固定 Review 条件；
+- 不补 Modash 核心字段时诚实落 Review，不伪造数据。
 
 ## 5. 交付物
 - `data/runs/<BID>/decisions.json`：五池决策（run_v2 结构，可复现）。
-- `data/runs/<BID>/deliverable.xlsx`：客户交付表（批次总览 + 评论证据 + 五池 sheet，内嵌意图评论截图、可点 IG/Amazon 链接）。
-- `data/evidence/<BID>/<handle>/intent_NN.png`：购买意图评论截图（交付表内链引用）。
-> `data/` 全部 gitignore，不进仓库（含真实候选/截图/库）。
+- `data/runs/<BID>/deliverable.xlsx`：批次总览、评论证据和五池客户交付表。
+- `data/evidence/<BID>/<handle>/`：候选证据目录；当前稳定证据以评论原话、用户名和帖子 URL 为主。
+> `data/` 运行内容全部 gitignore，不进仓库（含真实候选、证据和数据库）。
 
 ## 6. 客户反馈回流（飞轮）
 交付表客户审核后，把 Herman Approval=Yes 的红人回导 → `promote_golden`(tier=2 金种子) → 下轮 stage1 可作 Modash Lookalike 种子；Approval=No → 负向库，discovery 不再重现。（回导脚本见 DB_FLYWHEEL_DESIGN.md。）

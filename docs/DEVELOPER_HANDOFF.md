@@ -1,5 +1,10 @@
 # 开发接手指南
 
+> **架构入口已更新**：当前生产主线是 SOP V2 四阶段浏览器流水线。请先阅读
+> [`../README.md`](../README.md)、[`ARCHITECTURE.md`](ARCHITECTURE.md) 和
+> [`ACCOUNT_POOL_ARCHITECTURE.md`](ACCOUNT_POOL_ARCHITECTURE.md)。本文后续仍保留部分
+> Legacy `discover.py/account_pool.py/instagrapi` 接手记录，不应覆盖当前运行事实。
+
 ## 1. 项目目标
 
 本项目用于 Instagram 红人发现、筛选、证据核验和客户交付。当前稳定版本能够：
