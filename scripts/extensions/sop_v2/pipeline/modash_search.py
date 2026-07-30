@@ -10,7 +10,255 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import re
+import time
+from pathlib import Path
+
+
+GOLDEN_LOOKALIKE_SCHEMA_VERSION = 1
+_HANDLE_RE = re.compile(r"^[A-Za-z0-9._]{1,30}$")
+
+
+class GoldenLookalikeInputError(ValueError):
+    """人工 Modash Lookalike 结果不满足可审计导入契约。"""
+
+
+def _handle(value) -> str:
+    h = str(value or "").strip().lstrip("@")
+    return h if _HANDLE_RE.fullmatch(h) else ""
+
+
+def golden_seed_fingerprint(handles: list[str]) -> str:
+    """对批准种子集合做稳定指纹，防止把别批/旧版本 Lookalike 结果错接进来。"""
+    normalized = sorted({_handle(h).lower() for h in handles if _handle(h)})
+    return hashlib.sha256("\n".join(normalized).encode("utf-8")).hexdigest()
+
+
+def build_golden_seed_manifest(batch_id: str, handles: list[str],
+                               generated_at: str | None = None) -> dict:
+    """生成给人工 Modash Lookalike 步骤使用的种子清单。
+
+    种子由 ``creator_cache.golden_seeds`` 提供；该 API 只返回
+    ``tier=2 AND client_status IN ('approved','collaborated')``。manifest 中保留
+    明确资格条件与集合指纹，后续结果导入必须逐项匹配。
+    """
+    seeds = []
+    seen = set()
+    for raw in handles:
+        h = _handle(raw)
+        if not h or h.lower() in seen:
+            continue
+        seen.add(h.lower())
+        seeds.append({"handle": h})
+    return {
+        "schema_version": GOLDEN_LOOKALIKE_SCHEMA_VERSION,
+        "format": "golden-lookalikes-v1",
+        "batch_id": batch_id,
+        "generated_at": generated_at or time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "source": "creator_cache.golden_seeds",
+        "eligibility": "tier=2 AND client_status IN ('approved','collaborated')",
+        "seed_set_sha256": golden_seed_fingerprint([s["handle"] for s in seeds]),
+        "seed_count": len(seeds),
+        "seeds": seeds,
+        # 该 manifest 本身就是可填写/另存的结果模板，避免人工另猜字段。
+        "results": [
+            {"seed_handle": seed["handle"], "candidates": []}
+            for seed in seeds
+        ],
+        "manual_next_step": (
+            "在 Modash 对这些批准种子执行 Lookalike；把候选填入对应 results[].candidates "
+            "并另存，再用 --golden-lookalikes-json 导入。候选字段为 handle(必填)、"
+            "followers/er_pct(可选)。"
+        ),
+    }
+
+
+def write_golden_seed_manifest(path: str | Path, manifest: dict) -> Path:
+    """写 manifest，但不覆盖不同种子集合的既有审计文件。"""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if p.exists():
+        try:
+            current = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            current = {}
+        same_cohort = (
+            current.get("batch_id") == manifest.get("batch_id")
+            and current.get("seed_set_sha256") == manifest.get("seed_set_sha256")
+        )
+        if same_cohort:
+            return p
+        suffix = str(manifest.get("seed_set_sha256") or "unknown")[:12]
+        p = p.with_name(f"{p.stem}.{suffix}{p.suffix}")
+        if p.exists():
+            try:
+                current = json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                current = {}
+            if (
+                current.get("batch_id") == manifest.get("batch_id")
+                and current.get("seed_set_sha256") == manifest.get("seed_set_sha256")
+            ):
+                return p
+            raise GoldenLookalikeInputError(f"manifest 目标已存在且内容不一致：{p}")
+    p.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    return p
+
+
+def load_golden_lookalikes(path: str | Path, *, batch_id: str,
+                           golden_handles: list[str]) -> list[dict]:
+    """严格读取人工 Modash Lookalike 结果，转为 Stage1 seed records。
+
+    输入契约 ``golden-lookalikes-v1``::
+
+        {
+          "schema_version": 1,
+          "batch_id": "SKIN4-...",
+          "seed_set_sha256": "<golden manifest 中的值>",
+          "results": [
+            {
+              "seed_handle": "approved_seed",
+              "candidates": [
+                {"handle": "candidate", "followers": 12345, "er_pct": 2.4}
+              ]
+            }
+          ]
+        }
+
+    不接受裸 ``lookalikesToken``。现有 show-profile 缓存中的 token 是不透明引用，
+    并不包含可离线抽取的候选账号。
+    """
+    p = Path(path)
+    try:
+        payload = json.loads(p.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise GoldenLookalikeInputError(f"结果文件不存在：{p}") from exc
+    except (OSError, json.JSONDecodeError) as exc:
+        raise GoldenLookalikeInputError(f"结果文件不可读或不是合法 JSON：{p}") from exc
+    if not isinstance(payload, dict):
+        raise GoldenLookalikeInputError("结果根节点必须是对象")
+    if payload.get("schema_version") != GOLDEN_LOOKALIKE_SCHEMA_VERSION:
+        raise GoldenLookalikeInputError(
+            f"schema_version 必须是 {GOLDEN_LOOKALIKE_SCHEMA_VERSION}"
+        )
+    if payload.get("batch_id") != batch_id:
+        raise GoldenLookalikeInputError(
+            f"结果 batch_id={payload.get('batch_id')!r}，预期 {batch_id!r}"
+        )
+    expected_sha = golden_seed_fingerprint(golden_handles)
+    if payload.get("seed_set_sha256") != expected_sha:
+        raise GoldenLookalikeInputError("seed_set_sha256 与当前批准种子集合不一致")
+
+    allowed = {_handle(h).lower() for h in golden_handles if _handle(h)}
+    results = payload.get("results")
+    if not isinstance(results, list):
+        raise GoldenLookalikeInputError("results 必须是数组")
+
+    records = []
+    seen_seed_rows = set()
+    for index, group in enumerate(results, 1):
+        if not isinstance(group, dict):
+            raise GoldenLookalikeInputError(f"results[{index}] 必须是对象")
+        source_seed = _handle(group.get("seed_handle"))
+        if not source_seed or source_seed.lower() not in allowed:
+            raise GoldenLookalikeInputError(
+                f"results[{index}].seed_handle 不是当前 approved/collaborated 金种子"
+            )
+        source_key = source_seed.lower()
+        if source_key in seen_seed_rows:
+            raise GoldenLookalikeInputError(f"种子 @{source_seed} 在 results 中重复")
+        seen_seed_rows.add(source_key)
+        candidates = group.get("candidates")
+        if not isinstance(candidates, list):
+            raise GoldenLookalikeInputError(
+                f"results[{index}].candidates 必须是数组"
+            )
+        via = f"modash_manual_lookalike:golden:{source_seed}"
+        for candidate_index, item in enumerate(candidates, 1):
+            if not isinstance(item, dict):
+                raise GoldenLookalikeInputError(
+                    f"results[{index}].candidates[{candidate_index}] 必须是对象"
+                )
+            h = _handle(item.get("handle"))
+            if not h:
+                raise GoldenLookalikeInputError(
+                    f"results[{index}].candidates[{candidate_index}].handle 无效"
+                )
+            followers = item.get("followers")
+            if followers is not None:
+                if isinstance(followers, bool):
+                    raise GoldenLookalikeInputError(f"@{h} followers 必须是非负整数")
+                try:
+                    followers = int(followers)
+                except (TypeError, ValueError) as exc:
+                    raise GoldenLookalikeInputError(f"@{h} followers 必须是非负整数") from exc
+                if followers < 0:
+                    raise GoldenLookalikeInputError(f"@{h} followers 必须是非负整数")
+            er_pct = item.get("er_pct")
+            if er_pct is not None:
+                if isinstance(er_pct, bool):
+                    raise GoldenLookalikeInputError(f"@{h} er_pct 必须在 0-100")
+                try:
+                    er_pct = float(er_pct)
+                except (TypeError, ValueError) as exc:
+                    raise GoldenLookalikeInputError(f"@{h} er_pct 必须在 0-100") from exc
+                if not 0 <= er_pct <= 100:
+                    raise GoldenLookalikeInputError(f"@{h} er_pct 必须在 0-100")
+            records.append({
+                "handle": h,
+                "followers": followers,
+                "er": er_pct,
+                "discovered_via": via,
+                "discovery_sources": [via],
+                "golden_seed_handles": [source_seed],
+            })
+    return merge_seed_records(records)
+
+
+def merge_seed_records(*groups: list[dict]) -> list[dict]:
+    """按 handle 合并多源发现，保留全部来源与批准种子链路。"""
+    merged: dict[str, dict] = {}
+    order = []
+    for group in groups:
+        for raw in group:
+            h = _handle(raw.get("handle"))
+            if not h:
+                continue
+            key = h.lower()
+            sources = list(raw.get("discovery_sources") or [])
+            if raw.get("discovered_via") and raw["discovered_via"] not in sources:
+                sources.append(raw["discovered_via"])
+            golden = [_handle(x) for x in (raw.get("golden_seed_handles") or [])]
+            golden = [x for x in golden if x]
+            if key not in merged:
+                rec = dict(raw)
+                rec["handle"] = h
+                rec["discovery_sources"] = []
+                rec["golden_seed_handles"] = []
+                merged[key] = rec
+                order.append(key)
+            rec = merged[key]
+            for source in sources:
+                if source and source not in rec["discovery_sources"]:
+                    rec["discovery_sources"].append(source)
+            for seed in golden:
+                if seed.lower() not in {x.lower() for x in rec["golden_seed_handles"]}:
+                    rec["golden_seed_handles"].append(seed)
+            for field in ("followers", "er", "service_platform_id", "bio", "category"):
+                if rec.get(field) is None and raw.get(field) is not None:
+                    rec[field] = raw[field]
+    for key in order:
+        rec = merged[key]
+        sources = rec["discovery_sources"]
+        rec["discovered_via"] = (
+            sources[0] if len(sources) == 1
+            else "multi_source" if sources
+            else "unknown"
+        )
+    return [merged[key] for key in order]
+
 
 _SEARCH_JS = """async (body) => {
   const r = await fetch('/api/search/v2/instagram', {method:'POST',

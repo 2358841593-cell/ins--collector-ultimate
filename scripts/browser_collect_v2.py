@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import random
 import re
@@ -31,6 +32,7 @@ SECRETS = ROOT / ".secrets"
 EVIDENCE_ROOT = ROOT / "data" / "evidence"
 sys.path.insert(0, str(ROOT / "scripts"))
 from extensions.sop_v2 import content as content_mod  # noqa: E402
+from extensions.sop_v2 import storefront as storefront_mod  # noqa: E402
 from extensions.sop_v2.config import load_config  # noqa: E402
 
 _CFG = load_config()
@@ -41,9 +43,6 @@ AGG = ("linktr.ee", "linktree.com", "beacons", "ltk", "liketoknow", "shopltk", "
        "pillar.io", "many.link", "tap.bio", "solo.to", "allmylinks", "linkpop",
        "wonderl.ink", "wonderlink", "linkme.bio", "link.me", "later.com", "lnk.to",
        "linkr.bio", "s.shopmy", "flowcode", "koji", "gravatar")   # 补欧洲/新型聚合链
-AMAZON = ("amazon.", "amzn.to", "/shop/", "storefront")
-
-
 def load_proxy(session: str | None = None, ttl: int = 900):
     """读代理。session 给定则用青果 sticky 参数 `-S-{通道}-T-{秒}` 把出口 IP 固定住。
 
@@ -164,15 +163,29 @@ _PROFILE_JS = r"""() => {
     const t=(el.innerText||'').trim();
     if(t && t.length<200 && domStart.test(t) && !/instagram\.com|threads\.|^@/i.test(t)){ biolink=t; break; }
   }
-  // 帖子网格 shortcode
-  const codes=[...document.querySelectorAll('a')].map(a=>a.getAttribute('href'))
-     .filter(h=>h&&/\/(p|reel)\//.test(h));
+  // 帖子网格 shortcode + 置顶标记。置顶只在 profile 网格可可靠识别，进入帖子页后通常不显示。
+  const anchors=[...document.querySelectorAll('a[href]')]
+     .filter(a=>/\/(p|reel)\//.test(a.getAttribute('href')||''));
+  const isPinned=(a)=>{
+    // 每个 a 自己就是一个完整网格卡片；向上爬到 row/grid 会把同排甚至全页都误判为置顶。
+    const marker=[a.getAttribute('aria-label')||'',a.getAttribute('title')||''];
+    a.querySelectorAll('[aria-label],[title],svg title').forEach(e=>{
+      marker.push(e.getAttribute('aria-label')||e.getAttribute('title')||e.textContent||'');
+    });
+    // “没看见置顶图标”不是确认未置顶；false 只能由 media-info 的 pin lists 给出。
+    return /\bPinned(?: post| reel)?\b|置顶|Fijado|Fixado|Épinglé/i.test(marker.join(' '))
+      ? true : null;
+  };
+  const post_refs=anchors.map(a=>({url:a.getAttribute('href'), pinned:isPinned(a)}));
+  const codes=post_refs.map(x=>x.url);
   const challenge=/verify you'?re a real person|请验证你是真人|confirm you'?re human|suspicious|unusual activity/i.test(body.slice(0,400));
   const loginForm=!!document.querySelector('input[name="username"],input[name="password"]');
   return {
     ogdesc: meta('og:description')||'', ogtitle: meta('og:title')||'',
     header: body.slice(0, 900), external_url: ext, bio_link_text: biolink, biz_buttons: biz,
-    codes: [...new Set(codes)].slice(0,12), challenge, login_form: loginForm,
+    codes: [...new Set(codes)].slice(0,30),
+    post_refs: post_refs.filter((x,i,a)=>a.findIndex(y=>y.url===x.url)===i).slice(0,30),
+    challenge, login_form: loginForm,
     private: /This account is private|Esta cuenta es privada|cuenta privada|账号私密|This Account is Private/i.test(body)
   };
 }"""
@@ -308,7 +321,7 @@ def fetch_profile_browser(pg, handle):
         "biography": bio, "external_url": ext,
         "is_private": bool(d.get("private")), "is_business": is_business,
         "category": None, "brand_account_type": "brand" if is_brand else "personal",
-        "_scan_source": "browser", "codes": codes,
+        "_scan_source": "browser", "codes": codes, "post_refs": d.get("post_refs") or [],
         "_bio_has_more": _bio_has_more(d.get("bio_link_text")),   # 多链接号：Amazon 可能藏在 "and N more"
     }
     pf["core_niche_key"] = content_mod.derive_niche(bio, name)
@@ -361,6 +374,30 @@ def open_ctx(pw, acct, proxy, headless=True):
     return ctx
 
 
+def close_ctx(ctx):
+    """关闭带 route 的持久 context；先解除路由，避免未决 continue_ 让 close 永久等待。"""
+    if not ctx:
+        return
+    try:
+        ctx.unroute_all(behavior="ignoreErrors")
+    except TypeError:
+        try:
+            ctx.unroute_all()
+        except Exception:  # noqa: BLE001
+            pass
+    except Exception:  # noqa: BLE001
+        pass
+    for page in list(ctx.pages):
+        try:
+            page.close(run_before_unload=False)
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        ctx.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _pause(a=4.0, b=8.0):
     time.sleep(random.uniform(a, b))
 
@@ -373,7 +410,9 @@ def _goto(pg, url, tries=2):
     global LAST_NAV_ERR
     for t in range(tries):
         try:
-            resp = pg.goto(url, wait_until="domcontentloaded", timeout=45000)
+            # 单次导航硬上限与 Stage worker 的 20s watchdog 接近；不要在失效代理上
+            # 45s×2/页磨完整个 10 帖窗口。
+            resp = pg.goto(url, wait_until="domcontentloaded", timeout=25000)
             # goto 成功但状态非 2xx/3xx（如 429 限流 / 302 跳登录）也算问题，记下来
             st = resp.status if resp else None
             if st and st >= 400:
@@ -382,8 +421,15 @@ def _goto(pg, url, tries=2):
             LAST_NAV_ERR = None
             return True
         except Exception as e:  # noqa: BLE001
-            msg = f"{type(e).__name__}:{str(e)[:60]}"
-            LAST_NAV_ERR = ("timeout" if "Timeout" in type(e).__name__ else msg)
+            raw = str(e)
+            net_code = re.search(r"net::([A-Z0-9_]+)", raw)
+            if net_code:
+                # 只保留稳定且不含 URL/代理凭证的 Chromium 网络错误码。
+                LAST_NAV_ERR = f"net::{net_code.group(1)}"
+            elif "Timeout" in type(e).__name__:
+                LAST_NAV_ERR = "timeout"
+            else:
+                LAST_NAV_ERR = f"{type(e).__name__}:{raw[:60]}"
             time.sleep(random.uniform(2, 4))
     return False
 
@@ -464,12 +510,9 @@ def collect_candidate(pg, handle, ev_dir, n_posts=10):
         _cache_save(cand)
         return cand, ev
 
-    # Amazon 导购硬门槛：本版只做该赛道 → 无 Amazon 橱窗直接早跳（省昂贵深采）
+    # Storefront 只记录不早淘汰：V2 同时支持 With / Without Storefront，
+    # Amazon、LTK、ShopMy、自营店和购物聚合入口均可作为有效橱窗。
     _resolve_storefront(cand, pg)
-    if cand.get("storefront_status") == "confirmed_no":
-        cand["_skipped"] = "no_amazon_storefront"
-        _cache_save(cand)
-        return cand, ev
 
     # 2-3) 深采（帖子网格 + 推广帖购买意图 + 实算 ER）——抽出为 deep_collect，stage3 复用
     cand["codes"] = codes
@@ -477,14 +520,141 @@ def collect_candidate(pg, handle, ev_dir, n_posts=10):
 
 
 # 深采窗口大小：og:description 里读赞/评 + 推广帖判定的帖子文本
-_DEEP_READ_JS = r"""() => {
+_DEEP_READ_JS = r"""(shortcode) => {
   const meta=(p)=>{const e=document.querySelector(`meta[property="${p}"]`);return e?e.content:null;};
-  const art=document.querySelector('article')||document.body;
+  const html=document.documentElement.innerHTML||'';
+  const body=(document.body.innerText||'');
+  let taken=meta('article:published_time');
+  if(!taken){const m=html.match(/"taken_at"\s*:\s*(\d+)/i);if(m)taken=Number(m[1]);}
   return {caption: meta('og:description')||'', video: !!meta('og:video'),
-          text: (art.innerText||'').slice(0, 12000)}; }"""
-_GRID_JS = r"""() => { const codes=[...document.querySelectorAll('a')].map(a=>a.getAttribute('href'))
-    .filter(h=>h&&/\/(p|reel)\//.test(h)); return {codes:[...new Set(codes)].slice(0,12),
-    logged_out:/创建新账户|Create new account|Log into Instagram/.test(document.body.innerText.slice(0,120))}; }"""
+          taken_at:taken, text: body.slice(0, 12000)}; }"""
+_GRID_JS = r"""() => {
+  const anchors=[...document.querySelectorAll('a[href]')]
+    .filter(a=>/\/(p|reel)\//.test(a.getAttribute('href')||''));
+  const isPinned=(a)=>{
+    const marker=[a.getAttribute('aria-label')||'',a.getAttribute('title')||''];
+    a.querySelectorAll('[aria-label],[title],svg title').forEach(e=>{
+      marker.push(e.getAttribute('aria-label')||e.getAttribute('title')||e.textContent||'');
+    });
+    return /\bPinned(?: post| reel)?\b|置顶|Fijado|Fixado|Épinglé/i.test(marker.join(' '))
+      ? true : null;
+  };
+  const refs=anchors.map(a=>({url:a.getAttribute('href'),pinned:isPinned(a)}))
+    .filter((x,i,a)=>a.findIndex(y=>y.url===x.url)===i);
+  return {codes:refs.map(x=>x.url).slice(0,30),post_refs:refs.slice(0,30),
+    logged_out:/创建新账户|Create new account|Log into Instagram/.test(document.body.innerText.slice(0,120))};
+}"""
+
+# Reel 详情页当前不在可见 DOM / OG 元数据中展示播放量。登录 Cookie 下的 Web 同源详情接口
+# 会返回 IG 自身播放量、FB 转发播放量及两个置顶列表。这里只返回报价所需的有界字段，
+# 不落完整响应、不回显 Cookie。优先 ig_play_count，避免 FB 转发把 IG 合作预算虚高。
+_IG_MEDIA_INFO_JS = r"""async (mediaId) => {
+  try {
+    const r=await fetch(`/api/v1/media/${mediaId}/info/`, {
+      headers:{'x-ig-app-id':'936619743392459'}, credentials:'include'
+    });
+    if(!r.ok) return {http_status:r.status};
+    const data=await r.json();
+    const m=(data.items||[])[0];
+    if(!m) return {http_status:r.status, empty:true};
+    const clipsPins=Array.isArray(m.clips_tab_pinned_user_ids)
+      ? m.clips_tab_pinned_user_ids : null;
+    const timelinePins=Array.isArray(m.timeline_pinned_user_ids)
+      ? m.timeline_pinned_user_ids : null;
+    const pinnedKnown=clipsPins!==null || timelinePins!==null;
+    return {
+      http_status:r.status, code:m.code||null, taken_at:m.taken_at??null,
+      ig_play_count:m.ig_play_count??null, total_play_count:m.play_count??null,
+      fb_play_count:m.fb_play_count??null,
+      like_count:m.like_count??null, comment_count:m.comment_count??null,
+      pinned:pinnedKnown ? ((clipsPins||[]).length>0 || (timelinePins||[]).length>0) : null,
+      pinned_source:pinnedKnown ? 'ig_media_info_pin_lists' : null,
+      like_and_view_counts_disabled:m.like_and_view_counts_disabled??null
+    };
+  } catch(e) {
+    return {fetch_error:(e&&e.name)||'fetch_error'};
+  }
+}"""
+
+_SHORTCODE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+
+def _shortcode_to_media_id(shortcode):
+    """Instagram shortcode 的 base64-like 可逆整数编码（无需额外请求）。"""
+    code = str(shortcode or "").strip().strip("/")
+    if "/" in code:
+        code = code.split("/")[-1]
+    if not code or any(ch not in _SHORTCODE_ALPHABET for ch in code):
+        return None
+    value = 0
+    for ch in code:
+        value = value * 64 + _SHORTCODE_ALPHABET.index(ch)
+    return value
+
+
+def _normalize_media_metric(payload):
+    """把同源 media info 的有界响应归一为报价样本字段。"""
+    payload = payload or {}
+    status = payload.get("http_status")
+    if status != 200:
+        detail = (
+            f"api_http_{status}" if status is not None
+            else f"api_{payload.get('fetch_error') or 'failed'}"
+        )
+        return {
+            "play_count": None,
+            "play_count_status": detail,
+            "play_count_source": None,
+            "pinned": None,
+            "pinned_source": None,
+            "taken_at": None,
+        }
+
+    def _count(value):
+        try:
+            n = int(value)
+        except (TypeError, ValueError):
+            return None
+        return n if n >= 0 else None
+
+    ig_count = _count(payload.get("ig_play_count"))
+    total_count = _count(payload.get("total_play_count"))
+    fb_count = _count(payload.get("fb_play_count"))
+    # 客户报价口径只接受 Instagram 原生播放。play_count 可能混入 Facebook
+    # cross-post，故仅保留作审计，绝不能回退成报价样本。
+    chosen = ig_count
+    source = "ig_media_info.ig_play_count" if ig_count is not None else None
+    raw = (
+        f"ig={ig_count};total={total_count};fb={fb_count}"
+        if any(value is not None for value in (ig_count, total_count, fb_count))
+        else None
+    )
+    return {
+        "play_count": chosen,
+        "play_count_status": "observed" if chosen is not None else "ig_not_exposed",
+        "play_count_source": source,
+        "play_count_raw": raw,
+        "ig_play_count": ig_count,
+        "total_play_count": total_count,
+        "fb_play_count": fb_count,
+        "like_count": _count(payload.get("like_count")),
+        "comment_count": _count(payload.get("comment_count")),
+        "pinned": payload.get("pinned") if isinstance(payload.get("pinned"), bool) else None,
+        "pinned_source": payload.get("pinned_source"),
+        "taken_at": payload.get("taken_at"),
+        "like_and_view_counts_disabled": payload.get("like_and_view_counts_disabled"),
+    }
+
+
+def _fetch_reel_metric(pg, href):
+    shortcode = str(href or "").rstrip("/").split("/")[-1]
+    media_id = _shortcode_to_media_id(shortcode)
+    if media_id is None:
+        return _normalize_media_metric({"fetch_error": "invalid_shortcode"})
+    try:
+        return _normalize_media_metric(pg.evaluate(_IG_MEDIA_INFO_JS, str(media_id)))
+    except Exception as exc:  # noqa: BLE001
+        return _normalize_media_metric({"fetch_error": type(exc).__name__})
 
 # 直接抽评论 {用户名,原话} 配对（不 OCR、不截图）。2026-07 实测：IG 帖子页**无 <article>**，
 # 评论正文在 span[dir=auto]，与用户名链接是**兄弟节点**（旧代码在父链找正文→抽 0，dra.aliciapaola/
@@ -518,35 +688,384 @@ _COMMENTS_JS = r"""(owner) => {
 }"""
 
 
+_COMMENT_UI_NOISE_RE = re.compile(
+    r"^(?:"
+    r"liked by .+ and others|"
+    r"\d+\s+(?:seconds?|minutes?|hours?|days?|weeks?|months?|years?) ago|"
+    r"this reel has \d+ comments? from facebook\.?|"
+    r"hide all replies"
+    r")$",
+    re.IGNORECASE,
+)
+
+
+def _clean_comment_pairs(pairs, owner=None):
+    """二次清掉已在真实结果中观察到的 IG UI 文本，避免把 UI 当评论完成证据。"""
+    owner_key = str(owner or "").strip().lstrip("@").casefold()
+    out, seen = [], set()
+    for pair in pairs or []:
+        if not isinstance(pair, dict):
+            continue
+        username = str(pair.get("username") or "").strip().lstrip("@")
+        text = str(pair.get("text") or "").strip()
+        if (
+            not username
+            or not text
+            or username.casefold() == owner_key
+            or _COMMENT_UI_NOISE_RE.fullmatch(text)
+        ):
+            continue
+        key = (username.casefold(), text.casefold())
+        if key not in seen:
+            seen.add(key)
+            out.append({"username": username, "text": text[:240]})
+    return out
+
+
+def _comment_retry_needed(comment_count, paired_count):
+    """评论首抽不足时是否再加载一次。
+
+    正评论数或未知指标且首抽为 0，不能因为低于旧的 15 条阈值就直接失败；
+    已明确 0 评论仍由 deep_collect 在调用本函数前短路，不做无意义加载。
+    """
+    if paired_count == 0:
+        return comment_count != 0
+    return (
+        comment_count is not None
+        and comment_count >= 15
+        and paired_count < max(5, comment_count // 3)
+    )
+
+
+def _sample_comment_pairs(pg, owner, comment_count):
+    """加载并抽取一帖评论；返回 ``(pairs, attempts)``。
+
+    二次加载只提高真实评论出现的机会，不会把 ``comment_count>0`` 本身视为
+    完成证据；两次仍为空时调用方继续标记 ``comment_failed``。
+    """
+    _load_comments(pg, rounds=4)
+    paired = _clean_comment_pairs(
+        pg.evaluate(_COMMENTS_JS, owner) or [], owner
+    )
+    attempts = 1
+    if _comment_retry_needed(comment_count, len(paired)):
+        _load_comments(pg, rounds=3)
+        paired = _clean_comment_pairs(
+            pg.evaluate(_COMMENTS_JS, owner) or [], owner
+        )
+        attempts += 1
+    return paired, attempts
+
+
+def _media_identity(value):
+    """把相对/绝对、带 handle/不带 handle 的 IG 媒体 URL 归一为同一 identity。"""
+    raw = str(value or "").strip()
+    match = re.search(r"/(?:[^/?#]+/)?(reel|p)/([A-Za-z0-9_-]+)", raw)
+    if match:
+        return f"{match.group(1)}:{match.group(2)}"
+    return raw.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+
+
+def _comment_media_identity(value):
+    """评论重试按 shortcode 识别媒体；``/p/X`` 与 ``/reel/X`` 是同一帖子别名。"""
+    raw = str(value or "").strip()
+    match = re.search(
+        r"/(?:[^/?#]+/)?(?:reel|p)/([A-Za-z0-9_-]+)",
+        raw,
+    )
+    return match.group(1) if match else _media_identity(raw)
+
+
+def _comment_failure_identities(entries):
+    """把上一轮 ``comment_failed_posts`` 归一为媒体 identity 集合。"""
+    if isinstance(entries, (str, dict)):
+        entries = [entries]
+    if not isinstance(entries, (list, tuple, set)):
+        return set()
+    identities = set()
+    for entry in entries:
+        url = entry.get("url") if isinstance(entry, dict) else entry
+        identity = _comment_media_identity(url)
+        if identity:
+            identities.add(identity)
+    return identities
+
+
+def _merge_post_refs(*groups):
+    out, seen = [], set()
+    for group in groups:
+        for item in group or []:
+            if isinstance(item, str):
+                item = {"url": item, "pinned": None}
+            url = item.get("url") or item.get("code")
+            identity = _media_identity(url)
+            if not url or identity in seen:
+                continue
+            seen.add(identity)
+            out.append({"url": url, "pinned": item.get("pinned")})
+    return out
+
+
+def _refs_from_pricing_samples(samples, limit=10):
+    """把历史报价样本转换为最低优先级的深采 refs，保持样本顺序并按媒体去重。"""
+    refs = []
+    for sample in samples or []:
+        if not isinstance(sample, dict):
+            continue
+        url = sample.get("code") or sample.get("url")
+        if not url:
+            continue
+        refs.append({"url": url, "pinned": sample.get("pinned")})
+    return _merge_post_refs(refs)[:max(0, int(limit))]
+
+
+def _collect_profile_grid_refs(pg, handle, target_posts=10, max_scrolls=3):
+    """刷新主页主网格的当前帖子窗口（普通帖 + Reels，保持页面顺序）。
+
+    这是评论/ER 的“最近 N 帖”来源，和报价专用 Reels 专页严格分开。导航、登出或
+    多轮渲染后仍为空都视为刷新失败，由调用方决定是否回退历史 refs。
+    """
+    if not _goto(pg, f"https://www.instagram.com/{handle}/"):
+        return [], f"profile_grid_nav_failed:{LAST_NAV_ERR or 'unknown'}"
+    pg.wait_for_timeout(5000)
+    refs = []
+    wanted = max(1, int(target_posts))
+    for i in range(max_scrolls + 1):
+        grid = pg.evaluate(_GRID_JS)
+        if grid.get("logged_out"):
+            return [], "logged_out"
+        refs = _merge_post_refs(refs, grid.get("post_refs"))
+        if len(refs) >= wanted or i >= max_scrolls:
+            break
+        pg.mouse.wheel(0, 1200)
+        pg.wait_for_timeout(2200)
+    if not refs:
+        return [], "profile_grid_empty"
+    return refs[:wanted], None
+
+
+def _collect_grid_refs(pg, handle, min_non_pinned_reels=10, max_scrolls=8):
+    """从 Reels 专页收集候选引用；返回 (refs, error)。
+
+    不能使用主页主网格：创作者可把 Reel 从主网格移除，但它仍保留在 Reels 专页。
+    DOM 未见 pin marker 只算 unknown；最终 true/false 由 media-info pin lists 确认。
+    """
+    if not _goto(pg, f"https://www.instagram.com/{handle}/reels/"):
+        return [], f"grid_nav_failed:{LAST_NAV_ERR or 'unknown'}"
+    pg.wait_for_timeout(5000)
+    refs = []
+    for i in range(max_scrolls + 1):
+        g = pg.evaluate(_GRID_JS)
+        if g.get("logged_out"):
+            return refs, "logged_out"
+        refs = _merge_post_refs(refs, g.get("post_refs"))
+        usable = [
+            r for r in refs
+            if "/reel/" in r["url"] and r.get("pinned") is not True
+        ]
+        if len(usable) >= min_non_pinned_reels or i >= max_scrolls:
+            break
+        pg.mouse.wheel(0, 1500)
+        pg.wait_for_timeout(2200)
+    return refs, None
+
+
+def collect_pricing_evidence(pg, cand):
+    """独立采集展示型报价证据；不改评分/路由，也不要求重跑评论深采。
+
+    返回 ``(state, error)``。state 含刷新后的 refs/codes 与按 href 索引的媒体指标，
+    供完整 Stage 3 复用；同时直接写入 cand 的 pricing_* 字段，供历史候选价格补采。
+    """
+    from extensions.sop_v2 import pricing as pricing_mod
+
+    handle = cand.get("handle")
+    pricing_window = int(_CFG.get("pricing_estimate", {}).get("reels_window", 10))
+    # 始终重新打开 Reels 专页：①保证 media-info fetch 有 IG 同源上下文；②拿到真实
+    # Reels 顺序（不是可能缺 Reel 的主页主网格）；③多拿 3 条缓冲，剔除置顶后继续补足。
+    fresh_refs, grid_error = _collect_grid_refs(
+        pg, handle, min_non_pinned_reels=pricing_window + 3
+    )
+    if not fresh_refs and grid_error:
+        return None, grid_error
+    refs = _merge_post_refs(fresh_refs)
+
+    codes = [r["url"] for r in refs]
+    _pause(2, 4)
+
+    pricing_reels, pricing_metric_by_href, pricing_sample_by_href = [], {}, {}
+    eligible_pricing = metric_fail_streak = 0
+    for grid_rank, ref in enumerate(
+        [r for r in refs if "/reel/" in r["url"]]
+    ):
+        href = ref["url"]
+        purl = href if str(href).startswith("http") else f"https://www.instagram.com{href}"
+        sample = {
+            "code": href,
+            "url": purl,
+            "is_video": True,
+            "is_reel": True,
+            "pinned": ref.get("pinned"),
+            "pinned_source": "ig_profile_grid" if ref.get("pinned") is not None else None,
+            "grid_rank": grid_rank,
+            "captured_at": _now(),
+        }
+        if ref.get("pinned") is True:
+            sample.update({
+                "play_count": None,
+                "play_count_status": "skipped_pinned",
+                "play_count_source": None,
+                "taken_at": None,
+            })
+        else:
+            metric = _fetch_reel_metric(pg, href)
+            sample.update(metric)
+            if str(metric.get("play_count_status") or "").startswith("api_"):
+                metric_fail_streak += 1
+            else:
+                metric_fail_streak = 0
+        pricing_reels.append(sample)
+        pricing_metric_by_href[href] = sample
+        pricing_sample_by_href[href] = sample
+        if sample.get("pinned") is False and sample.get("play_count_status") == "observed":
+            eligible_pricing += 1
+        if eligible_pricing >= pricing_window or metric_fail_streak >= 3:
+            break
+        if ref.get("pinned") is not True:
+            _pause(0.6, 1.2)
+
+    cand["pricing_reel_samples"] = pricing_reels
+    cand["pricing_captured_at"] = _now()
+    cand["pricing_estimate"] = pricing_mod.derive_quote_estimate(cand, _CFG)
+    return {
+        "refs": refs,
+        "codes": codes,
+        "pricing_reels": pricing_reels,
+        "metric_by_href": pricing_metric_by_href,
+        "sample_by_href": pricing_sample_by_href,
+        "grid_error": grid_error,
+    }, None
+
+
 def deep_collect(pg, cand, ev_dir, n_posts=10):
-    """③深采：对已浅扫的 cand（含 codes/handle）开 N 帖 → 只在推广帖找购买意图评论+截图
-    + 帖子赞评算实算 ER。纯浏览器零 API。返回 (cand, evidence)；logged_out → (None, "logged_out")。"""
+    """③深采：打开目标帖子、逐帖读取赞评并采集评论，再派生意图与实算 ER。
+
+    ``comments_read`` 只保留为“深采函数执行过”的历史兼容字段；正式完整性由
+    ``deep_collection_status`` 及逐帖状态判断。已确认 0 评论属于完整证据；页面报告有
+    评论（或赞评指标整体未读到）却抽不到评论，首次必须换号重试。只有同一 URL
+    连续两轮都不可见、且本轮明确仅报告 1–2 条时，才以透明的 unavailable 终态收敛。
+    """
     from extensions.sop_v2 import comments as cmt_mod
+    from extensions.sop_v2 import pricing as pricing_mod
+
     handle = cand.get("handle")
     ev = []
     ev_dir.mkdir(parents=True, exist_ok=True)
-    codes = cand.get("codes") or []
-    if not codes:  # 缓存/种子无网格 → 现取一次
-        if not _goto(pg, f"https://www.instagram.com/{handle}/"):
-            return None, "grid_nav_failed"   # 导航失败=号问题，报错重试，绝不返回半成品 cand 静默进 collected
-        pg.wait_for_timeout(5000)
-        g = pg.evaluate(_GRID_JS)
-        if g.get("logged_out"):
-            return None, "logged_out"
-        for _ in range(3):
-            if g.get("codes"):
-                break
-            pg.mouse.wheel(0, 1200)
-            pg.wait_for_timeout(3500)
-            g = pg.evaluate(_GRID_JS)
-        codes = g.get("codes", [])
-    _pause(2, 4)
+    previous_comment_retry_ids = _comment_failure_identities(
+        cand.get("comment_failed_posts")
+    )
+    # 若整号因其他帖子仍 incomplete 而再次运行，已收敛的低量帖应保持终态；
+    # 显式 requeue 会清掉该字段，届时才从首轮重新计数。
+    previous_comment_retry_ids.update(
+        _comment_failure_identities(cand.get("comment_unavailable_posts"))
+    )
+    previous_pricing = {
+        key: copy.deepcopy(cand[key])
+        for key in (
+            "pricing_reel_samples",
+            "pricing_captured_at",
+            "pricing_estimate",
+        )
+        if key in cand
+    }
+
+    # 评论/ER 必须先刷新当前主页主网格；历史 stage_json 的 codes 可能已删除、失效或
+    # 不再属于最近窗口。只有主页刷新失败时才回退旧 refs。报价专用 Reels 专页仍与
+    # 此窗口分离，绝不能把“最近 N 帖”悄悄改成“最近 N 条 Reels”。
+    historical_primary_refs = _merge_post_refs(
+        cand.get("post_refs"),
+        [{"url": code, "pinned": None} for code in (cand.get("codes") or [])],
+    )
+    fresh_primary_refs, primary_refresh_error = _collect_profile_grid_refs(
+        pg, handle, target_posts=n_posts
+    )
+    if fresh_primary_refs:
+        primary_refs = fresh_primary_refs
+        cand["post_refs"] = [dict(ref) for ref in fresh_primary_refs]
+        cand["codes"] = [ref["url"] for ref in fresh_primary_refs]
+        cand.pop("primary_grid_refresh_error", None)
+        cand["primary_refs_source"] = "current_profile_grid"
+        cand.pop("primary_refs_fallback_reason", None)
+    else:
+        primary_refs = historical_primary_refs
+        cand["primary_grid_refresh_error"] = primary_refresh_error
+        if historical_primary_refs:
+            cand["primary_refs_source"] = "historical_primary_refs"
+            cand["primary_refs_fallback_reason"] = primary_refresh_error
+    pricing_state, pricing_error = collect_pricing_evidence(pg, cand)
+    if pricing_state is None:
+        cand["pricing_reel_samples"] = []
+        cand["pricing_captured_at"] = _now()
+        cand["pricing_estimate"] = pricing_mod.derive_quote_estimate(cand, _CFG)
+        cand["pricing_estimate"]["collection_error"] = pricing_error
+        pricing_state = {
+            "refs": [],
+            "codes": [],
+            "pricing_reels": [],
+            "metric_by_href": {},
+            "sample_by_href": {},
+        }
+    # 极少数候选没有主页 shortcode 时，才按层级使用 Reels 引用兜底核心深采：
+    # 本次报价 refs 优先；若它也为空，再用进入本轮前已有的报价样本。后者只作为
+    # 评论/ER 的访问窗口，previous_pricing 的完整证据对象不会被覆盖或改写。
+    if primary_refs:
+        refs = primary_refs
+    elif pricing_state["refs"]:
+        refs = pricing_state["refs"]
+        cand["primary_refs_source"] = "current_pricing_refs"
+        cand["primary_refs_fallback_reason"] = (
+            f"{primary_refresh_error or 'profile_grid_empty'};"
+            "historical_primary_refs_empty"
+        )
+    else:
+        refs = _refs_from_pricing_samples(
+            previous_pricing.get("pricing_reel_samples"), limit=n_posts
+        )
+        if refs:
+            cand["primary_refs_source"] = "existing_pricing_samples"
+            cand["primary_refs_fallback_reason"] = (
+                f"{primary_refresh_error or 'profile_grid_empty'};"
+                "historical_primary_refs_empty;current_pricing_refs_empty"
+            )
+            cand["post_refs"] = [dict(ref) for ref in refs]
+            cand["codes"] = [ref["url"] for ref in refs]
+        else:
+            cand["primary_refs_source"] = "unavailable"
+            cand["primary_refs_fallback_reason"] = (
+                f"{primary_refresh_error or 'profile_grid_empty'};"
+                "historical_primary_refs_empty;current_pricing_refs_empty;"
+                "existing_pricing_samples_empty"
+            )
+    codes = [ref["url"] for ref in refs]
 
     posts_meta, intent_posts, all_intent, promo_count = [], [], [], 0
+    pricing_reels = pricing_state["pricing_reels"]
+    pricing_metric_by_href = pricing_state["metric_by_href"]
+    pricing_sample_by_href = pricing_state["sample_by_href"]
     all_comments, seen_c = [], set()           # 累积评论样本（供 comments.analyze 算有效样本/信任分）
     nav_fails = 0                              # 连续帖子页导航失败数（限流探测）
-    for i, href in enumerate(codes[:n_posts]):
-        purl = f"https://www.instagram.com{href}"
+    failed_post_urls = []
+    metric_missing_urls = []
+    comment_failed_urls = []
+    comment_unavailable_posts = []
+    comment_attempted_posts = 0
+    comment_completed_posts = 0
+    comments_cfg = _CFG.get("comments", {})
+    per_post_max = max(1, int(comments_cfg.get("per_post_max", 10)))
+    primary_hrefs = codes[:n_posts]
+    # 额外报价 Reels 已由同源详情接口读取，无需逐条导航；页面深采仍只跑原来的前 N 帖窗口。
+    visit_hrefs = list(dict.fromkeys(primary_hrefs))
+    for i, href in enumerate(visit_hrefs):
+        purl = href if str(href).startswith("http") else f"https://www.instagram.com{href}"
         if not _goto(pg, purl):
             # 实测：隧道出口 IP 在高频翻帖下被限流，表现为帖子页连续导航失败。
             # 旧行为是傻等着挨个超时(45s×2/帖)、10 帖全废还静默产出空 cand（18% 的号中招）。
@@ -556,28 +1075,121 @@ def deep_collect(pg, cand, ev_dir, n_posts=10):
             # → **新出口 IP**。这才是真正的"换 IP 退避"。
             nav_fails += 1
             if nav_fails >= 3 and not posts_meta:
-                return None, "proxy_throttled"   # → stage3 判 error → _base 关 ctx 换号换 IP
+                # → stage3 判 error → _base 关 ctx 换号换 IP
+                return None, f"proxy_throttled:{LAST_NAV_ERR or 'unknown'}"
+            failed_post_urls.append(purl)
             continue
         nav_fails = 0
         pg.wait_for_timeout(3000)
-        info = pg.evaluate(_DEEP_READ_JS)
+        shortcode = href.rstrip("/").split("/")[-1]
+        info = pg.evaluate(_DEEP_READ_JS, shortcode)
         likes, comments, caption = _post_stats(info.get("caption", ""))   # 赞/评/干净caption(算实算ER)
-        posts_meta.append({"code": href, "caption": caption, "is_video": info.get("video"),
-                           "like_count": likes, "comment_count": comments})
+        ref = next((r for r in refs if r["url"] == href), {"pinned": None})
+        metric = pricing_metric_by_href.get(href) or {}
+        if likes is None or comments is None:
+            # OG 元标签会因地区/页面版本缺赞评；同源 media-info 对普通帖与 Reels 都可用。
+            # 只在缺字段时补一次，避免已拿到 DOM 指标时增加请求。
+            engagement_metric = (
+                metric
+                if metric.get("like_count") is not None
+                or metric.get("comment_count") is not None
+                else _fetch_reel_metric(pg, href)
+            )
+            if likes is None:
+                likes = engagement_metric.get("like_count")
+            if comments is None:
+                comments = engagement_metric.get("comment_count")
+        pinned = metric.get("pinned")
+        if not isinstance(pinned, bool):
+            pinned = ref.get("pinned")
+        post_meta = {
+            "code": href,
+            "url": purl,
+            "caption": caption,
+            # 历史 og:video 在真实数据上恒 false；/reel/ 路径才是稳定 Reel 标记。
+            "is_video": "/reel/" in href or bool(info.get("video")),
+            "is_reel": "/reel/" in href,
+            "like_count": likes,
+            "comment_count": comments,
+            "play_count": metric.get("play_count"),
+            "play_count_status": metric.get("play_count_status") or (
+                "not_collected" if "/reel/" in href else "not_applicable"
+            ),
+            "play_count_source": metric.get("play_count_source"),
+            "play_count_raw": metric.get("play_count_raw"),
+            "ig_play_count": metric.get("ig_play_count"),
+            "total_play_count": metric.get("total_play_count"),
+            "fb_play_count": metric.get("fb_play_count"),
+            "taken_at": metric.get("taken_at") or info.get("taken_at"),
+            "pinned": pinned,
+            "pinned_source": metric.get("pinned_source") or (
+                "ig_profile_grid" if ref.get("pinned") is not None else None
+            ),
+            "captured_at": _now(),
+        }
+        if likes is None or comments is None:
+            metric_missing_urls.append(purl)
+            post_meta["metrics_status"] = "missing"
+        else:
+            post_meta["metrics_status"] = "observed"
+        if href in primary_hrefs:
+            posts_meta.append(post_meta)
+        if href in pricing_sample_by_href:
+            pricing_sample_by_href[href].update({
+                "caption": caption,
+                "like_count": likes,
+                "comment_count": comments,
+                "taken_at": post_meta.get("taken_at"),
+            })
         is_promo = cmt_mod.is_promotional(caption)
         if is_promo:
             promo_count += 1
-        # 采评论的帖：推广帖 或 高评论帖（购买意图常出现在高互动帖，不只带货词帖）
-        if not (is_promo or (comments or 0) >= 15):
+        # 完整交付必须逐帖核验评论，不能再把“非推广/低评论”直接视作已经读过。
+        # 已明确为 0 条的帖子无需展开，但要留下“已核实无评论”状态；其余帖子都尝试采样。
+        if comments == 0:
+            post_meta["comment_sampling_status"] = "verified_zero"
+            post_meta["comments_collected"] = 0
+            comment_completed_posts += 1
             _pause(1.5, 3)
             continue
-        _load_comments(pg, rounds=4)
-        # 直接抽 {用户名,原话} 配对（owner=帖主，排除其 caption；不 OCR、不截图）
-        paired = pg.evaluate(_COMMENTS_JS, handle) or []
-        # 自检：og 显示评论多但抽得少 → 评论区没完全展开，再加载一轮重抽（防"抽 0/抽少"）
-        if (comments or 0) >= 15 and len(paired) < max(5, (comments or 0) // 3):
-            _load_comments(pg, rounds=3)
-            paired = pg.evaluate(_COMMENTS_JS, handle) or []
+        comment_attempted_posts += 1
+        # 直接抽 {用户名,原话} 配对（owner=帖主，排除其 caption；不 OCR、不截图）。
+        # 正评论数/未知指标若首抽为 0，无论是否达到 15 条都再加载一次。
+        paired, sampling_attempts = _sample_comment_pairs(
+            pg, handle, comments
+        )
+        paired = paired[:per_post_max]
+        post_meta["comment_sampling_attempts"] = sampling_attempts
+        post_meta["comments_collected"] = len(paired)
+        if paired:
+            post_meta["comment_sampling_status"] = "collected"
+            comment_completed_posts += 1
+        else:
+            repeated_low_unavailable = (
+                comments in (1, 2)
+                and _comment_media_identity(purl) in previous_comment_retry_ids
+            )
+            if repeated_low_unavailable:
+                post_meta["comment_sampling_status"] = (
+                    "unavailable_after_retry"
+                )
+                comment_completed_posts += 1
+                comment_unavailable_posts.append(
+                    {
+                        "url": purl,
+                        "reported_count": comments,
+                        "reason": (
+                            "reported_low_count_unavailable_after_retry"
+                        ),
+                    }
+                )
+            else:
+                post_meta["comment_sampling_status"] = (
+                    "failed_unknown_metrics"
+                    if comments is None
+                    else "failed_reported_comments"
+                )
+                comment_failed_urls.append(purl)
         for c in paired:
             k = (c.get("username", "") + "|" + (c.get("text") or "")[:24]).lower()
             if c.get("text") and k not in seen_c:
@@ -620,17 +1232,73 @@ def deep_collect(pg, cand, ev_dir, n_posts=10):
     cand["high_intent_ratio"] = (round(cand["high_intent_count"] / analysis["valid_comments"] * 100, 1)
                                  if analysis["valid_comments"] else None)
     cand["sampled_posts"] = posts_meta
+    expected_posts = min(max(0, int(n_posts)), len(visit_hrefs))
+    cand["deep_target_posts"] = max(0, int(n_posts))
+    cand["deep_available_posts"] = len(visit_hrefs)
+    cand["deep_successful_posts"] = len(posts_meta)
+    cand["deep_failed_posts"] = failed_post_urls
+    cand["deep_metric_missing_posts"] = metric_missing_urls
+    cand["comment_attempted_posts"] = comment_attempted_posts
+    cand["comment_completed_posts"] = comment_completed_posts
+    cand["comment_failed_posts"] = comment_failed_urls
+    cand["comment_unavailable_posts"] = comment_unavailable_posts
+    cand["deep_collection_status"] = (
+        "complete"
+        if (
+            expected_posts > 0
+            and len(posts_meta) == expected_posts
+            and not failed_post_urls
+            and not metric_missing_urls
+            and not comment_failed_urls
+        )
+        else "incomplete"
+    )
+    cand["pricing_reel_samples"] = pricing_reels
+    cand["pricing_captured_at"] = _now()
+    cand["pricing_estimate"] = pricing_mod.derive_quote_estimate(cand, _CFG)
+    if pricing_error:
+        cand["pricing_estimate"]["collection_error"] = pricing_error
+    # 评论/ER 重采不得让原本完整的报价证据倒退成 partial/missing。新证据只有质量不低于
+    # 旧证据时才替换；相同完整度时保留更新鲜的一次。
+    old_estimate = previous_pricing.get("pricing_estimate")
+    new_estimate = cand.get("pricing_estimate")
+    if _pricing_evidence_rank(old_estimate) > _pricing_evidence_rank(new_estimate):
+        for key in (
+            "pricing_reel_samples",
+            "pricing_captured_at",
+            "pricing_estimate",
+        ):
+            if key in previous_pricing:
+                cand[key] = previous_pricing[key]
+            else:
+                cand.pop(key, None)
     cand["evidence_dir"] = str(ev_dir.relative_to(ROOT))
     # 内容信号（赞助/导购/成分词 + 实算 ER，从帖子赞评/caption 派生）
     cand["posts"] = [{"caption_text": p["caption"], "media_type": 2 if p["is_video"] else 1,
                       "like_count": p.get("like_count"), "comment_count": p.get("comment_count"),
-                      "play_count": 0} for p in posts_meta]
+                      "play_count": p.get("play_count"), "pinned": p.get("pinned"),
+                      "taken_at": p.get("taken_at")} for p in posts_meta]
     cand.update(content_mod.derive_content_signals(cand, _CFG))
     cand.pop("posts", None)
     caps = " ".join(p.get("caption", "") for p in posts_meta)
     cand["core_niche_key"] = content_mod.derive_niche(cand.get("biography"), cand.get("full_name"), caps)
     _cache_save(cand)   # 浅扫字段回写（stage3 另经 creator_cache.advance 写 stage_json）
     return cand, ev
+
+
+def _pricing_evidence_rank(estimate):
+    """报价证据单调等级；原生样本优先于第三方和 missing。"""
+    if not isinstance(estimate, dict):
+        return (0, 0)
+    status = estimate.get("status")
+    sample = int(estimate.get("sample_count") or 0)
+    order = {
+        "missing": 1,
+        "fallback_modash": 2,
+        "partial": 3,
+        "complete": 4,
+    }
+    return (order.get(status, 0), sample)
 
 
 def _cache_save(cand):
@@ -648,27 +1316,21 @@ _SHOP_RANK = {"Amazon": 0, "LTK": 1, "ShopMy": 2, "自营店": 3, "链接聚合"
 
 
 def _shop_type(u: str):
-    """把一条链接分类成橱窗类型；社交/内容链返回 None（不算橱窗）。"""
-    l = (u or "").lower()
-    if any(a in l for a in AMAZON):
-        return "Amazon"
-    if any(k in l for k in ("liketoknow", "ltk.app", "shopltk", "ltk.to", "/ltk")):
-        return "LTK"
-    if "shopmy" in l:
-        return "ShopMy"
-    if any(g in l for g in AGG):
-        return "链接聚合"
-    if any(s in l for s in _SOCIAL):
-        return None
-    if re.search(r"/shop|/store|storefront|myshopify|bigcartel|\.store\b|boutique", l):
-        return "自营店"
-    return "自营店"     # 剩下的非社交外链，多半是个人店/官网 → 当自营橱窗展示（客户口径：有什么放什么）
+    """把一条链接分类成认可橱窗；普通官网/日历/社交链接不冒充自营店。"""
+    return storefront_mod.classify_url(u)
 
 
 def _resolve_storefront(cand, pg):
-    """判 storefront（零 API）。Amazon 优先（confirmed_yes 供硬门槛/优先级）；**客户 2026-07-17：
-    Amazon 没有就有什么橱窗放什么**——LTK / ShopMy / 自营店 / 聚合链都抓出来存 storefront_url+type，
-    交付表照实展示，不再一个"未确认"了事。"""
+    """判通用 Storefront（零 API）。
+
+    客户 2026-07-17 口径：Amazon 没有就有什么橱窗放什么。Amazon / LTK / ShopMy /
+    明确自营店 / 已识别购物聚合入口均为 ``confirmed_yes``；普通网页不冒充店铺。
+    聚合页会优先穿透寻找更具体的 Amazon/购物链接，但穿透失败不能把已识别的聚合入口
+    降级成 ``confirmed_no``。
+    """
+    for key in ("storefront_status", "storefront_url", "storefront_type",
+                "amazon_storefront_link"):
+        cand.pop(key, None)
     ext = cand.get("external_url")
     links = [ext] if ext else []
     if cand.get("_bio_has_more"):        # "and N more"：点开弹层拿隐藏链接
@@ -683,47 +1345,57 @@ def _resolve_storefront(cand, pg):
             all_links.append(u)
     cand["bio_links"] = all_links
 
-    def _set_other_storefront():
-        # 非 Amazon：挑最像橱窗的一条（LTK>ShopMy>自营>聚合），存下来照实展示
+    def _best_storefront(urls):
         best, bt = None, None
-        for u in all_links:
+        for u in urls:
             t = _shop_type(u)
-            if t and t != "Amazon" and (bt is None or _SHOP_RANK.get(t, 9) < _SHOP_RANK.get(bt, 9)):
+            if t and (bt is None or _SHOP_RANK.get(t, 9) < _SHOP_RANK.get(bt, 9)):
                 best, bt = u, t
-        if best:
-            cand["storefront_url"] = best
-            cand["storefront_type"] = bt
+        return best, bt
+
+    def _set_storefront(url, kind):
+        cand["storefront_status"] = "confirmed_yes"
+        cand["storefront_url"] = url
+        cand["storefront_type"] = kind
+        if kind == "Amazon":
+            cand["amazon_storefront_link"] = url
 
     if not all_links:
         cand["storefront_status"] = "unknown"     # 没抓到外链 ≠ 没橱窗 → 交 Review，不误杀
         return
-    # 1) 任意直链 Amazon
-    for u in all_links:
-        if any(a in u.lower() for a in AMAZON):
-            cand["storefront_status"] = "confirmed_yes"
-            cand["amazon_storefront_link"] = u
-            cand["storefront_url"] = u
-            cand["storefront_type"] = "Amazon"
+    # 1) 直链里优先 Amazon；其次 LTK / ShopMy / 自营店。
+    best, best_type = _best_storefront(all_links)
+    if best_type == "Amazon":
+        _set_storefront(best, best_type)
+        return
+    if best_type and best_type != "链接聚合":
+        _set_storefront(best, best_type)
+        return
+
+    # 2) 通用聚合入口逐个穿透，优先保存更具体的购物目的地。
+    aggregators = [u for u in all_links if _shop_type(u) == "链接聚合"]
+    for u in aggregators:
+        if not _goto(pg, u):
+            continue
+        pg.wait_for_timeout(4000)
+        try:
+            hrefs = pg.evaluate(
+                "() => [...document.querySelectorAll('a[href]')].map(a => a.href)"
+            ) or []
+        except Exception:  # noqa: BLE001
+            hrefs = []
+        target, target_type = _best_storefront(
+            [h for h in hrefs if _shop_type(h) != "链接聚合"]
+        )
+        if target_type:
+            _set_storefront(target, target_type)
             return
-    # 2) 聚合链逐个穿透找 Amazon
-    penetrated = False
-    for u in all_links:
-        if any(g in u.lower() for g in AGG):
-            penetrated = True
-            if _goto(pg, u):
-                pg.wait_for_timeout(4000)
-                amz = pg.evaluate(r"""() => { const hs=[...document.querySelectorAll('a[href]')].map(a=>a.href);
-                  const shop=hs.find(h=>/amazon\.[a-z.]+\/(shop|storefront)/i.test(h));
-                  const any=hs.find(h=>/amazon\.|amzn\.to/i.test(h)); return shop||any||null; }""")
-                if amz:
-                    cand["storefront_status"] = "confirmed_yes"
-                    cand["amazon_storefront_link"] = amz
-                    cand["storefront_url"] = amz
-                    cand["storefront_type"] = "Amazon"
-                    return
-    # 3) 无 Amazon：有什么橱窗放什么（LTK/ShopMy/自营/聚合），并按是否穿透过定 status
-    _set_other_storefront()
-    cand["storefront_status"] = "confirmed_no" if penetrated else "unknown"
+
+    # 3) 已识别的购物聚合入口本身也按客户口径保留为橱窗；普通未知网页只记 unknown。
+    if best_type == "链接聚合":
+        _set_storefront(best, best_type)
+        return
+    cand["storefront_status"] = "unknown"
 
 
 def _to_int(s):

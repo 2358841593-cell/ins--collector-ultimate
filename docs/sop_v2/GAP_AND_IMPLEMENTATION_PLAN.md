@@ -2,6 +2,11 @@
 
 来源文档：`Instagram红人筛选SOP标准确认书_客户版.docx`（Client-Facing V2.0，2026-07-13）。
 
+> 本文件记录 2026-07-14 的差距与演进方案，不是当前运行事实。当前主线见
+> [`PIPELINE_SPEC.md`](PIPELINE_SPEC.md)。2026-07-28 已统一：Storefront 为通用电商
+> 三态，不限 Amazon；`confirmed_no` 不早淘汰；展示估价按最近 10 条非置顶 Reels
+> 均播 × CPM $35–$40/1000，只展示、不写 `paid_cpm`、不参与评分路由。
+
 ## 1. 结论
 
 V2 可在现有项目基础上实现。现有六阶段主管道、Instagram 回扫、评论分析、水军库、Storefront 浏览器核验、SQLite、XLSX/HTML 输出和账号池都保留，不替换已经实跑验证的主骨架。
@@ -12,7 +17,8 @@ V2 可在现有项目基础上实现。现有六阶段主管道、Instagram 回�
 
 ## 2. 在现有主管道上必须增量调整的逻辑
 
-1. 删除“无 Amazon Storefront 立即 Exclude”。改为 `Include-With-Storefront` 和 `Include-Without-Storefront` 双轨；状态未知才进 Review。
+1. 删除“无 Amazon Storefront 立即 Exclude”。通用电商 Storefront（Amazon/LTK/ShopMy/
+   自营店/购物聚合）与确认无 Storefront 都继续采集；最终分 With/Without 双轨，状态未知才 Review。
 2. 停止在 profile 阶段因无 Storefront 跳过 posts 回扫，否则 Without-Storefront 候选永远无法评分。
 3. 单一 10K-150K 粉丝门槛拆成 Paid/Gifting 两条轨道。
 4. 保留旧评分用于对照，新增 A-F 六模块 100 分与 N/A 归一化；完成回归验证后再切换客户交付口径。
@@ -33,6 +39,7 @@ V2 可在现有项目基础上实现。现有六阶段主管道、Instagram 回�
 | Raw Skin/VO 人工证据 | 输出中预留，主管道未实现 | 建立 manual evidence JSON/XLSX 回写合同 |
 | 评论双条件 | 有意图比例，无“≥5条且≥15%” | 更新采样和评分，有效样本 <20 固定 Review |
 | Paid CPM | 无 | 新增实际 USD 报价、非置顶近 10 Reels 均播和边界 gate |
+| 展示型预估报价 | 无 | 独立派生均播×$35（区间$35–$40）/1000；与实际 Paid CPM、评分和路由隔离 |
 | 100 分 + AI Score | 旧加权分 | 新增 normalized total、N/A 分母和 9.5 特殊封顶 |
 | 五池交付 | 候选/证据/排除/说明 | 改为五决策池 + Evidence/Data Dictionary/Summary 辅助表 |
 | Herman 反馈回流 | 无 | 保留两个空列，提供 feedback import 命令 |

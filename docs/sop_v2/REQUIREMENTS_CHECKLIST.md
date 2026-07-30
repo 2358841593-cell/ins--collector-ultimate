@@ -1,10 +1,11 @@
 # Instagram 红人筛选 SOP V2 需求追踪与操作清单
 
-版本：Baseline 1.0
+版本：Baseline 1.1
 
-日期：2026-07-14
+日期：2026-07-28
 
-规则源：`Instagram红人筛选SOP标准确认书_客户版.docx`
+规则源：`Instagram红人筛选SOP标准确认书_客户版.docx`，以及客户
+2026-07-28 对通用 Storefront 和展示型预估报价的补充确认。
 用途：作为后续开发、测试、批次执行和客户验收的唯一逐项清单。
 
 ## 1. 状态说明
@@ -14,6 +15,7 @@
 - `TODO`：需新开发。
 - `MANUAL`：客户确认必须人工判断或回填。
 - `EXTERNAL`：需从 Modash、实际报价或第三方页面取数。
+- `DEFERRED`：规则保留，但当前批次明确不参与评分或路由。
 
 ## 2. 需求—实现—验收追踪表
 
@@ -72,7 +74,7 @@
 | GATE-08 | 赞助比例 | `<30%` 通过；30%-40% Review；>40% Exclude | 30%/40% Review；40.01% Exclude | PARTIAL |
 | GATE-09 | SHEIN/Temu 合作 | 近 12 月+可见历史任意真实合作命中 Exclude | 普通提及不淘汰；合作语境淘汰 | TODO |
 | GATE-10 | 明显品牌/官方号 | 非个人 creator Exclude | 保留命中证据 | EXISTING/PARTIAL |
-| GATE-11 | Storefront | 有/无均可 Include；状态未知 Review | 无 Storefront 不再被硬淘汰 | TODO |
+| GATE-11 | 通用电商 Storefront | Amazon/LTK/ShopMy/明确自营店/已识别购物聚合入口均算有；确认无也可 Include；未知 Review | `confirmed_no` 不早淘汰；非 Amazon 入口不降成无；未知不伪装成无 | EXISTING |
 | GATE-12 | 图谱边界 | 图谱候选未经完整审计最高 Review | 不得由 graph 直接路由 Include | TODO |
 
 ### E. A 模块—内容赛道 15 分
@@ -112,7 +114,7 @@
 
 | ID | 子项 | 规则 | 验收 | 状态 |
 |---|---|---|---|---|
-| SCORE-D1 | Storefront 可确认 4 | 有=4；确认无=2；未知 Review | 有/无均可最终 Include | PARTIAL |
+| SCORE-D1 | Storefront 可确认 4 | 任意认可电商入口=4；确认无=2；未知 Review | Amazon 不是白名单；有/无均可最终 Include | EXISTING/PARTIAL |
 | SCORE-D2 | Storefront 成熟度 4 | 有且近 3 个月更新=4；较旧=2；无则 N/A | 不要求商品数/分类数 | TODO/EXTERNAL |
 | SCORE-D3 | LTK/聚合页 | 人工点到可确认状态；仍未知 Review | 保留访问链和截图 | PARTIAL/MANUAL |
 | SCORE-D4 | 赞助健康度 3 | <30%=3；30-40%=1+Review；>40% Exclude | 与 GATE-08 一致 | PARTIAL |
@@ -132,14 +134,29 @@
 
 | ID | 子项 | 规则 | 验收 | 状态 |
 |---|---|---|---|---|
-| SCORE-F1 | Paid CPM 8 | ≤$35=8；>$35 且≤$40 Review/中档；>$40 Exclude | 35/40 边界测试 | TODO/MANUAL |
-| SCORE-F2 | CPM 公式 | 实际 USD 报价 ÷ 总原生曝光 ×1000 | 不用估算报价作确认值 | TODO |
-| SCORE-F3 | 曝光口径 | 非置顶近 10 条 Reels 平均播放；缺失才用 Modash 均播 | 保留 10 条帖子明细 | TODO |
-| SCORE-F4 | Gifting | 费用记 0，不计算零 CPM，不因此加分 | 不出现 CPM=0 高分 | TODO |
-| SCORE-F5 | 预算层级 3 | track、报价、粉丝档匹配 | 规则可配置 | TODO |
-| SCORE-F6 | 联系方式 2 | email/form=2；仅 DM=1；无=0 | 不发送，只记录可用性 | TODO |
-| SCORE-F7 | 合作风险 2 | 无禁用品牌/竞品冲突/争议=2；不明 Review | 人工证据+时间 | TODO/MANUAL |
-| SCORE-F8 | 缺实际报价 | Paid 固定 Review | 高分不得覆盖 | TODO |
+| SCORE-F1 | Paid CPM 8 | 未来恢复时：≤$35=8；>$35 且≤$40 Review/中档；>$40 Exclude | 必须用实际报价；展示估价不得触发边界 | DEFERRED/MANUAL |
+| SCORE-F2 | CPM 公式 | 实际 USD 报价 ÷ 总原生曝光 ×1000 | 不用展示估价作确认值 | DEFERRED |
+| SCORE-F3 | 曝光口径 | 非置顶近 10 条 Reels 平均播放；缺失才用 Modash 均播 | 保留 10 条帖子明细 | DEFERRED |
+| SCORE-F4 | Gifting | 费用记 0，不计算零 CPM，不因此加分 | 不出现 CPM=0 高分 | DEFERRED |
+| SCORE-F5 | 预算层级 3 | track、报价、粉丝档匹配 | 规则可配置 | DEFERRED |
+| SCORE-F6 | 联系方式 2 | email/form=2；仅 DM=1；无=0 | 不发送，只记录可用性 | DEFERRED |
+| SCORE-F7 | 合作风险 2 | 无禁用品牌/竞品冲突/争议=2；不明 Review | 人工证据+时间 | DEFERRED/MANUAL |
+| SCORE-F8 | 缺实际报价 | 仅在未来恢复 F 时决定是否固定 Review；当前不固定 Review | 当前缺实际报价不改变路由 | DEFERRED |
+
+> 当前批次 `[scoring.F].defer_this_round=true`，所以上述 F1–F8 是保留的“实际报价/实际
+> Paid CPM”规格，状态视为 DEFERRED。展示型预估报价不是其替代输入，不能恢复 F 分或
+> 触发实际 CPM 的 $35/$40 Gate。
+
+### J.1 展示型预估报价（交付字段，不计分）
+
+| ID | 需求 | 规则 | 验收 | 状态 |
+|---|---|---|---|---|
+| PRICE-01 | 原生曝光窗口 | 登录态浏览器会话读取 Instagram 同源 media info；先排除所有置顶 Reels，再从其余 Reels 按发布时间倒序取最近 10 条 | 置顶不得占用 10 条窗口；保留每条 URL/时间/播放量/置顶状态 | EXISTING/PARTIAL |
+| PRICE-02 | 平均播放量 | `Σ合格 ig_play_count / sample_count` | 只用 IG 原生播放；总 `play_count`/`fb_play_count` 仅审计、不得抬价；缺失不填 0，去重后计算 | EXISTING/PARTIAL |
+| PRICE-03 | 默认预估报价 | `average_plays × $35 / 1000` | 1,000 均播=$35；10,000 均播=$350 | EXISTING/PARTIAL |
+| PRICE-04 | 预估区间 | `average_plays × $35–$40 / 1000` | 10,000 均播显示 $350–$400 | EXISTING/PARTIAL |
+| PRICE-05 | 完整性状态 | 10 条=`complete`；1–9 条=`partial`；无原生样本但有 Modash 均播=`fallback_modash`；都没有=`missing` | 样本数、来源、置顶排除数和状态同时展示；降级状态不得伪装为完整窗口 | EXISTING/PARTIAL |
+| PRICE-06 | 决策隔离 | 预估只展示，不是实际报价 | 不写 `paid_cpm`；派生前后 Gate/F 分/fixed Review/final_pool 完全一致 | EXISTING/PARTIAL |
 
 ### K. 总分、AI Score 与五池
 
@@ -153,7 +170,7 @@
 | ROUTE-02 | Priority Review | 6.5-<7.5，或高潜但有固定待补项 | 显示 Missing Data 和补数动作 | TODO |
 | ROUTE-03 | Review | 5.0-<6.5，或专项证据缺失 | 不进触达名单 | TODO |
 | ROUTE-04 | Exclude | <5.0 或任一硬红线 | 保留原因和证据 | TODO |
-| ROUTE-05 | 固定 Review 优先 | Modash 核心缺失、Storefront 未知、评论不足、Raw Skin/VO 未核验、Paid 缺报价 | 高分不能自动提升 | TODO |
+| ROUTE-05 | 固定 Review 优先 | Modash 核心缺失、Storefront 未知、评论不足、目标受众低于 35%、语言不满足 | 展示估价 partial/fallback/missing 不新增 Review；高分不能覆盖现有固定项 | EXISTING/PARTIAL |
 
 ### L. 交付、证据、数据库和反馈
 
@@ -167,6 +184,7 @@
 | DEL-06 | High-Intent Snippets | 1-2 条英文原话 | 带对应帖子 URL | PARTIAL |
 | DEL-07 | 原始/标准化 Modash 值 | 字段证据展开 | 可审计 | TODO |
 | DEL-08 | XLSX 可作最终交付 | 默认不强制 Google Sheet | 客户可直接打开与筛选 | EXISTING/PARTIAL |
+| DEL-09 | 展示型预估报价 | 默认值、$35–$40 区间、均播、样本数、来源和状态 | JSON/XLSX/HTML 明示“估算，非实际报价”；missing 留空 | EXISTING/PARTIAL |
 | DB-01 | 完整候选快照 | 字段、gate、score、route、evidence 入库 | 可重现当次决策 | PARTIAL |
 | DB-02 | 批次 manifest | SOP 版本、config/source SHA-256、采集参数 | 同 raw+config 重跑结果一致 | TODO |
 | DB-03 | 证据索引 | 截图/PDF/URL/时间/字段映射 | 找得到每个放行/淘汰证据 | TODO |
@@ -195,7 +213,7 @@
 - [ ] 去重并保留所有 discovery source。
 - [ ] 采集 profile、bio links、近 30 帖索引。
 - [ ] 先过私密账号、粉丝区间、品牌号等 Instagram 可判红线。
-- [ ] 不因无 Storefront 跳过内容回扫。
+- [ ] 不因 `confirmed_no` 跳过内容回扫；不得把 Storefront 限定为 Amazon。
 - [ ] 不为已命中硬红线的候选消耗 Modash 查询。
 
 ### 阶段 2：内容、赞助和评论审计
@@ -210,8 +228,9 @@
 
 ### 阶段 3：Storefront 和人工内容证据
 
-- [ ] 真浏览器核验 bio/Linktree/Beacons/LTK/Amazon 状态。
+- [ ] 真浏览器核验 bio 中的 Amazon、LTK、ShopMy、自营店和购物聚合入口。
 - [ ] 将 Storefront 标记为 confirmed_yes / confirmed_no / unknown。
+- [ ] 非 Amazon 的有效电商入口仍记 confirmed_yes；确认无也继续，unknown 才 Review。
 - [ ] 有 Storefront 时检查近 3 个月活跃度；页面不暴露则记 Missing。
 - [ ] 人工核验近 30 帖 Raw Skin，至少保留 2 条证据。
 - [ ] 人工确认 VO 并保留 URL/截图/时间。
@@ -228,8 +247,11 @@
 
 ### 阶段 5：报价和合作风险
 
+- [ ] 先排除置顶 Reels，再从剩余 Reels 取最近 10 条，不能先取 10 条再删置顶。
+- [ ] 计算展示均播、默认报价 `均播×35/1000` 和区间 `均播×35–40/1000`。
+- [ ] 标明 `complete/partial/fallback_modash/missing`、样本数、来源和置顶排除数。
+- [ ] 确认展示预估未写入 `paid_cpm`，且没有改变 Gate、F 分或五池。
 - [ ] Paid 仅接受红人/代理的实际 USD 报价。
-- [ ] 排除置顶帖，计算近 10 Reels 平均播放。
 - [ ] 计算 Paid CPM 并过 $35/$40 边界。
 - [ ] Gifting 记 0 成本但不计 CPM。
 - [ ] 记录联系方式可用性，不发送消息。
@@ -252,6 +274,7 @@
 - [ ] 检查所有 Evidence Link 可访问且无凭证。
 - [ ] 生成五池 XLSX、Evidence Index、Summary 和 Data Dictionary。
 - [ ] 生成自包含 HTML 审计报告。
+- [ ] JSON/XLSX/HTML 的预估报价均显示默认值、区间、样本/来源状态和“非实际报价”提示。
 - [ ] 生成 manifest JSON 和证据索引。
 - [ ] 确认 Herman Approval/Feedback 为可编辑空列。
 - [ ] 交付包不含 secrets、session、Cookie、Token 和原始日志。

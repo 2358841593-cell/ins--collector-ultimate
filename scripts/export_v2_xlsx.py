@@ -2,7 +2,7 @@
 """五池 XLSX 业务交付导出（专业可读版）。
 
 对齐客户 SOP §8 字段；以"购买意向评论证据"为重点（客户核心诉求）；可点真实链接
-（IG 主页 / Amazon 橱窗）；评论区截图嵌入证据 sheet 并内链跳转。
+（IG 主页 / 电商橱窗）；评论区截图嵌入证据 sheet 并内链跳转。
 风格：色标验收建议 + 隔行底纹 + 合理行高列宽 + 冻结窗格 + 自动筛选，专业可读。
 """
 from __future__ import annotations
@@ -14,6 +14,8 @@ from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+from export_v2_comment_status import comment_collection_complete
+from extensions.sop_v2 import storefront as storefront_mod
 POOLS = ["Include-With-Storefront", "Include-Without-Storefront",
          "Priority-Review", "Review", "Exclude"]
 MISSING = "缺失"
@@ -40,10 +42,15 @@ COLS = [
     ("赛道", "niche", 11, False),
     ("购买意向评论（原话）", "intent_snippet", 40, True),
     ("评论证据", "comment_ev", 10, False),
-    ("Amazon 橱窗", "storefront_link", 14, False),
+    ("电商橱窗 / 购物入口", "storefront_link", 20, False),
     ("赞助占比", "sponsorship", 9, False),
     ("Fake%（Modash）", "fake", 12, False),
     ("ER 对照", "er_compare", 20, True),
+    ("非置顶 Reels 样本", "pricing_sample", 13, False),
+    ("近 10 条非置顶 Reels 均播", "pricing_avg", 17, False),
+    ("预估报价 USD（CPM 35）", "pricing_quote", 17, False),
+    ("预估上限 USD（CPM 40）", "pricing_quote_high", 17, False),
+    ("报价状态 / 来源", "pricing_status", 26, True),
     ("AI 评分", "ai", 8, False),
     ("结论", "summary", 30, True),
     ("待补/原因", "reasons", 34, True),
@@ -56,6 +63,13 @@ COLS = [
 
 def _verdict(pool):
     return POOL_ZH.get(pool, pool)
+
+
+def _xlsx_safe(value):
+    """Neutralize formula-like external text before writing it to XLSX cells."""
+    if isinstance(value, str) and value.startswith(("=", "+", "-", "@")):
+        return "'" + value
+    return value
 
 
 def _cell(c, key):
@@ -72,12 +86,41 @@ def _cell(c, key):
         return NICHE_LABEL.get(c.get("core_niche_key"), c.get("core_niche_key") or "—")
     if key == "intent_snippet":
         snips = c.get("high_intent_snippets") or []
+        deep_complete = comment_collection_complete(c)
+        comment_unavailable_count = len(c.get("comment_unavailable_posts") or [])
+        sampled_posts = [
+            post for post in (c.get("sampled_posts") or [])
+            if isinstance(post, dict)
+        ]
+        verified_zero = (
+            deep_complete
+            and bool(sampled_posts)
+            and all(post.get("comment_count") == 0 for post in sampled_posts)
+        )
+        vc = c.get("valid_comments")
+        valid_count = int(vc or 0)
+        completion_note = ""
+        if deep_complete and comment_unavailable_count:
+            completion_note = (
+                f"{comment_unavailable_count}帖低量评论重复不可见（已复采）"
+            )
+        elif verified_zero:
+            completion_note = "未发现公开评论（已完成采集）"
+        elif deep_complete and valid_count < 20:
+            completion_note = (
+                f"公开有效评论有限（{valid_count}条，已完成采集）"
+            )
+        elif not deep_complete and snips:
+            completion_note = "评论采集未完成（待复采）"
         if snips:
-            return "\n".join(f"· {s}" for s in snips[:3])
+            rows = [completion_note] if completion_note else []
+            rows.extend(f"· {s}" for s in snips[:3])
+            return "\n".join(rows)
+        if completion_note:
+            return completion_note
         # 四态区分：深采未跑 / 抽取失败(系统侧) / 样本偏少 / 真没意图——别把抽取失败甩锅成账号受限
         if not c.get("comments_read"):
             return "评论待采集（深采未完成）"
-        vc = c.get("valid_comments")
         if (c.get("comments_analyzed") or 0) == 0:
             return "评论抽取失败（待复采）"
         if (vc or 0) < 20:
@@ -86,16 +129,22 @@ def _cell(c, key):
     if key == "comment_ev":
         return "帖子 ↗" if (c.get("intent_posts") or c.get("comment_shots")) else "—"
     if key == "storefront_link":
-        st = c.get("storefront_status")
+        st = storefront_mod.effective_status(c)
         if st == "confirmed_yes":
-            return "打开 ↗"
-        return {"confirmed_no": "确认无", "unknown": "未确认"}.get(st, "—")
+            return f"{storefront_mod.storefront_type(c) or '打开橱窗'} ↗"
+        return {"confirmed_no": "确认无橱窗", "unknown": "未确认"}.get(st, "—")
     if key == "sponsorship":
         v = c.get("sponsorship_saturation")
         return f"{v}%" if v is not None else "—"
     if key == "fake":
         v = c.get("fake_pct")
-        return f"{v}%" if v is not None else "待补"
+        if v is not None:
+            return f"{v}%"
+        if c.get("modash_report"):
+            return "数据源无"
+        if c.get("final_pool") == "Exclude":
+            return "未补（硬门槛已排除）"
+        return "待补"
     if key == "er_compare":
         mo = c.get("modash_er")
         ig = c.get("ig_er")
@@ -103,6 +152,29 @@ def _cell(c, key):
         parts.append(f"Modash {mo}%" if mo is not None else "Modash —")
         parts.append(f"IG实算 {ig}%" if ig is not None else "IG 待读")
         return " / ".join(parts)
+    if key.startswith("pricing_"):
+        p = c.get("pricing_estimate") or {}
+        status = p.get("status") or "missing"
+        requested = int(p.get("requested_reels") or 10)
+        sample = int(p.get("sample_count") or 0)
+        if key == "pricing_sample":
+            if status == "fallback_modash":
+                return "第三方"
+            return f"{sample}/{requested}" if sample else "待补"
+        if key == "pricing_avg":
+            return p.get("average_plays")
+        quote = p.get("quote_usd") or {}
+        if key == "pricing_quote":
+            return quote.get("default")
+        if key == "pricing_quote_high":
+            return quote.get("max")
+        if status == "complete":
+            return f"完整 · IG 最近 {requested} 条非置顶 Reels"
+        if status == "partial":
+            return f"样本不足 · IG {sample}/{requested}（暂估）"
+        if status == "fallback_modash":
+            return "第三方 Reels 均播替代（未验证最近 10 条/置顶）"
+        return "待补 Reels 播放量"
     if key == "ai":
         return c.get("ai_vetting_score") if c.get("ai_vetting_score") is not None else "—"
     if key == "summary":
@@ -125,8 +197,11 @@ def _url(c, key):
     if key == "comment_ev":       # 评论证据 → 有意图评论的帖子链接（客户点开核验"谁说了什么"）
         ip = c.get("intent_posts") or []
         return ip[0].get("post_url") if ip else None
-    if key == "storefront_link" and c.get("storefront_status") == "confirmed_yes":
-        return c.get("amazon_storefront_link")
+    if key == "storefront_link" and storefront_mod.has_storefront(c):
+        return storefront_mod.storefront_url(c)
+    if key == "pricing_sample":
+        reels = (c.get("pricing_estimate") or {}).get("reels") or []
+        return reels[0].get("url") if reels else None
     return None
 
 
@@ -182,7 +257,10 @@ def build_workbook(decisions):
     ws = wb.create_sheet("批次总览", 0)
     meta = decisions.get("manifest", {})
     pc = Counter(c.get("final_pool", "Review") for c in cands)
-    sf = [c["handle"] for c in cands if c.get("storefront_status") == "confirmed_yes"]
+    sf = [c["handle"] for c in cands if storefront_mod.has_storefront(c)]
+    price_status = Counter(
+        (c.get("pricing_estimate") or {}).get("status", "missing") for c in cands
+    )
     ws.cell(1, 1, "Instagram 红人筛选 · 交付总览").font = Font(bold=True, size=15, name="Microsoft YaHei")
     rows = [
         ("批次", meta.get("batch_id", "")),
@@ -191,11 +269,15 @@ def build_workbook(decisions):
         ("候选总数", len(cands)),
         ("纳入·有橱窗 / 无橱窗", f"{pc.get('Include-With-Storefront',0)} / {pc.get('Include-Without-Storefront',0)}"),
         ("优先复核 / 待复核 / 已排除", f"{pc.get('Priority-Review',0)} / {pc.get('Review',0)} / {pc.get('Exclude',0)}"),
-        ("确认有 Amazon 橱窗", f"{len(sf)} 个"),
+        ("确认有电商橱窗/购物入口", f"{len(sf)} 个"),
+        ("原生报价口径完整", f"{price_status.get('complete', 0)} 个"),
+        ("报价样本不足 / 第三方替代 / 缺失",
+         f"{price_status.get('partial', 0)} / {price_status.get('fallback_modash', 0)} / {price_status.get('missing', 0)}"),
         ("", ""),
         ("阅读说明", "五个决策池互斥，一人一池。『验收建议』色标区分；『购买意向评论』是核心，评论证据列可跳截图。"),
-        ("链接", "Handle/主页/Amazon 橱窗均可点击核验。"),
+        ("链接", "Handle/主页/电商橱窗或购物入口均可点击核验。"),
         ("ER 口径", "Modash ER（近两月中位数，偏低）与 IG 实算 ER（近帖，部分藏赞）并列参考；本赛道 Modash ER 普遍<2%，硬门槛以可靠标准+购买意向评论为准。"),
+        ("预估报价口径", "先排除置顶 Reels，再取最近 10 条平均播放量；默认 CPM $35，参考区间 $35–40。样本不足/第三方替代会明确标记；仅供预算参考，不是博主实际报价，也不参与评分或路由。"),
         ("Herman 两列", "供客户审批回填。"),
     ]
     for r, (k, v) in enumerate(rows, 3):
@@ -224,7 +306,7 @@ def build_workbook(decisions):
         for r, c in enumerate(by_pool.get(pool, []), 2):
             ws.row_dimensions[r].height = 46
             for j, (_, key, _w, do_wrap) in enumerate(COLS, 1):
-                cell = ws.cell(r, j, _cell(c, key))
+                cell = ws.cell(r, j, _xlsx_safe(_cell(c, key)))
                 cell.border = border
                 cell.font = base_font
                 cell.alignment = wrap if do_wrap else Alignment(vertical="center")
@@ -238,6 +320,10 @@ def build_workbook(decisions):
                 if key == "comment_ev" and c.get("handle") in anchor:
                     cell.hyperlink = f"#评论证据!A{anchor[c['handle']]}"
                     cell.font = link_font
+                if key == "pricing_avg" and isinstance(cell.value, (int, float)):
+                    cell.number_format = "#,##0.00"
+                if key in ("pricing_quote", "pricing_quote_high") and isinstance(cell.value, (int, float)):
+                    cell.number_format = '$#,##0.00'
                 # 验收建议色标
                 if key == "verdict":
                     cell.fill = PatternFill("solid", fgColor=POOL_FILL[pool])

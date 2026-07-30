@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 from .contracts import GateVerdict, Pool
+from . import storefront
 
 
 def collect_fixed_review_reasons(cand: dict, cfg: dict) -> list[str]:
@@ -19,7 +20,7 @@ def collect_fixed_review_reasons(cand: dict, cfg: dict) -> list[str]:
     core = cfg["modash_gates"]["core_fields"]
     if any(cand.get(f) is None for f in core):
         reasons.append("modash_core_missing")
-    if cand.get("storefront_status") in (None, "unknown"):
+    if storefront.effective_status(cand) == "unknown":
         reasons.append("storefront_unknown")
     vc = cand.get("valid_comments")
     if vc is None or vc < cfg["comments"]["min_valid_sample"]:
@@ -76,7 +77,7 @@ def route(cand: dict, gate_results: list, score_summary: dict, cfg: dict) -> dic
     nt = score_summary["normalized_total"]
     a = cfg["ai_score"]
     if nt >= a["include_min"]:
-        st = cand.get("storefront_status")
+        st = storefront.effective_status(cand)
         pool = Pool.INCLUDE_WITH_STOREFRONT if st == "confirmed_yes" else Pool.INCLUDE_WITHOUT_STOREFRONT
         return {"pool": pool, "exclude_reasons": [], "review_reasons": [], "tier_by": "score"}
     if nt >= a["priority_min"]:

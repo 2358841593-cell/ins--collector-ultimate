@@ -1,10 +1,7 @@
 """Storefront 浏览器穿透（P1-2，SCORE-D1/D2/D3）。
 
 对候选 bio 里的聚合页（Linktree/Beacons/LTK/ShopMy/Stan 等）用真浏览器渲染后读真实
-出链，判断是否穿透到 Amazon Storefront：
-  - 命中 amazon.com/shop 或 /storefront → confirmed_yes（+ 链接 + 证据）
-  - 打开成功但无 Amazon 出链 → confirmed_no
-  - 打开失败/需人工点击（LTK 联盟跳转常无法自动确认）→ unknown（进 Review 待人工）
+出链，判断是否存在任意认可的电商 Storefront。Amazon 优先，但不是准入硬门槛。
 留证：source_url + captured_at + 命中的出链样本 + 截图路径。
 """
 from __future__ import annotations
@@ -12,6 +9,8 @@ from __future__ import annotations
 import re
 import time
 from pathlib import Path
+
+from . import storefront as storefront_mod
 
 SECRETS = Path(__file__).resolve().parents[2].parent / ".secrets"
 SHOT_DIR = SECRETS / "storefront-shots"
@@ -32,8 +31,9 @@ def penetrate(url: str, headless: bool = True, save_shot: bool = True) -> dict:
     """打开单个 bio 链接，读出链判断 Storefront。返回决策 + 证据。"""
     from playwright.sync_api import sync_playwright
 
-    out = {"source_url": url, "status": "unknown", "amazon_link": None,
-           "amazon_links": [], "checked": 0, "note": "", "screenshot": None}
+    out = {"source_url": url, "status": "unknown", "storefront_url": None,
+           "storefront_type": None, "amazon_link": None, "commerce_links": [],
+           "checked": 0, "note": "", "screenshot": None}
     SHOT_DIR.mkdir(parents=True, exist_ok=True)
 
     with sync_playwright() as pw:
@@ -51,25 +51,26 @@ def penetrate(url: str, headless: bool = True, save_shot: bool = True) -> dict:
 
             hrefs = page.eval_on_selector_all("a[href]", "els => els.map(e => e.href)")
             out["checked"] = len(hrefs)
-            amazon_shop = [h for h in hrefs if AMAZON_SHOP.search(h)]
-            amazon_any = [h for h in hrefs if AMAZON_ANY.search(h)]
-
-            if amazon_shop:
+            ranked = {"Amazon": 0, "LTK": 1, "ShopMy": 2, "自营店": 3, "链接聚合": 4}
+            recognized = []
+            for candidate_url in [url, *hrefs]:
+                kind = storefront_mod.classify_url(candidate_url)
+                if kind:
+                    recognized.append((candidate_url, kind))
+            if recognized:
+                best_url, best_type = min(recognized, key=lambda x: ranked.get(x[1], 9))
                 out["status"] = "confirmed_yes"
-                out["amazon_link"] = amazon_shop[0]
-                out["amazon_links"] = amazon_shop[:5]
-            elif amazon_any:
-                # 有 amazon 链接但非 /shop（可能是单品联盟链）→ 记为 yes（有 Amazon 导购路径）
-                out["status"] = "confirmed_yes"
-                out["amazon_link"] = amazon_any[0]
-                out["amazon_links"] = amazon_any[:5]
-                out["note"] = "amazon_link_non_storefront_path"
-            elif "liketoknow" in url.lower() or "shopltk" in url.lower():
-                out["status"] = "unknown"
-                out["note"] = "ltk_affiliate_needs_manual_click"
+                out["storefront_url"] = best_url
+                out["storefront_type"] = best_type
+                out["commerce_links"] = [
+                    {"url": u, "type": t} for u, t in recognized[:10]
+                ]
+                if best_type == "Amazon":
+                    out["amazon_link"] = best_url
+                out["note"] = "recognized_storefront"
             else:
                 out["status"] = "confirmed_no"
-                out["note"] = "opened_no_amazon_outlink"
+                out["note"] = "opened_no_storefront_outlink"
 
             if save_shot:
                 slug = re.sub(r"[^a-z0-9]+", "-", url.lower())[:40].strip("-")
@@ -88,8 +89,9 @@ def penetrate(url: str, headless: bool = True, save_shot: bool = True) -> dict:
 
 def resolve_candidate(cand: dict, headless: bool = True) -> dict:
     """对一个候选：若 storefront 未确认且有聚合页链接，穿透解析并回写。"""
-    if cand.get("storefront_status") == "confirmed_yes":
-        return {"status": "confirmed_yes", "note": "amazon_direct_in_bio"}
+    if storefront_mod.has_storefront(cand):
+        storefront_mod.normalize(cand)
+        return {"status": "confirmed_yes", "note": "storefront_direct_in_bio"}
     links = list(cand.get("bio_links") or [])
     ext = cand.get("external_url")
     if ext and ext not in links:
@@ -100,13 +102,16 @@ def resolve_candidate(cand: dict, headless: bool = True) -> dict:
         res = penetrate(url, headless=headless)
         if res["status"] == "confirmed_yes":
             cand["storefront_status"] = "confirmed_yes"
-            cand["amazon_storefront_link"] = res["amazon_link"]
+            cand["storefront_url"] = res["storefront_url"]
+            cand["storefront_type"] = res["storefront_type"]
+            if res["storefront_type"] == "Amazon":
+                cand["amazon_storefront_link"] = res["amazon_link"]
             cand["storefront_evidence"] = res
             return res
         last = res
-    # 全部未穿透到 Amazon
+    # 全部未穿透到认可 Storefront
     if targets:
-        # 若至少一个聚合页成功打开且无 Amazon → confirmed_no；否则 unknown
+        # 若至少一个目标成功打开且确认无 Storefront → confirmed_no；否则 unknown
         cand["storefront_status"] = "confirmed_no" if last.get("status") == "confirmed_no" else "unknown"
         cand["storefront_evidence"] = last
         return last

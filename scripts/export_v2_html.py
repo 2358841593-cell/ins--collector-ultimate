@@ -2,7 +2,7 @@
 """五池 HTML 表格交付（可读版，替代难看的 XLSX）。
 
 对齐客户 SOP §8 字段；购买意向评论**分级**(高/中/低)带"谁说的"；能点的都点：
-IG 主页 / Amazon 橱窗 / 有意图评论的帖子链接 / 合作品牌。自包含单文件 HTML，浏览器直开。
+IG 主页 / 电商橱窗 / 有意图评论的帖子链接 / 合作品牌。自包含单文件 HTML，浏览器直开。
 
 用法：python scripts/export_v2_html.py --decisions decisions.json --out deliverable.html
 """
@@ -14,6 +14,9 @@ import json
 from collections import Counter
 from pathlib import Path
 
+from export_v2_comment_status import comment_collection_complete
+from extensions.sop_v2 import storefront as storefront_mod
+
 POOLS = ["Include-With-Storefront", "Include-Without-Storefront",
          "Priority-Review", "Review", "Exclude"]
 POOL_ZH = {"Include-With-Storefront": "纳入 · 有橱窗", "Include-Without-Storefront": "纳入 · 无橱窗",
@@ -24,8 +27,9 @@ NICHE_ZH = {"skincare": "护肤", "beauty_device": "美容仪", "beauty_wellness
             "lifestyle": "生活方式", "other": "其他"}
 GRADE_CLASS = {"高": "g-hi", "中": "g-mid", "低": "g-lo"}
 
-COLS = ["客户选择", "验收", "红人", "粉丝", "赛道", "购买意向评论（谁说了什么）", "Amazon 橱窗",
-        "合作品牌", "赞助", "Fake%", "受众画像（第三方核验）", "ER 对照", "AI", "结论", "待补 / 原因"]
+COLS = ["客户选择", "验收", "红人", "粉丝", "赛道", "购买意向评论（谁说了什么）", "电商橱窗 / 购物入口",
+        "合作品牌", "赞助", "Fake%", "受众画像（第三方核验）", "ER 对照",
+        "预估报价（USD）", "AI", "结论", "待补 / 原因"]
 
 
 def _decide_cell(c):
@@ -107,8 +111,26 @@ _INTERACT_JS = """<script>
 
 
 def _na(c):
-    # 有第三方报告但字段空 = 数据源本身没有；没报告 = 待补数（区分"数据源无"和"我们没采"）
-    return '<span class="muted">数据源无</span>' if c.get("modash_report") else '<span class="muted">待补数</span>'
+    # 有第三方报告但字段空 = 数据源本身没有；硬门槛已排除 = 按预算策略不付费；
+    # 其余没报告才是真正待补数。
+    if c.get("modash_report"):
+        label = "数据源无"
+    elif c.get("final_pool") == "Exclude":
+        label = "未补（已按硬门槛排除）"
+    else:
+        label = "待补数"
+    return f'<span class="muted">{label}</span>'
+
+
+def _brand_cell(c):
+    brands = c.get("brand_collaborations") or []
+    if brands:
+        return "、".join(esc(b) for b in brands[:6])
+    if c.get("modash_report"):
+        return '<span class="muted">数据源未识别</span>'
+    if c.get("final_pool") == "Exclude":
+        return '<span class="muted">未补（已按硬门槛排除）</span>'
+    return '<span class="muted">待补数</span>'
 
 
 def _fake_cell(c):
@@ -157,14 +179,109 @@ def _kv(label, val_html):
     return f'<div class="kv"><span class="k">{esc(label)}</span><span class="v">{val_html}</span></div>' if val_html else ""
 
 
+def _fmt_count(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    return f"{number:,.0f}" if number.is_integer() else f"{number:,.2f}"
+
+
+def _fmt_usd(value):
+    try:
+        return f"${float(value):,.2f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _pricing_cell(c):
+    """展示型估价：绝不冒充博主实际报价。"""
+    p = c.get("pricing_estimate") or {}
+    status = p.get("status") or "missing"
+    quote = p.get("quote_usd") or {}
+    avg = p.get("average_plays")
+    if avg is None or quote.get("default") is None:
+        return '<span class="muted">待补近 10 条非置顶 Reels 播放量</span>'
+
+    sample = int(p.get("sample_count") or 0)
+    requested = int(p.get("requested_reels") or 10)
+    low = quote.get("min")
+    high = quote.get("max")
+    if status == "complete":
+        source = f"IG 近 {requested} 条非置顶 Reels"
+    elif status == "partial":
+        source = f'<span class="warn">IG 样本不足 {sample}/{requested}，暂估</span>'
+    elif status == "fallback_modash":
+        source = '<span class="warn">第三方均播替代，未验证近 10 条/置顶</span>'
+    else:
+        source = '<span class="warn">口径待核验</span>'
+    return (
+        f'<b>{_fmt_usd(quote.get("default"))}</b>'
+        f'<div class="aud">区间 {_fmt_usd(low)}–{_fmt_usd(high)}</div>'
+        f'<div class="aud">均播 {_fmt_count(avg)} · {source}</div>'
+        '<div class="aud muted">按 CPM $35（区间 $35–40）估算，非实际报价</div>'
+    )
+
+
+def _pricing_detail_block(c):
+    p = c.get("pricing_estimate") or {}
+    if not p:
+        return ""
+    q = p.get("quote_usd") or {}
+    rows = [
+        _kv("性质", "展示型估算，非博主实际报价；不参与评分或路由"),
+        _kv(
+            "公式",
+            f'{_fmt_count(p.get("average_plays"))} ÷ 1,000 × CPM '
+            f'${esc((p.get("cpm_usd") or {}).get("default", 35))}',
+        ),
+        _kv(
+            "结果",
+            f'默认 {_fmt_usd(q.get("default"))} · 区间 '
+            f'{_fmt_usd(q.get("min"))}–{_fmt_usd(q.get("max"))}',
+        ),
+        _kv(
+            "样本状态",
+            f'{esc(p.get("status") or "missing")} · '
+            f'{int(p.get("sample_count") or 0)}/{int(p.get("requested_reels") or 10)} · '
+            f'{esc(p.get("source") or "missing")}',
+        ),
+    ]
+    reels = p.get("reels") or []
+    if reels:
+        links = []
+        for i, reel in enumerate(reels[:10], 1):
+            label = f'{i}. {_fmt_count(reel.get("play_count"))} 播放'
+            if reel.get("taken_at"):
+                label += f' · {esc(reel["taken_at"])}'
+            if reel.get("url"):
+                links.append(f'<a href="{esc(reel["url"])}" target="_blank">{label} ↗</a>')
+            else:
+                links.append(label)
+        rows.append(_kv("Reels 明细", "<br>".join(links)))
+    elif p.get("status") == "fallback_modash":
+        rows.append(_kv("限制", "使用第三方账号级 Reels 均播；未验证是否为最近 10 条，也无法确认置顶排除。"))
+    elif p.get("status") == "missing":
+        rows.append(_kv("待补", "未取得足够的 Reels 播放量，未生成报价。"))
+    return '<div class="grp"><div class="gt">预估报价证据与口径</div>' + "".join(rows) + '</div>'
+
+
 def _detail_panel(c, ncols):
     """每个红人的完整受众画像（可折叠）：一次 credit 拿到的全部维度都铺出来。"""
     h = (c.get("handle") or "").lstrip("@")
-    if not c.get("modash_report"):
-        inner = '<div class="dl-note">此红人尚未做第三方受众核验（待补数）。</div>'
-        return (f'<tr class="det"><td colspan="{ncols}"><details><summary>▸ 完整受众画像 · @{esc(h)}</summary>'
-                f'{inner}</details></td></tr>')
     blocks = []
+    pricing_block = _pricing_detail_block(c)
+    if pricing_block:
+        blocks.append(pricing_block)
+    if not c.get("modash_report"):
+        if c.get("final_pool") == "Exclude":
+            note = "此红人已按非第三方硬门槛排除，因此未消耗第三方报告额度。"
+        else:
+            note = "此红人尚未做第三方受众核验（待补数）。"
+        blocks.append(f'<div class="dl-note">{note}</div>')
+        inner = "".join(blocks)
+        return (f'<tr class="det"><td colspan="{ncols}"><details><summary>▸ 完整受众画像 · @{esc(h)}</summary>'
+                f'<div class="dl">{inner}</div></details></td></tr>')
 
     # 粉丝质量拆解
     at = c.get("audience_types") or {}
@@ -239,7 +356,7 @@ def _detail_panel(c, ncols):
     if c.get("avg_comments") is not None:
         stat.append(f'均评 {c["avg_comments"]:,}')
     if c.get("avg_reels_plays") is not None:
-        stat.append(f'Reels均播 {c["avg_reels_plays"]:,}')
+        stat.append(f'第三方 Reels均播 {c["avg_reels_plays"]:,}')
     if stat:
         p.append(_kv("表现", " · ".join(stat)))
     if c.get("followers_growth_pct") is not None:
@@ -281,6 +398,32 @@ def _intent_cell(c):
     posts = c.get("intent_posts") or []
     post_url = posts[0].get("post_url") if posts else None
     g = c.get("intent_by_grade") or {}
+    deep_complete = comment_collection_complete(c)
+    comment_unavailable_count = len(c.get("comment_unavailable_posts") or [])
+    sampled_posts = [
+        post for post in (c.get("sampled_posts") or [])
+        if isinstance(post, dict)
+    ]
+    verified_zero = (
+        deep_complete
+        and bool(sampled_posts)
+        and all(post.get("comment_count") == 0 for post in sampled_posts)
+    )
+    vc = c.get("valid_comments")
+    valid_count = int(vc or 0)
+    completion_note = ""
+    if deep_complete and comment_unavailable_count:
+        completion_note = (
+            f"{comment_unavailable_count}帖低量评论重复不可见（已复采）"
+        )
+    elif verified_zero:
+        completion_note = "未发现公开评论（已完成采集）"
+    elif deep_complete and valid_count < 20:
+        completion_note = (
+            f"公开有效评论有限（{valid_count}条，已完成采集）"
+        )
+    elif not deep_complete and snips:
+        completion_note = "评论采集未完成（待复采）"
     if snips:
         rows = []
         for s in snips[:6]:
@@ -292,11 +435,17 @@ def _intent_cell(c):
             rows.append(f'<div class="cmt {cls}">{esc(s)}</div>')
         head = (f'<div class="tier">高{g.get("high",0)} 中{g.get("medium",0)} 低{g.get("low",0)}'
                 + (f' · <a href="{esc(post_url)}" target="_blank">看帖 ↗</a>' if post_url else '') + '</div>')
-        return head + "".join(rows)
+        note = (
+            f'<div class="{"muted" if deep_complete else "warn"}">'
+            f'{esc(completion_note)}</div>'
+            if completion_note else ""
+        )
+        return note + head + "".join(rows)
+    if completion_note:
+        return f'<span class="muted">{esc(completion_note)}</span>'
     # 无意图片段：区分四种性质不同的情况，别把"我们抽取失败"甩锅成"账号受限"
     if not c.get("comments_read"):
         return '<span class="muted">评论待采集（深采未完成）</span>'
-    vc = c.get("valid_comments")
     if (c.get("comments_analyzed") or 0) == 0:
         return '<span class="warn">评论抽取失败（待复采）</span>'   # 深采跑了但一条没抽到 = 系统侧待修
     if (vc or 0) < 20:
@@ -316,20 +465,17 @@ def _intent_cell(c):
 
 
 def _storefront_cell(c):
-    """客户 2026-07-17：Amazon 有就打开 Amazon 橱窗；没有就展示他实际有的橱窗（LTK/ShopMy/自营/聚合）。"""
-    st = c.get("storefront_status")
-    if st == "confirmed_yes":
-        u = c.get("amazon_storefront_link") or c.get("storefront_url") or ""
-        return f'<a href="{esc(u)}" target="_blank">打开 Amazon 橱窗 ↗</a>'
-    # 无 Amazon：有什么橱窗放什么
-    su, stype = c.get("storefront_url"), c.get("storefront_type")
-    if su and stype and stype != "Amazon":
-        return f'<a href="{esc(su)}" target="_blank">{esc(stype)} ↗</a>'
-    # 还有 bio 链但没归类出橱窗 → 给首个 bio 链兜底（客户可自己看）
+    """Amazon 优先；否则展示实际 LTK/ShopMy/自营店/购物聚合入口。"""
+    st = storefront_mod.effective_status(c)
+    su = storefront_mod.storefront_url(c)
+    stype = storefront_mod.storefront_type(c)
+    if st == "confirmed_yes" and su:
+        return f'<a href="{esc(su)}" target="_blank">{esc(stype or "打开橱窗")} ↗</a>'
+    # 仍给未归类的 bio 链作人工核验入口，但不把普通网页冒充成已确认橱窗。
     bl = c.get("bio_links") or []
     if bl:
-        return f'<a href="{esc(bl[0])}" target="_blank">链接 ↗</a>'
-    return {"confirmed_no": '<span class="muted">无 Amazon（未见其他橱窗）</span>',
+        return f'<a href="{esc(bl[0])}" target="_blank">Bio 链接（橱窗未确认）↗</a>'
+    return {"confirmed_no": '<span class="muted">确认无橱窗</span>',
             "unknown": '<span class="muted">未确认</span>'}.get(st, '<span class="muted">—</span>')
 
 
@@ -374,7 +520,6 @@ def _row(c):
     h = (c.get("handle") or "").lstrip("@")
     prof = c.get("profile_url") or f"https://www.instagram.com/{h}/"
     pool = c.get("final_pool", "Review")
-    brands = c.get("brand_collaborations") or []
     reasons = (c.get("review_reasons_text") or []) + (c.get("exclude_reasons_text") or [])
     cells = [
         _decide_cell(c),
@@ -384,11 +529,12 @@ def _row(c):
         esc(NICHE_ZH.get(c.get("core_niche_key"), c.get("core_niche_key") or "—")),
         _intent_cell(c),
         _storefront_cell(c),
-        ("、".join(esc(b) for b in brands[:6]) if brands else '<span class="muted">待补</span>'),
+        _brand_cell(c),
         (f'{c.get("sponsorship_saturation")}%' if c.get("sponsorship_saturation") is not None else '<span class="muted">—</span>'),
         _fake_cell(c),
         _audience_cell(c),
         _er_cell(c),
+        _pricing_cell(c),
         f'<b>{esc(c.get("ai_vetting_score"))}</b>' if c.get("ai_vetting_score") is not None else "—",
         esc(c.get("decision_summary") or ""),
         ("；".join(esc(r) for r in reasons) if reasons else '<span class="muted">—</span>'),
@@ -402,7 +548,7 @@ def build_html(decisions) -> str:
     meta = decisions.get("manifest", {})
     pc = Counter(c.get("final_pool", "Review") for c in cands)
     by_pool = {p: [c for c in cands if c.get("final_pool") == p] for p in POOLS}
-    sf = sum(1 for c in cands if c.get("storefront_status") == "confirmed_yes")
+    sf = sum(1 for c in cands if storefront_mod.has_storefront(c))
 
     cards = "".join(
         f'<div class="card {POOL_CLASS[p]}"><div class="n">{pc.get(p,0)}</div>'
@@ -479,9 +625,9 @@ tr:has(.db.no.on) td{{background:#fdf5f4!important}}
 #cbar button:hover{{background:#2f8659}} #cbar button.ghost{{background:transparent;border:1px solid #5c8478}}
 </style></head><body><div class="wrap">
 <h1>Instagram 红人筛选 · 交付表</h1>
-<div class="meta">批次 {esc(meta.get('batch_id',''))} · {esc(meta.get('campaign_track',''))} · 生成 {esc(decisions.get('generated_at',''))} · 候选 {len(cands)} · 确认 Amazon 橱窗 {sf}</div>
+<div class="meta">批次 {esc(meta.get('batch_id',''))} · {esc(meta.get('campaign_track',''))} · 生成 {esc(decisions.get('generated_at',''))} · 候选 {len(cands)} · 确认有电商橱窗/购物入口 {sf}</div>
 <div class="cards">{cards}</div>
-<div class="note"><b>如何使用（客户）：</b>最左列『客户选择』直接点 <b>合适 / 不合适 / 待定</b>，可在下方填『原因』。选择<b>自动存本机浏览器</b>（关页不丢，随时接着选）。选完点底部 <b>⬇ 导出客户决策</b> 下载一个 JSON 文件，<b>回传给我们</b>即可——我们据此更新入选/排除。<br><b>阅读说明：</b>五池互斥，一人一池。<b>购买意向评论分三级</b>——高(求链接/已下单)·中(考虑/问适用)·低(真诚产品热情，非水军)，标明"谁说了什么"，点『看帖 ↗』核验。<b>每行下方『▸ 完整受众画像』可展开</b>：真人/机器人拆解、点赞者画像、受众国家/年龄/性别/语言、跨平台、涨粉、赞助帖（接入权威第三方受众数据源交叉核验）。<b>橱窗</b>：有 Amazon 打开 Amazon 橱窗，没有则展示其实际橱窗(LTK/自营店/聚合链)。ER：第三方受众数据(参考) + IG 实算中位(门槛依据，抗爆款)。</div>
+<div class="note"><b>如何使用（客户）：</b>最左列『客户选择』直接点 <b>合适 / 不合适 / 待定</b>，可在下方填『原因』。选择<b>自动存本机浏览器</b>（关页不丢，随时接着选）。选完点底部 <b>⬇ 导出客户决策</b> 下载一个 JSON 文件，<b>回传给我们</b>即可——我们据此更新入选/排除。<br><b>阅读说明：</b>五池互斥，一人一池。<b>购买意向评论分三级</b>——高(求链接/已下单)·中(考虑/问适用)·低(真诚产品热情，非水军)，标明"谁说了什么"，点『看帖 ↗』核验。<b>每行下方『▸ 完整受众画像』可展开</b>：真人/机器人拆解、点赞者画像、受众国家/年龄/性别/语言、跨平台、涨粉、赞助帖（接入权威第三方受众数据源交叉核验）。<b>橱窗</b>：Amazon、LTK、ShopMy、自营店和购物聚合入口都计入；确认无橱窗也不在浅扫阶段直接淘汰。ER：第三方受众数据(参考) + IG 实算中位(门槛依据，抗爆款)。<b>预估报价</b>：先排除置顶 Reels，再取最近 10 条的平均播放量，按 CPM $35 估算并给出 $35–40 区间；样本不足或使用第三方均播时会明确标记。该数值仅供预算参考，<b>不是博主实际报价，也不参与评分/路由</b>。</div>
 {''.join(sections)}
 </div>
 <div id="cbar"><span id="cstat"></span><div class="r"><button class="ghost" onclick="clearDecisions()">清空</button><button onclick="exportDecisions()">⬇ 导出客户决策</button></div></div>

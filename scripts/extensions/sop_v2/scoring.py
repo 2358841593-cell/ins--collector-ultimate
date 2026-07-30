@@ -7,6 +7,7 @@ AI Vetting Score = round(normalized_total/10, 1)，仅作展示；分层判定�
 from __future__ import annotations
 
 from .contracts import ScoreItem
+from . import storefront
 
 
 def _band_score(value, bands, key, default=0):
@@ -122,7 +123,7 @@ def score_C(cand, cfg):
 def score_D(cand, cfg):
     d = cfg["scoring"]["D"]
     items = []
-    st = cand.get("storefront_status")
+    st = storefront.effective_status(cand)
     sf = {"confirmed_yes": d["storefront_confirm"]["yes"],
           "confirmed_no": d["storefront_confirm"]["no"]}.get(st)
     items.append(_si("D", "storefront", sf, 4, f"status={st}"))
@@ -245,7 +246,7 @@ def exceptional_ok(cand) -> bool:
         cand.get("all_hard_gates_pass"),
         (cand.get("elite_brand_hits") or 0) > 0 or cand.get("red_light_mask_and_vo"),
         cand.get("has_vo") is True,
-        cand.get("storefront_status") == "confirmed_yes" and cand.get("storefront_active"),
+        storefront.has_storefront(cand) and cand.get("storefront_active"),
         cand.get("high_intent_full_marks"),
         (cand.get("sponsorship_saturation") is not None and cand["sponsorship_saturation"] < 30.0),
     ])

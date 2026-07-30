@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from .contracts import GateResult, GateVerdict
+from . import storefront
 
 
 def _g(gid, verdict, observed=None, threshold=None, reason="", source="") -> GateResult:
@@ -149,7 +150,7 @@ def gate_brand_account(cand, cfg):
 
 
 def gate_storefront(cand, cfg):
-    s = cand.get("storefront_status")  # confirmed_yes | confirmed_no | unknown
+    s = storefront.effective_status(cand)  # confirmed_yes | confirmed_no | unknown
     if s == "unknown" or s is None:
         return _g("GATE-11", GateVerdict.REVIEW, s, "confirmed", "storefront_unknown", "browser")
     return _g("GATE-11", GateVerdict.PASS, s, "confirmed", source="browser")

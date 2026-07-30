@@ -1,10 +1,15 @@
 # SOP V2 开发执行清单（代码实证版）
 
-版本：1.3.1（v1.1 = 五视角对抗校验修订 42 条；v1.2 = 合入操作机初跑实证、R0 修复阶段、Modash 真实余额；v1.2.1 = 三视角校验修订 14 条；v1.3 = 合入 Modash Discovery 浏览器实测，发现层改为 Modash-first 双通道；v1.3.1 = 双视角校验修订 11 条：Handle 池注入接口补全、两源命中承接、发现层降级口径、docx 引用消歧；v1.4 = IG 采集通道决策浏览器优先（§1.6/§2.6，Collector 后端接口，参考 browser-cdp-lab），B0 track，重塑 R0；v1.5 = 客户拍板 instagrapi 完全退役、浏览器唯一 IG 通道、Modash 复用已登录 Chrome 不新建进程；R0 全面改为登录态 Chrome profile 池；v1.5.1 = 一致性校验清残留：发现层降为 Modash 单通道 + 外部 handle 注入，删除通道B/--warm-only/--wait-pool/暖 Session≥5 私有 API 措辞，批准者回流明确走 Modash lookalike）
-日期：2026-07-14
+版本：1.6（在 v1.5.1 基础上合入 2026-07-28 通用 Storefront 与展示型预估报价补充）
+日期：2026-07-28
 规则源：`Instagram红人筛选SOP标准确认书_客户版.docx`（Client-Facing V2.0，2026-07-13）
 实证源：`FULL_INITIAL_RUN_REPORT_20260714.md` + 证据包（3 次在线 run 原始产物）+ `MODASH_FUNCTIONS_COST_REPORT.md`（客户账号只读核对）
 定位：本文件是 `REQUIREMENTS_CHECKLIST.md`（验收追踪）与 `GAP_AND_IMPLEMENTATION_PLAN.md`（差距结论）之下的**开发执行层**——每个任务落到具体文件、接入点、输入输出与验收测试。所有"现状"结论均经代码逐行核实或初跑证据核实。
+
+> 2026-07-28 口径覆盖：下文提到 `no_amazon_storefront` 或“无橱窗早筛”的地方，只是在
+> 复述 2026-07-14 **Legacy 初跑缺陷**，不是当前允许的规则。当前 Storefront 是通用电商
+> 入口；`confirmed_no` 继续深采，`unknown` 才 Review。展示估价是独立交付字段，不等于
+> 实际报价/Paid CPM，也不参与评分路由。
 
 ---
 
@@ -99,7 +104,7 @@
 
 **参考实现**：`browser-cdp-lab`（shell 拥有 Chrome 生命周期、Playwright 仅 `connectOverCDP` 观察、`open -n` 独立实例防 shell 退出带走进程、`.run/pids` 追踪、ready 检查）。本项目 `start_instagram_cdp.zsh` 已是同款模式（且多一层端口 owner-profile 校验）；吸收 lab 的**多实例管理 + PID 文件 + lib 配置单测**即可，无需另起炉灶。lab 的 `.run/x-audit/` 已实证登录态抓 X profile。
 
-**可行性（按数据需求）**：Profile/bio/粉丝/链接 = 完全可替代（最稳）；近帖/caption/赞评 = 可替代（较慢，Reels play_count 页面可见）；评论语义 = 可替代（最慢，量小可接受）；发现 tagged/关键词 = **由 Modash Discovery 承担，IG 侧不再自产发现候选**（旧 IG 种子源随 instagrapi 一并退役，Lookalike 回流改由 Modash lookalike）。真实代价：DOM 解析比 API JSON 脆（IG 改版需维护）、慢。
+**可行性（按数据需求）**：Profile/bio/粉丝/链接 = 完全可替代（最稳）；近帖/caption/赞评 = 可替代（较慢）；报价用 Reels 播放指标由同一登录态会话读取 Instagram 同源 media info，只取 IG 原生 `ig_play_count` 计价；评论语义 = 可替代（最慢，量小可接受）；发现 tagged/关键词 = **由 Modash Discovery 承担，IG 侧不再自产发现候选**（旧 IG 种子源随 instagrapi 一并退役，Lookalike 回流改由 Modash lookalike）。真实代价：DOM 解析和同源响应字段均需随 IG 改版维护，整体较慢。
 
 **设计（后端接口隔离，不动骨架）**：新增 `browser_collect` 采集后端（唯一 `Collector` 实现），驱动登录态 Chrome（CDP）读页面，**产出与 instagrapi `_compact_media`/profile 完全同构的候选 dict/posts 结构**；discover.py stage3-6（漏斗/评分/评论分析，纯逻辑）零改动。旧 instagrapi 采集路径（Stage1 发现 API + Stage2 API 回扫）走 `Collector` 接口后被 `BrowserCollector` 取代；`account_pool.py`/`instagram_session.py` 的冷登录/TOTP/轮换/烧号防护整块**从主路径移除**（保留文件但不再被 `--v2-collect` 调用，避免误触发冷登录）。
 
@@ -225,17 +230,18 @@ BatchManifest: batch_id, sop_version, campaign_track, config_sha256,
 | audience | 目标国受众合计 ≥50 满分 / [35,50) 部分分 / **<35→Review（不被高分覆盖）**；Top Audience Language ≥50% 匹配市场主语言，不满足或缺失→Review；年龄/性别恒 N/A |
 | sponsorship | <30% 过；[30%,40%] 含两端 Review；>40% Exclude；窗口近 15 帖 |
 | shein_temu | 回看 12 个月 + Modash 全部可见历史；仅合作语境命中；日期未知但命中仍 Exclude；普通提及不淘汰 |
-| storefront | confirmed_yes/confirmed_no 均可 Include；unknown→Review；活跃=近 3 个月更新；无商品数/分类数要求 |
+| storefront | 通用电商三态：Amazon/LTK/ShopMy/明确自营店/已识别购物聚合入口均为 confirmed_yes；confirmed_yes/confirmed_no 均可 Include；unknown→Review；活跃=近 3 个月更新；无商品数/分类数要求 |
 | collectability | 私密/不可读→Exclude(private_account)；临时失败重试（次数/冷却入 config），耗尽→Review 不误杀（初跑 5 个 Error 即此场景） |
 | comments | Top10+Recent10、每帖≤10；有效样本≥20 否则固定 Review；高意图三档全口径：满分 6=≥5 条**且**≥15%；[5%,15%)=3；<5%=0；**≥15% 但 <5 条→3 分档**（默认待校准）；低质 [0,25)=3/[25,40)=2/[40,50)=1/[50,∞)=0 且 Review [CONFLICT-低质恰值] |
 | anomaly | ≥5 帖且单帖互动集中度≥70%→Review；禁用"Reels ER>2% Review"字面规则 [CONFLICT-ReelsER，docx §15 已裁定] |
 | niche_routing | Lifestyle 主赛道→封顶 Review，产品/护肤证据充分（人工证据导入）后可提升 |
 | scoring | A15/B15/C20/D15/E20/F15 全子项显式入 config；A2 导购型四档 [40,∞)=5/[30,40)=4/[20,30)=2/[0,20)=0；C1 IG 互动率基准 micro reels≥3.0/static≥1.8、mid≥1.5（达标 5/略低 2，与 seeds.toml 现值一致）；B 模块成分/设备规格/皮肤问题三类词表独立成组（区别于发现侧 seeds 词表）；Fake [0,15)=6/[15,25)=3/≥25 淘汰；organic ≥10=2/1-9=1/0=0（中间档默认）[CONFLICT-organic]；C5 Save/Share 缺失→**N/A 不扣分不进 Review**（客户覆盖）；D2 confirmed_no 时 N/A；E4 恒 N/A |
-| cpm | 仅实际 USD 报价；曝光=非置顶近 10 Reels 均播（缺失 fallback Modash 均播并标 source）；F1: ≤$35=8 / ($35,$40]=4 且 Review / >$40 Exclude [CONFLICT-F1分档]；Gifting 记 0 成本、不算 CPM、F1 N/A；Paid 缺报价→固定 Review |
+| cpm | 实际 Paid CPM 保留为独立未来规则：必须有红人/代理实际 USD 报价，不能使用展示估价；当前 `[scoring.F].defer_this_round=true`，整个 F 模块 N/A，缺实际报价不固定 Review |
+| pricing_estimate | 客户 2026-07-28 展示字段：登录态浏览器会话读 Instagram 同源 media info；先排置顶，再从剩余 Reels 取最近 10 条；均播只用 IG 原生 `ig_play_count`，总 `play_count`/`fb_play_count` 仅审计、不得抬价；均播×$35/1000 为默认，均播×$35–$40/1000 为区间；10条=complete、1–9条=partial、无原生样本才 fallback Modash、都无=missing；降级如实标注；不写 paid_cpm、不进 Gate/F/fixed Review/route |
 | elite_brands | Omnilux/CurrentBody/Therabody 每命中 +1.5 封顶 4；红光面罩+VO 可直接 4；窗口 12 个月 |
 | visual | 近 30 帖、≥2 条证据；A=4/B=2/C=0；Include 最低 B；C/无证据→Review；VO 人工 |
 | ai_score | **分层判定用 normalized_total（≥75/[65,75)/[50,65)/<50），AI Score=round(nt/10,1) 仅展示**；9.5+ 按 docx §13 严口径六条件，否则封顶 9.4 [CONFLICT-9.5VO] |
-| fixed_review | Modash 核心字段缺失 / Storefront unknown / 有效评论<20 / Raw Skin或VO 未核验 / Paid 缺报价 / 受众合计<35% / 语言不满足——高分不得覆盖 |
+| fixed_review | Modash 核心字段缺失 / Storefront unknown / 有效评论<20 / 受众合计<35% / 语言不满足——高分不得覆盖；Raw Skin、VO、实际报价和展示估价完整性均不在当前固定项 |
 | merge_priority | Modash 优先：粉丝/General ER/假粉/国家/受众/语言/合作史；Instagram 优先：内容/赞助/评论/视觉；人工最高；冲突记 conflict |
 | seeds | 品牌词 Omnilux/CurrentBody/Therabody、产品词、场景词、排除词 #shein #temu——**均用于 Modash 搜索模板的 Bio/Captions/Mentions 过滤**（非 IG 侧发现）；Lookalike 指 Modash lookalike（DISC-01/05/06/07） |
 | discovery | Modash 单发现通道 + 外部 handle 注入：**Paid 搜索模板**（Creator 主池 + Regular 补充池、Business 排除；10K-150K；Location 按 Tier1/2 分别执行；ER≥2%、Fake≤25% 仅作召回；Posted within 30 天不足放宽 90 天；Active creators 开启；Bio/Captions 词表 skincare/beauty device/red light/LED mask/anti-aging/acne/skin recovery；Mentions currentbody/omniluxled/therabody）；**Gifting 模板独立跑**（5K-<30K 与 30K-50K，不与 Paid 混用）；**AI Search 按意图拆小查询**（讲解型护肤教育/红光设备真实使用/自然光低滤镜/带教育 VO 的 Amazon 美容设备推荐）；**AI 每个查询叠加 Followers/Location/ER/Fake/Active/Account Type 基础过滤，先比结果质量再决定是否用 Image Search/Lookalike**；Gifting 除粉丝档外其余条件与 Paid 一致；Mentions 清单开放可扩（currentbody/omniluxled/therabody 等）；结果页只读不 View 不导出；UI 总数不可信按实际 handle 去重；数量漏斗 100-300→50-100→30-50→15-30→Profile 10-20→Include 1-10；**降噪与深扫排序承接成本报告"两源命中"要求：≥2 独立来源命中（Modash 各搜索模板 Paid/Gifting/AI、客户回流、人工 Approved 互为独立源；IG 侧不再自产发现源）优先进深扫队列，人工 Approved/客户回流可例外，单源候选仅在池量不足时按分数递补**；每类新动作（新 Search/AI/Image/Lookalike/Save）首次执行前 canary；Collaborations 索引不全，品牌合作用 Mentions/Captions 召回、以 Profile Report 合作史+IG 原帖判定 |
@@ -286,10 +292,10 @@ class Collector(Protocol):        # BrowserCollector 为唯一运行时实现
 | P0-4 | **Modash 三通道取数适配**：①`search_pool_import.py` 搜索结果页缩池记录导入（**主发现通道**，零 Profile 消耗，字段契约见 §2.2；含 config discovery 组的 Paid/Gifting/AI 模板快照）；②`lookup_log.py` Profile 补数 + 预算台账（每轮≤20/每日≤30/账期≤110/80% 保留线，30 天缓存，canary 记录）；③`import_modash_export.py` **仅 shortlist** 导出适配 + 字段映射报告。外部成本：Profile/导出按 §1.4 纪律；新搜索动作首次 canary | AUTH-03/04, DATA-02/03, DISC-01/05/06/07 | extensions/integrations/modash/ | 台账绑定 run/handle/action_id；重跑不重复扣费；预算触线即停；未映射列显式列出；结果页记录带 filters_snapshot 可复现同一搜索 |
 | P0-5 | 硬门槛引擎 `gates.py`（GATE-01..12 + 可采集性分流 + SHEIN/Temu 语境匹配 + 图谱封顶） | GATE-01..12, COLLECT-01/02, SCOPE-01 | extensions/sop_v2/gates.py | 边界用例：Paid 9,999/10K/150K/150,001；Gifting 4,999/5K/29,999/30K/50K/50,001；fake 24.99/25.00；ER 2.00/2.01；赞助 29.99/30/40/40.01；CPM 35.00/40.00/40.01 |
 | P0-6 | 评分引擎 `scoring.py`（A-F + N/A 归一化 + AI Score + 9.5 封顶；分层用 normalized_total） | SCORE-*/TOTAL-01..04 | extensions/sop_v2/scoring.py | golden fixtures：E4 恒 N/A、D2 confirmed_no、Gifting F1 N/A、C5 缺失 N/A（C 分母 20→17）；fake 15.00/24.99；低质 25/40/50 恰值；"20 样本 3 条=15%"组合档；74.9 不入 Include；9.5 六条件缺一封顶 |
-| P0-7 | 路由引擎 `routing.py`（硬红线→固定 Review（含受众/语言）→Lifestyle 封顶→分数分层→Storefront 双 Include；Gifting 30K-50K 插入位置=硬红线与固定 Review 之后） | ROUTE-01..05 | extensions/sop_v2/routing.py | 恰好一池；高分+缺报价不入 Include；Lifestyle 高分封顶；30K-50K+缺报价→Review；受众 34.9/35.0、语言 49.9/50.0 |
+| P0-7 | 路由引擎 `routing.py`（硬红线→固定 Review（含受众/语言）→Lifestyle 封顶→分数分层→Storefront 双 Include；Gifting 30K-50K 插入位置=硬红线与固定 Review 之后） | ROUTE-01..05 | extensions/sop_v2/routing.py | 恰好一池；通用 Storefront yes/no 可分别 Include、unknown Review；展示估价状态变化不改池；Lifestyle 高分封顶；受众 34.9/35.0、语言 49.9/50.0 |
 | P0-8 | 编排入口 `run_v2.py` | DB-01/02 | extensions/sop_v2/run_v2.py | 同输入重跑逐字节一致 |
 | P0-9 | 五池导出 `export_v2_xlsx.py`（8 sheet） | DEL-01..08 | scripts/export_v2_xlsx.py | 结构测试；Herman 空列；缺失显示"缺失"不填 0 |
-| P0-10 | `discover.py --v2-collect`（§2.3 七点，含 `--handle-pool` 注入接口；采集经 BrowserCollector）。外部成本：在线验证消耗登录态 profile 请求 | GATE-11, GATE-01..03, COLLECT-03/04/05, SCORE-F3 | scripts/discover.py | 不带旗标逐字节一致；带旗标：Without-Storefront（初跑 4 人即用例）与 Gifting 5K-9,999 产出完整 30 帖+评论；置顶标记落库；**仅 --handle-pool 输入即可完成回扫全流程（IG 侧无自产种子）** |
+| P0-10 | `discover.py --v2-collect`（§2.3 七点，含 `--handle-pool` 注入接口；采集经 BrowserCollector）。外部成本：在线验证消耗登录态 profile 请求 | GATE-11, GATE-01..03, COLLECT-03/04/05, SCORE-F3, PRICE-01..05 | scripts/discover.py | 通用 Storefront 与 confirmed_no 都继续深采；置顶标记和最近 10 条非置顶 Reels 播放证据落库；**仅 --handle-pool 输入即可完成回扫全流程（IG 侧无自产种子）** |
 | P0-11 | 测试套件 + 合成 fixtures（可采初跑证据包脱敏结构） | QA-01..04 | tests/ | 全绿；覆盖每个边界与每个池 |
 | P0-12 | 离线回归：历史 scan cache 跑 run_v2，新旧评分对照（流程性） | — | — | 对照表输出；无未解释翻转 |
 | P0-13 | 日志/交付包脱敏扫描 + 无外发断言（联系方式仅记录） | AUTH-05, SCOPE-02, SCORE-F6 | tests/test_redaction.py + batch.py 钩子 | 命中即失败；F6 只记录可用性 |
@@ -302,7 +308,7 @@ class Collector(Protocol):        # BrowserCollector 为唯一运行时实现
 |---|---|---|---|---|
 | P1-1 | 人工证据合同 + 导入（Raw Skin ≥2 条+时间、VO、风险、报价；Lifestyle 提升证据同通道） | SCORE-B4/B5, F7/F8 | scripts/import_manual_evidence.py | 导入后重跑路由确定性变化；Pending 只进 Review |
 | P1-2 | Storefront 活跃度 + LTK 人工穿透工作流。外部成本：浏览器访问 | SCORE-D2/D3 | verify_browser.py 契约不变 + manual_evidence | 日期不可见不伪造；unknown→Review |
-| P1-3 | CPM 计算（非置顶近 10 Reels 均播优先，fallback Modash 均播标 source） | SCORE-F1..F4 | scoring.py + merge.py | 35.00/40.00/40.01 断言；Gifting F1 N/A（不因 CPM=0 得分也不记 0 分）；估算不作确认值 |
+| P1-3 | 展示型预估报价（先排置顶再取 10 条；Instagram 原生优先，fallback Modash 均播标 source） | PRICE-01..06 | pricing.py + browser_collect_v2.py + exporters | 1K 均播=$35–$40、10K=$350–$400；complete/partial/fallback/missing；派生前后 paid_cpm/Gate/F/route 不变 |
 | P1-4 | Modash Profile 补数执行流（客户 Chrome 插件只读；先查 30 天缓存；预算内逐个；证据=值/页面/时间/截图引用）。外部成本：Profiles 配额 | DATA-02, AUTH-01..05 | lookup_log.py 执行侧 | 触线即停；未补数保留 Missing/Review；零凭证落盘 |
 | P1-5 | 评论异常互动集中度（≥5 帖且≥70%→Review，CLIENT_CONFLICT 标记） | SCORE-C8 | gates.py | 69.9/70.0 边界 fixture |
 
@@ -323,8 +329,9 @@ class Collector(Protocol):        # BrowserCollector 为唯一运行时实现
 2. 候选发现（**Modash 单发现通道**）：a) Modash Legacy/AI Search 按 config discovery 模板执行（新搜索先 canary；结果页只读记录 → search_pool_import.py；不点 View、不导出、不 Bulk save）+ 客户回流/人工 Approved handle 注入；b) `discover.py --v2-collect --resume`（BrowserCollector 走登录态 Chrome profile 回扫 Handle 池；候选池落盘；中断可续跑）。
 3. `verify_browser.py` 核验 Storefront 三态。
 4. Modash 补数：30 天缓存优先 → Profile 队列（≤20/轮）→ 终选 shortlist 才导出并完成**字段映射确认**。
-5. 人工证据：Raw Skin/VO/风险/报价模板录入导入。
-6. `run_v2.py` → 五池 → `export_v2_xlsx.py` + HTML + manifest；交付前脱敏扫描。
+5. 人工证据：Raw Skin/VO/风险/实际报价模板录入导入。
+6. `run_v2.py` 派生展示估价 → 五池 → `export_v2_xlsx.py` + HTML + manifest；核对报价
+   样本/来源状态和“非实际报价”提示，再做脱敏扫描。
 7. 人工抽查全部 Include + ≥20 条 Review/Exclude；同 raw 重跑一致性验证。
 8. 交付；回收 Herman 两列回导；只把客户明确确认的新规则写回 config；CONFLICT 台账逐项裁定。
 
@@ -340,7 +347,7 @@ class Collector(Protocol):        # BrowserCollector 为唯一运行时实现
 | 客户 Chrome 已登录 Modash 会话 | 缩池/补数/导出 | 已确认；2FA 客户完成 |
 | 新 Legacy/AI/Image/Lookalike/Save 动作的成本 canary | Discovery 模板正式批量执行前提 | 待执行（实测仅覆盖翻页+一次筛选切换零消耗） |
 | Raw Skin / VO 人工核验执行人 | P1-1 | 客户确认人工判定；需指定角色 |
-| Paid 实际报价来源 | F 模块 | 缺报价固定 Review，不阻塞交付 |
+| Paid 实际报价来源 | 未来恢复 F 模块时计算实际 CPM | 当前 F 整体 N/A；缺实际报价不固定 Review，也不影响展示估价 |
 | 阶段 9"触达/合作结果记录"是否本期范围 | P2-3 模板 | 待确认，暂按范围外 |
 
 ## 5. 客户待确认冲突台账（CONFLICT，随首批交付提交裁定）

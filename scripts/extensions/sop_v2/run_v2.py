@@ -19,7 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from extensions.sop_v2 import gates, routing, scoring  # noqa: E402
+from extensions.sop_v2 import gates, pricing, routing, scoring, storefront  # noqa: E402
 from extensions.sop_v2.config import config_sha256, load_config  # noqa: E402
 from extensions.sop_v2.contracts import GateVerdict  # noqa: E402
 
@@ -30,7 +30,7 @@ REASON_TEXT = {
     # stage2/3 机器淘汰原因（rejected 号进 Exclude 池写明）
     "private": "私密账号",
     "brand_account": "品牌/官方号（非个人创作者）",
-    "no_amazon_storefront": "无 Amazon 橱窗（非本赛道导购）",
+    "no_amazon_storefront": "历史规则：未确认 Amazon 橱窗（当前 V2 不再作为硬淘汰）",
     "off_niche": "非目标赛道（护肤/美妆导购）",
     "fake_followers_high": "假粉 ≥ 25%",
     "general_er_low": "Modash General ER ≤ 2%",
@@ -95,6 +95,8 @@ def score_by_module(items) -> dict:
 
 
 def decide(cand: dict, cfg: dict) -> dict:
+    cand = storefront.normalize(dict(cand))
+    cand["pricing_estimate"] = pricing.derive_quote_estimate(cand, cfg)
     gate_results = gates.evaluate_gates(cand, cfg)
     items = scoring.score_all(cand, cfg)
     summ = scoring.normalize(items)
@@ -118,9 +120,6 @@ def decide(cand: dict, cfg: dict) -> dict:
         "decision_summary": decision_summary(r["pool"].value, r.get("review_reasons"),
                                              r.get("exclude_reasons"), ai),
     })
-    # storefront link 展示
-    if cand.get("storefront_status") == "confirmed_yes":
-        rec["amazon_storefront_link"] = cand.get("amazon_storefront_link") or cand.get("external_url")
     return rec
 
 
@@ -128,6 +127,9 @@ def decide_rejected(cand: dict, cfg: dict | None = None) -> dict:
     """机器淘汰号（stage2/3 已 reject，_reject_reason 携带原因）：直接归 Exclude 池并写明原因。
     不跑完整 decide——它们缺 Modash/深采数据，跑评分/门槛会误判。客户铁律：淘汰也要体现，
     带已抓浅扫数据（粉丝/橱窗/赛道）展示，让客户浏览判断，不 silently drop。"""
+    cand = storefront.normalize(dict(cand))
+    if cfg is not None:
+        cand["pricing_estimate"] = pricing.derive_quote_estimate(cand, cfg)
     reason = cand.get("_reject_reason") or "rejected"
     rec = dict(cand)
     txt = _humanize([reason])
@@ -142,8 +144,6 @@ def decide_rejected(cand: dict, cfg: dict | None = None) -> dict:
         "ai_vetting_score": None,
         "decision_summary": "机器淘汰（发现/浅扫阶段）：" + "；".join(txt),
     })
-    if cand.get("storefront_status") == "confirmed_yes":
-        rec["amazon_storefront_link"] = cand.get("amazon_storefront_link") or cand.get("external_url")
     return rec
 
 

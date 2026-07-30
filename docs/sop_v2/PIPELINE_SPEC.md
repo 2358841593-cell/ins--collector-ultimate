@@ -1,6 +1,8 @@
 # 四阶段模块化流水线 · 冻结规格（单一事实源）
 
-日期：2026-07-16。经设计 workflow（4 facet 并行）+ 对抗审查（8 blocking）收敛。实现以本文为准。
+初版日期：2026-07-16；当前修订：2026-07-28。经设计 workflow（4 facet 并行）+
+对抗审查（8 blocking）收敛，并合入客户 2026-07-28 的 Storefront 与展示估价口径。
+实现以本文为准。
 
 ## 0. 数据流总线
 
@@ -35,17 +37,67 @@ rejected 是每级旁路终态。任一级**瞬时失败**（号问题）→ sta
 - **坑B：缺 Modash 补数 → Include 恒空**。routing 的 `modash_core_missing` 要 `fake_pct/creator_country/top_audience_country`，浏览器零 API 拿不到 → 全批钉 Review。
   **修**：④decide 在调 run_v2 前，对**将 Include 的候选**走 Modash CDP 补数（尊重 `modash_budget.export_only_shortlist`）；补数失败**诚实降级 Review**（不阻塞出表）。测试阶段无 Modash 会话 → 候选诚实落 Review（符合预期，非 bug）。
 - **坑C：wall/challenge 误判成 rejected → 一次限流永久烧号**。
-  **修**：严格映射——`login_wall/logged_out/profile_fetch_failed/任何异常` → `mark_error`（status 不动，可重试）；**仅** `is_private/brand_account/no_amazon_storefront/off_niche/real_er<0.5%` → `reject`。process_one **禁止** `else→reject` 兜底。`real_er` 缺失（未登录/未取到赞评）→ 不判 zombie，走 gate_real_er 的 `missing_is_review`→Review。
+  **修**：严格映射——`login_wall/logged_out/profile_fetch_failed/任何异常` →
+  `mark_error`（status 不动，可重试）；Stage 2 仅
+  `is_private/brand_account/followers_out_of_range/off_niche` → `reject`。
+  `confirmed_no` 和任意非 Amazon Storefront 都必须继续深采；`unknown` 留给 Stage 4
+  Review。Stage 3 的低 ER 或证据不足也不作机器早淘汰。process_one **禁止**
+  `else→reject` 兜底。
 
 ## 4. 其它审查项的定夺
 
 - **旧库 9 行回填**：迁移时一次性把**现有全部行**置 `status='decided'`（终态，旧红光设备测试数据不进新 Amazon 导购流水线）；用 `PRAGMA user_version` 守卫**只跑一次**，绝不每次 `_conn` 重跑。金种子 tier/client_status 不碰（正交）。
 - **ig_er 显示**：④export 时 `cand.setdefault('ig_er', cand.get('real_er'))`（纯展示映射，不碰 gates）。
-- **私密/粉丝档**：stage2 rejected 处理（private/brand/no_storefront/off_niche 统一 rejected，DB 可查审计）；粉丝档只做**与 track 无关的宽粗筛**（<2k 或 >300k 明显越界），精确分档留 `gate_followers`。
-- **rejected 复发**：本版 `should_ingest_seed` 对 `client_status='rejected'`(客户) 与 `status='rejected'`(机器) 均排除；可变原因(off_niche/no_storefront)的跨轮复活留作后续（可人工 `UPDATE status='seed'`）。
+- **私密/粉丝档**：Stage 2 对 private/brand/followers_out_of_range/off_niche 记
+  rejected，DB 可查审计；粉丝档只做**与 track 无关的宽粗筛**（<2k 或 >300k
+  明显越界），精确分档留 `gate_followers`。Storefront 不属于 Stage 2 淘汰条件。
+- **rejected 复发**：`should_ingest_seed` 对 `client_status='rejected'`（客户）与
+  `status='rejected'`（机器）均排除；可变的 off_niche 跨轮复活必须走受控重排接口，
+  不直接裸 SQL 改状态。历史 `no_amazon_storefront` 属规则漂移，应精确重排并保留审计。
 - **并发**：`_conn()` 加 `PRAGMA journal_mode=WAL` + `busy_timeout=5000`；**同批默认单进程串行**，`locked_at`+stale 兜底孤儿。
 - **证据路径**：新 pipeline 模块复用 `browser_collect_v2` 的 `_shot`/`relative_to(ROOT)`，ROOT=仓库根，与 `export_v2_xlsx.ROOT` 一致；不另算。
-- **reason 码对齐**：机器淘汰码复用 gates/run_v2 的 `REASON_TEXT` 键（no_amazon_storefront/brand_account/followers_out_of_range/real_er_low）。
+- **reason 码对齐**：机器浅扫淘汰码复用 gates/run_v2 的 `REASON_TEXT` 键
+  （private/brand_account/followers_out_of_range/off_niche）。不得再生成
+  `no_amazon_storefront`；低 ER 在当前口径进入 Review，而不是机器 rejected。
+
+### 4.1 Storefront 三态
+
+Storefront 表示通用电商购物入口，而非 Amazon 白名单：
+
+- `confirmed_yes`：Amazon、LTK、ShopMy、明确自营店或已识别的购物聚合入口；
+- `confirmed_no`：确认没有 Storefront，仍可完成深采并进入
+  `Include-Without-Storefront`；
+- `unknown`：证据不足，Stage 4 Review。
+
+聚合页导航失败是瞬时采集错误或未知证据，不得降成 `confirmed_no`；非 Amazon 的有效购物
+入口也不得降成“无橱窗”。
+
+### 4.2 展示型预估报价
+
+客户 2026-07-28 新增 `pricing_estimate`。采集顺序和公式冻结为：
+
+```text
+先排除置顶 Reels → 对剩余 Reels 按时间倒序取最近 10 条
+登录态浏览器会话 → Instagram 同源 media info
+average_plays = Σ ig_play_count / 实际合格样本数
+default quote = average_plays × 35 / 1000 USD
+range = average_plays × [35, 40] / 1000 USD
+```
+
+数据合同必须保留 `requested_reels=10`、`sample_count`、`pinned_excluded`、
+`average_plays`、`source`、`captured_at`、逐 Reel 证据及
+`quote_usd.default/min/max`。每条媒体的总 `play_count` 和 `fb_play_count` 可以留作
+审计，但不能进入 `average_plays` 或报价；报价指标优先且只使用 IG 原生
+`ig_play_count`。状态只能是：
+
+- `complete`：10 条 Instagram 原生合格样本；
+- `partial`：1–9 条原生合格样本；
+- `fallback_modash`：没有原生合格样本，使用明确标注的 Modash 均播；
+- `missing`：两类均无数据，价格为空。
+
+`partial/fallback_modash/missing` 必须在 JSON/XLSX/HTML 中如实标注。该值只用于展示，
+不是实际报价，不得写 `paid_cpm`，也不得进入 Gate、F 模块、固定 Review 或五池路由。
+实际报价和实际 Paid CPM 始终是另一类人工/报价证据。
 
 ## 5. 冻结的 creator_cache 流水线 API（其余模块只调这些，不写裸 SQL）
 
@@ -64,7 +116,11 @@ should_ingest_seed(handle) -> bool            # 去重：client_status/status='r
 ## 6. 阶段模块布局
 
 `scripts/extensions/sop_v2/pipeline/`：`__init__.py` · `_base.py`(run_stage 骨架) · `stage1_discover.py` · `stage2_qualify.py` · `stage3_collect.py` · `stage4_decide.py` · `run_pipeline.py`。
-stage2/3 **复用** `browser_collect_v2` 的 `open_ctx/fetch_profile_browser/_resolve_storefront/_post_stats/_load_comments/_scroll_snippet_into_view/_goto/_shot/_pause`（零 API，不 import instaloader）。stage4 复用 `run_v2.decide` + `export_v2_xlsx`。
+stage2/3 **复用** `browser_collect_v2` 的
+`open_ctx/fetch_profile_browser/_resolve_storefront/_post_stats/_load_comments/_scroll_snippet_into_view/_goto/_shot/_pause`
+（不 import instaloader/instagrapi）。Stage 3 另通过同一登录态浏览器会话调用 Instagram
+同源 media info，保存非置顶 Reels 播放证据；
+Stage 4 复用 `run_v2.decide` + `pricing.derive_quote_estimate` + `export_v2_xlsx`。
 
 ## 7. 验收门禁
 
@@ -72,3 +128,7 @@ stage2/3 **复用** `browser_collect_v2` 的 `open_ctx/fetch_profile_browser/_re
 2. 状态机往返：假 handle 走 seed→qualified→collected→decided，断言 status 流转 + stage_json 累积不丢。
 3. upsert 不清零：对 collected 行重浅扫，断言 status/real_er/stage_json 不变。
 4. 端到端：一个真实合格候选能走到 Include（依赖 ④Modash 补数）——测试期无 Modash 会话则诚实落 Review。
+5. Storefront：Amazon/LTK/ShopMy/自营店/购物聚合均能归入 `confirmed_yes`；
+   `confirmed_no` 不在 Stage 2 rejected；`unknown` 进入 Review。
+6. 展示估价：先排置顶再取 10 条；覆盖完整、1–9 条、Modash fallback 和 missing；
+   断言派生前后 `paid_cpm`、Gate、分数和最终路由均不变。

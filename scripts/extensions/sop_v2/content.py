@@ -72,10 +72,15 @@ def median_er(posts, followers, window: int = 10):
 
 def derive_content_signals(cand: dict, cfg: dict) -> dict:
     posts = cand.get("posts") or []
-    followers = cand.get("follower_count") or 0
+    followers = cand.get("follower_count") or cand.get("seed_followers") or 0
     out = {}
     if not posts:
         return out
+    if not cand.get("follower_count") and cand.get("seed_followers"):
+        # Instagram profile DOM 偶尔拿不到粉丝数，但 Stage 1 已保存同轮 Modash
+        # seed_followers。显式标记来源后用于 ER 分母，避免“赞评齐全却永远算不出 ER”。
+        out["follower_count"] = cand["seed_followers"]
+        out["follower_count_source"] = "modash_seed_fallback"
 
     captions = [(p.get("caption_text") or "") for p in posts]
     recent15 = posts[:15]

@@ -28,6 +28,13 @@ _SEARCH_JS = """async (a) => {
     body: JSON.stringify({skip:a.skip, limit:6, search_origin:'lookalikes', query:a.query, filters:a.filters})});
   return await r.text();
 }"""
+_EXACT_SEARCH_JS = """async (handle) => {
+  const r = await fetch('/api/search/v2/instagram?', {method:'POST',
+    headers:{'content-type':'application/json'},
+    body: JSON.stringify({skip:0, limit:6, search_origin:'text-search',
+      filters:{username:handle}})});
+  return await r.text();
+}"""
 _SHOW_JS = """async (spid) => {
   const r = await fetch('/api/discovery/show-profile/'+spid
     +'?allowOutdated=true&originatingFrom=ai_search&useInHouseEngagementRate=true');
@@ -47,10 +54,47 @@ def _find_modash(b):
     return None
 
 
+def _service_platform_id(result: dict):
+    """Return the report id across old and current Modash search contracts."""
+    return result.get("servicePlatformId") or result.get("serviceSdId")
+
+
 def resolve_platform_ids(pg, handles, query, filters, max_pages=40):
-    """重跑 discovery 搜索分页，建 {handle(lower) → servicePlatformId}。"""
+    """Build ``handle(lower) → report id`` with exact search plus bulk fallback.
+
+    The July 2026 marketer UI uses ``filters.username`` for Creator mode and
+    returns ``serviceSdId``.  Older discovery responses used
+    ``servicePlatformId``.  Exact Creator-mode search is free and avoids ranking
+    drift from a broad discovery query.  Empty/error responses are retried
+    because the endpoint can briefly return no result under a long sequential
+    run.  The historical bulk discovery scan remains a fallback for older UI
+    contracts.
+    """
     want = {h.lstrip("@").lower() for h in handles}
     idmap = {}
+
+    for handle in sorted(want):
+        for attempt in range(3):
+            try:
+                res = json.loads(pg.evaluate(_EXACT_SEARCH_JS, handle))
+            except Exception:  # noqa: BLE001
+                res = {}
+            for result in res.get("results") or []:
+                username = (result.get("username") or "").lower()
+                spid = _service_platform_id(result)
+                if username == handle and spid:
+                    idmap[handle] = spid
+                    break
+            if handle in idmap:
+                break
+            if attempt < 2:
+                pg.wait_for_timeout(500 * (attempt + 1))
+        pg.wait_for_timeout(100)
+
+    unresolved = want - set(idmap)
+    if not unresolved:
+        return idmap
+
     for i in range(max_pages):
         try:
             res = json.loads(pg.evaluate(_SEARCH_JS, {"skip": i * 6, "query": query, "filters": filters}))
@@ -61,9 +105,10 @@ def resolve_platform_ids(pg, handles, query, filters, max_pages=40):
             break
         for x in results:
             u = (x.get("username") or "").lower()
-            if u and u not in idmap:
-                idmap[u] = x.get("servicePlatformId")
-        if want <= set(idmap):
+            spid = _service_platform_id(x)
+            if u and spid and u not in idmap:
+                idmap[u] = spid
+        if unresolved <= set(idmap):
             break
         pg.wait_for_timeout(300)
     return idmap

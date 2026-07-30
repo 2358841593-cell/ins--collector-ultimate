@@ -1,8 +1,14 @@
 # SOP V2 最终执行清单（开发追踪表）
 
-版本：1.2 ｜ 日期：2026-07-14 ｜ 分支：`sop-v2-dev`
-（v1.1 = 新增 B0 浏览器采集后端 track；v1.2 = 客户拍板 instagrapi 完全退役、浏览器唯一 IG 通道、Modash 复用已登录 Chrome；R0 全面改为登录态 profile 池）
-**这是后续开发、修复与测试的唯一执行入口。** 每项任务的完整设计、阈值口径与验收标准见 [`DEV_EXECUTION_CHECKLIST.md`](DEV_EXECUTION_CHECKLIST.md)（v1.3.1，经三轮多视角对抗校验，共修订 67 处），此表只列"做什么、在哪做、什么算完成"。
+版本：1.3 ｜ 日期：2026-07-28 ｜ 分支：`sop-v2-dev`
+（v1.3 = 合入通用 Storefront 与展示型预估报价口径）
+本表只跟踪“做什么、在哪做、什么算完成”；当前业务规则以
+[`PIPELINE_SPEC.md`](PIPELINE_SPEC.md) 和
+[`REQUIREMENTS_CHECKLIST.md`](REQUIREMENTS_CHECKLIST.md) 为准。
+
+> 2026-07-28 覆盖：Storefront 不限 Amazon；`confirmed_no` 不早淘汰，`unknown` 才 Review。
+> 展示估价按最近 10 条非置顶 Reels 均播 × CPM $35（区间 $35–$40）/1000，只进交付展示，
+> 不写 `paid_cpm`、不参与 Gate/F/固定 Review/路由。
 
 执行环境（本机）：
 - 仓库：`/Users/wiselq/Desktop/ins-collector`，分支 `sop-v2-dev`，边修复边测试。
@@ -65,10 +71,12 @@
 - [~] **P0-4** Modash 三通道适配：`search_pool_import.py`（主发现，13 字段契约）/ `lookup_log.py`（Profile 补数+预算台账）/ `import_modash_export.py`（仅 shortlist）
 - [x] **P0-5** `gates.py` 硬门槛引擎（GATE-01..12 + 可采集性；全部半开区间边界用例）
 - [x] **P0-6** `scoring.py`（A-F、N/A 归一化、AI Score、9.5 封顶；golden fixtures）
-- [x] **P0-7** `routing.py`（固定 Review 七项优先 → Lifestyle 封顶 → 分层 → 五池互斥）
+- [x] **P0-7** `routing.py`（当前五项固定 Review 优先 → Lifestyle 封顶 → 分层 →
+  Storefront yes/no 双 Include；展示估价状态不改路由）
 - [x] **P0-8** `run_v2.py` 编排（同输入逐字节可复现）
 - [x] **P0-9** `export_v2_xlsx.py` 五池 8 sheet（Herman 空列；缺失不填 0）
-- [ ] **P0-10** `discover.py --v2-collect` 七点旗标（双闸旁路/track 放宽/30 帖/置顶/评论采样/旧线停用/`--handle-pool`）；不带旗标逐字节回归
+- [~] **P0-10** 浏览器采集：通用 Storefront 三态不早淘汰；先排置顶再取最近 10 条
+  非置顶 Reels 播放证据；评论采样与 `--resume`
 - [~] **P0-11** 测试套件 + 合成 fixtures（可用初跑证据包脱敏结构）
 - [ ] **P0-12** 离线回归：初跑 scan cache 跑 run_v2 新旧对照
 - [x] **P0-13** 脱敏扫描 + 无外发断言（`tests/test_redaction.py` + 交付前钩子）
@@ -77,7 +85,10 @@
 
 - [x] **P1-1** `import_manual_evidence.py`（Raw Skin/VO/风险/报价模板；Lifestyle 提升同通道）
 - [~] **P1-2** Storefront 活跃度 + LTK 人工穿透工作流
-- [ ] **P1-3** CPM 计算（非置顶近 10 Reels 均播；Gifting F1=N/A；35/40/40.01 断言）
+- [~] **P1-3** 展示型预估报价：均播×$35/1000、区间 $35–$40；覆盖
+  complete/partial/fallback_modash/missing；同源 media info 只以 IG 原生
+  `ig_play_count` 计价，总 `play_count`/`fb_play_count` 仅审计；并断言与实际
+  `paid_cpm`、评分和路由隔离
 - [ ] **P1-4** Modash Profile 补数执行流（yibo Chrome 只读；30 天缓存优先；预算触线即停）
 - [ ] **P1-5** 互动集中度异常检测（≥5 帖且 ≥70%→Review）
 
@@ -86,10 +97,12 @@
 - [ ] **RB-0** 预检门通过（健康登录态 Chrome profile 数 ≥N，见 R0-3；登录态新鲜；代理一致；config SHA 锁定）
 - [ ] **RB-1** 建批：显式选 track；Handle 池目标 100-300 → Include 1-10 不凑数
 - [ ] **RB-2** 发现（Modash 单通道）：a) Modash 模板搜索（新动作先 canary，结果页只读 → search_pool_import）+ 客户回流/人工 handle 注入；b) `discover.py --v2-collect --resume`（BrowserCollector 登录态 profile 回扫 Handle 池，中断可续跑）
-- [ ] **RB-3** verify_browser.py Storefront 三态核验
+- [ ] **RB-3** 核验通用 Storefront 三态（Amazon/LTK/ShopMy/自营店/购物聚合；
+  confirmed_no 继续，unknown Review）
 - [ ] **RB-4** Modash 补数（缓存→Profile 队列 ≤20/轮→shortlist 导出+字段映射确认）
-- [ ] **RB-5** 人工证据录入（Raw Skin/VO/风险/报价）
-- [ ] **RB-6** run_v2 → 五池 → XLSX + HTML + manifest → 脱敏扫描
+- [ ] **RB-5** 人工证据录入（Raw Skin/VO/风险/实际报价）
+- [ ] **RB-6** run_v2 派生展示估价 → 五池 → XLSX + HTML + manifest；检查样本/来源状态、
+  “估算非实际报价”提示及决策隔离 → 脱敏扫描
 - [ ] **RB-7** 人工抽查全部 Include + ≥20 条 Review/Exclude；同 raw 重跑一致性
 - [ ] **RB-8** 交付 → Herman 回填回导 → CONFLICT 台账（9 条，见 v1.3.1 §5）请客户裁定 → 只把明确确认的规则写回 config
 
@@ -121,6 +134,6 @@
 | 本机代理出口口径（有无 Clash） | 负责人/运维 | E0-3 → R0-2/3（存活性优化，非阻断） |
 | 新 Search/AI/Lookalike/Save 首次 canary | 开发（RB-2 前执行） | Modash 模板批量执行 |
 | Raw Skin/VO 人工核验执行人 | 客户/负责人 | P1-1 证据供给 |
-| Paid 实际报价来源 | 客户 | F 模块（缺则固定 Review，不阻塞交付） |
+| Paid 实际报价来源 | 客户 | 未来恢复 F 模块时使用；当前 F=N/A，缺失不固定 Review，也不影响展示估价 |
 | CONFLICT 台账 9 条裁定 | 客户（随首批交付） | 下一版 config |
 | 阶段 9"触达/合作结果记录"是否本期范围 | 客户（随首批交付） | P2-3 回导模板列（暂按范围外） |

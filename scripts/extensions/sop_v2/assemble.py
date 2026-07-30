@@ -18,6 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import browser_collect  # noqa: E402
 from extensions.sop_v2 import content as content_mod  # noqa: E402
+from extensions.sop_v2 import storefront as storefront_mod  # noqa: E402
 from extensions.sop_v2.config import load_config  # noqa: E402
 
 _CFG = load_config()
@@ -50,16 +51,15 @@ def derive_storefront(prof):
     ext = prof.get("external_url")
     if ext:
         links.append(ext)
-    joined = " ".join(links).lower()
-    for a in AMAZON:
-        if a in joined:
-            amazon_link = next((l for l in links if any(x in l.lower() for x in ("amazon", "amzn"))), ext)
-            return "confirmed_yes", amazon_link
-    if any(g in joined for g in AGG):
-        return "unknown", None      # 聚合页，需浏览器穿透
+    ranked = {"Amazon": 0, "LTK": 1, "ShopMy": 2, "自营店": 3, "链接聚合": 4}
+    found = [(l, storefront_mod.classify_url(l)) for l in links]
+    found = [(l, t) for l, t in found if t]
+    if found:
+        url, kind = min(found, key=lambda x: ranked.get(x[1], 9))
+        return "confirmed_yes", url, kind
     if not links:
-        return "confirmed_no", None
-    return "unknown", None
+        return "unknown", None, None
+    return "unknown", None, None
 
 
 def derive_niche(prof):
@@ -72,7 +72,7 @@ def derive_niche(prof):
 
 def assemble_one(handle, modash_rec, account, headless=True):
     prof = browser_collect.fetch_profile(account, handle, headless=headless)
-    st, amazon_link = derive_storefront(prof)
+    st, storefront_link, storefront_type = derive_storefront(prof)
     cand = {
         "handle": handle,
         "full_name": prof.get("full_name"),
@@ -85,7 +85,9 @@ def assemble_one(handle, modash_rec, account, headless=True):
         "external_url": prof.get("external_url"),
         "bio_links": prof.get("bio_links"),
         "storefront_status": st,
-        "amazon_storefront_link": amazon_link,
+        "storefront_url": storefront_link,
+        "storefront_type": storefront_type,
+        "amazon_storefront_link": storefront_link if storefront_type == "Amazon" else None,
         "core_niche_key": derive_niche(prof),
         "general_er": _er_to_float(modash_rec.get("er")),
         "brand_account_type": "personal",

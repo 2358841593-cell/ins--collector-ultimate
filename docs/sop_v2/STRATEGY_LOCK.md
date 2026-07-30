@@ -1,4 +1,4 @@
-# 采集策略固化（v2 · 2026-07-15）
+# 采集策略固化（v2 · 2026-07-15，2026-07-28 补充）
 
 本文件锁定经实测收敛的关键策略，后续开发以此为准；改动需在此登记原因。
 
@@ -41,14 +41,19 @@
 - 改用带货导向 Modash 查询（amazon storefront / shop my amazon / link in bio）→ 命中真带货号；
   **副作用**：会混入店铺/品牌号（hebestore19 等）→ 靠浏览器品牌判定 + 早跳过滤。
 
+这里的 Amazon 关键词只是发现阶段的高精度召回信号，不是 Storefront 白名单。候选后续出现
+LTK、ShopMy、明确自营店或已识别购物聚合入口，同样算 `confirmed_yes`；确认没有任何
+Storefront 的 `confirmed_no` 也继续深采。
+
 ## 5b. 客户 2026-07-15 确认变更（已落地）
 - **discovery 只做「Amazon Finds 导购型」赛道**：config `[discovery]` 换成 amazon_shopping_guide
   （带货导向 Modash 查询 + 橱窗信号 + 护肤/美妆赛道词 + 排店铺信号）；红光设备种子退役。
 - **ER 放宽**：Modash General ER **降为参考、不再硬淘汰**（`general_er_reference_only=true`）；
   **实算 ER = 硬门槛**，取**前 10 帖**赞评/粉丝算（`[real_er]`：<0.5% Exclude、[0.5,1.0) Review、
   缺数据 Review 不误杀）。GATE-13 落地。
-- **采集全程浏览器、零 API**：`browser_collect_v2` 移除 instaloader 调用；profile/品牌/橱窗/帖子
-  网格/赞评全走浏览器渲染；强制英文 locale 保证登出/多语言下解析稳。
+- **采集全程复用浏览器会话**：`browser_collect_v2` 移除 instaloader/instagrapi 调用；
+  profile/品牌/橱窗/帖子网格/赞评主要走浏览器渲染；报价播放指标由同一登录态会话调用
+  Instagram 同源 media info。强制英文 locale 保证登出/多语言下解析稳。
 
 ## 5c. 账号现状（阻塞项，2026-07-15）
 - 老 5 号：过度测 API → 临时限流冷却（redirect-loop）。
@@ -57,8 +62,22 @@
 - **结论**：评论购买意图、实算 ER、storefront 穿透都需可登录的号；供应商需交付能保持登录、
   无风控挑战的号（我不能代过人机验证）。
 
+## 5d. 客户 2026-07-28 确认变更
+
+- **Storefront 通用化**：Amazon、LTK、ShopMy、明确自营店和已识别购物聚合入口均算有；
+  `confirmed_no` 不早淘汰，`unknown` 才 Review。
+- **展示型预估报价**：先排置顶，再从剩余 Reels 按发布时间倒序取最近 10 条；默认报价为
+  均播×$35/1000，区间为均播×$35–$40/1000。播放证据由登录态浏览器会话读取
+  Instagram 同源 media info；均播只使用 IG 原生 `ig_play_count`，总
+  `play_count`/`fb_play_count` 仅审计、不得抬价。
+- **证据降级必须显式**：10 条=`complete`、1–9 条=`partial`、无原生样本才
+  `fallback_modash`、均无=`missing`。
+- **决策隔离**：展示估价不是实际报价，不写 `paid_cpm`，不进入 Gate、F 分、固定 Review
+  或五池路由。
+
 ## 6. 硬门槛（不依赖 Modash 的先行）→ 通过者才 Modash 补数
-followers 档 / 赞助饱和 / **真实 storefront** / 排品牌号 / 赛道 / 实算 ER（帖量足够大才准）→
+followers 档 / 赞助饱和 / **Storefront 三态留证（yes/no 都不早淘汰）** / 排品牌号 / 赛道 /
+实算 ER（帖量足够大才准）→
 过硬门槛 → 才用 Modash 补 fake%/受众（客户既有业务流程，走本机已登录 yibo Chrome CDP）。
 
 ## 7. 数据库飞轮（见 DB_FLYWHEEL_DESIGN.md）

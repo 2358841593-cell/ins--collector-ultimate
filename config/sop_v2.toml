@@ -182,6 +182,15 @@ exposure_reels_window = 10
 # Gifting 记 0 成本、不算 CPM、F1 记 N/A（不送分不扣分）；Paid 缺实际报价 → 固定 Review
 gifting_cpm_is_na = true
 
+# ── 展示型预估报价（不等于实际报价，不参与 Gate/F 分/路由）────────────
+[pricing_estimate]
+# 客户 2026-07-28：最近 10 个非置顶 Reels 平均播放量 × CPM 35–40 / 1000。
+reels_window = 10
+exclude_pinned = true
+default_cpm_usd = 35.0
+cpm_min_usd = 35.0
+cpm_max_usd = 40.0
+
 # ── AI Vetting Score 与分层 ──────────────────────────────────────
 [ai_score]
 # 分层判定用 normalized_total（防 74.9 被 round 成 7.5 误入 Include）

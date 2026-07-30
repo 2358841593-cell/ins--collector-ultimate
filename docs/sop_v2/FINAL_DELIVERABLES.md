@@ -1,8 +1,8 @@
 # Instagram 红人筛选 SOP V2 最终交付物规范
 
-版本：Baseline 1.0
+版本：Baseline 1.1
 
-日期：2026-07-14
+日期：2026-07-28
 原则：客户对外交付尽量简单；项目内部保留完整审计能力。
 
 ## 1. 最终客户交付
@@ -51,7 +51,7 @@ Instagram_Influencer_Vetting_<batch_id>.xlsx
 | Decision Summary | 一句话结论 |
 | Review Reason | 进 Review/Priority Review 的专项原因 |
 | Exclude Reason | 硬红线或低分原因 |
-| Missing Data | 待补 Modash/评论/视觉/VO/报价等 |
+| Missing Data | 待补 Modash/评论/视觉/VO/实际报价等；展示估价缺失单独标状态 |
 | Herman Approval | 空列，供客户回填 |
 | Herman's Feedback | 空列，供客户原文回填 |
 
@@ -126,17 +126,31 @@ Instagram_Influencer_Vetting_<batch_id>.xlsx
 | 字段 | 说明 |
 |---|---|
 | Storefront Status | confirmed_yes / confirmed_no / unknown |
-| Amazon Storefront Link | 确认的 Amazon URL |
+| Storefront Type | Amazon / LTK / ShopMy / 自营店 / 购物聚合 |
+| Storefront Link | 已确认的电商购物入口 URL；不限定 Amazon |
 | Storefront Last Activity | 可确认的最近更新时间 |
 | Storefront Evidence | 浏览器截图/源 URL/核验时间 |
 | Sponsorship Saturation | 近 15 帖赞助比例 |
 | SHEIN/Temu Partnership | Yes/No/Unknown + 合作证据 |
 | Elite Brand History | 近 12 个月红光品牌合作史 |
+| Pricing Estimate Status | complete / partial / fallback_modash / missing |
+| Pricing Reels Sample | 合格样本数/10；先排置顶，再从剩余 Reels 取最近 10 条 |
+| Pricing Average Plays | 合格非置顶 Reels 平均播放量 |
+| Estimated Quote USD | 展示默认值：`均播×35/1000` |
+| Estimated Quote Range USD | 展示区间：`均播×35/1000` 至 `均播×40/1000` |
+| Pricing Estimate Source | instagram_media_info_ig_play_count（同源 media info 的 IG 原生播放）/ modash_profile_fallback / missing |
+| Pricing Evidence | 每条 Reel URL、发布时间、`ig_play_count`、审计用总 `play_count`/`fb_play_count`、置顶状态与采集时间 |
 | Actual Quote USD | 红人/代理实际报价 |
-| Native Exposure | 非置顶近 10 Reels 均播 |
+| Native Exposure for Paid CPM | 实际 CPM 使用的非置顶近 10 Reels 均播 |
 | Paid CPM | 实际报价÷原生曝光×1000 |
 | Contact Availability | Email/Form/DM/None |
 | Partnership Risk | Clear/Unknown/Risk + 证据 |
+
+展示型 `Estimated Quote` 与 `Actual Quote/Paid CPM` 必须分列。前者只是客户决策参考，
+不得写入 `paid_cpm`，也不得影响 Gate、F 分、固定 Review 或最终池；后者必须有红人/代理
+实际报价证据。估价只使用同源 media info 的 IG 原生 `ig_play_count`；总
+`play_count`/`fb_play_count` 仅作审计，不能进入均播或抬高报价。
+`partial/fallback_modash/missing` 必须原样暴露，不得伪装为完整 10 条窗口。
 
 ### 3.7 评分分解
 
@@ -180,6 +194,8 @@ Instagram_Influencer_Vetting_<batch_id>.xlsx
 - A-F 评分规则。
 - N/A、Missing、Pending、Conflict 的含义。
 - Storefront 双轨和五池分流规则。
+- 展示估价的 `$35` 默认、`$35–$40` 区间、先排置顶再取 10 条及四种状态；
+- 展示估价与实际报价/Paid CPM 的决策隔离。
 - Modash 只作定向补充、非全量导出的口径。
 
 ## 6. 项目内部审计包
@@ -233,7 +249,10 @@ delivery/<batch_id>/
 
 - [ ] 五个决策池互斥且无遗漏。
 - [ ] Include 候选硬门槛全部有原值、来源和证据。
-- [ ] 缺核心 Modash 字段、Storefront 未知、评论不足、Raw Skin/VO 未核验、Paid 缺报价的候选未被自动 Include。
+- [ ] 缺核心 Modash 字段、Storefront 未知、评论不足、受众/语言固定项未满足的候选未被自动 Include。
+- [ ] Amazon/LTK/ShopMy/自营店/购物聚合均可被识别；`confirmed_no` 未在采集阶段早淘汰。
+- [ ] 展示估价先排置顶再取 10 条，并显示默认值、区间、样本数、来源和完整性状态。
+- [ ] 展示估价未写 `paid_cpm`，派生前后 Gate、F 分、固定 Review 和最终池不变。
 - [ ] 所有 Exclude 都有可追溯硬红线或分数原因。
 - [ ] 所有 Include 和至少 20 个 Review/Exclude 已人工抽查。
 - [ ] AI Score、N/A 归一化和 9.5 封顶通过测试。

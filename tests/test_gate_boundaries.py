@@ -18,10 +18,21 @@ def verdict(cand):
 
 
 def base(**kw):
-    # 默认给 storefront confirmed + real_er 达标，隔离被测门槛
-    # （storefront unknown / real_er 缺失都会独立返回 REVIEW，会污染其它门槛测试）
-    c = {"platform": "instagram", "campaign_track": "paid", "storefront_status": "confirmed_yes",
-         "real_er": 2.0}
+    # 默认让所有无关门槛通过，单个用例只覆盖自己要测的字段。
+    # GATE-13 当前以 real_er_median 为准；旧数据缺中位数时才回退 Modash general_er。
+    c = {
+        "platform": "instagram",
+        "campaign_track": "paid",
+        "storefront_status": "confirmed_yes",
+        "real_er_median": 2.0,
+        "fake_pct": 10.0,
+        "creator_country": "US",
+        "top_audience_country": "US",
+        "general_er": 3.0,
+        "sponsorship_saturation": 20.0,
+        "brand_account_type": "personal",
+        "shein_temu_partnership": False,
+    }
     c.update(kw)
     return c
 
@@ -55,11 +66,30 @@ class TestModashGates(unittest.TestCase):
         self.assertEqual(verdict(base(follower_count=50000, general_er=2.0)), GateVerdict.PASS)
 
     def test_real_er_hard_gate(self):
-        # 实算 ER 硬门槛(GATE-13)：<0.5% EXCLUDE / [0.5,1.0) REVIEW / >=1.0 PASS / 缺失 REVIEW
-        self.assertEqual(verdict(base(follower_count=50000, real_er=0.3)), GateVerdict.EXCLUDE)
-        self.assertEqual(verdict(base(follower_count=50000, real_er=0.7)), GateVerdict.REVIEW)
-        self.assertEqual(verdict(base(follower_count=50000, real_er=1.5)), GateVerdict.PASS)
-        self.assertEqual(verdict(base(follower_count=50000, real_er=None)), GateVerdict.REVIEW)
+        # 2026-07-16 放宽：实算中位 ER <1% 均 Review 浮现，不再硬淘汰；>=1% PASS。
+        self.assertEqual(
+            verdict(base(follower_count=50000, real_er_median=0.3)),
+            GateVerdict.REVIEW,
+        )
+        self.assertEqual(
+            verdict(base(follower_count=50000, real_er_median=0.7)),
+            GateVerdict.REVIEW,
+        )
+        self.assertEqual(
+            verdict(base(follower_count=50000, real_er_median=1.5)),
+            GateVerdict.PASS,
+        )
+        self.assertEqual(
+            verdict(
+                base(
+                    follower_count=50000,
+                    real_er_median=None,
+                    sampled_posts=[],
+                    general_er=None,
+                )
+            ),
+            GateVerdict.REVIEW,
+        )
 
 
 class TestSponsorship(unittest.TestCase):

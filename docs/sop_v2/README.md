@@ -1,6 +1,11 @@
 # SOP V2 文档索引
 
 当前生产主线是 Modash-first、Instagram browser-only 的四阶段流水线。
+2026-07-28 起，Storefront 按通用电商三态处理；展示型预估报价按最近 10 条非置顶
+Reels 均播 × CPM $35（区间 $35–$40）/1000 计算。播放证据由登录态浏览器会话读取
+Instagram 同源 media info，定价优先且只采用 IG 原生 `ig_play_count`；总
+`play_count`/`fb_play_count` 仅审计，不得抬价。部分样本、Modash fallback 和缺失
+必须如实标注，且展示估价与实际报价、评分和路由隔离。
 
 建议阅读顺序：
 
@@ -12,6 +17,7 @@
 6. [`STRATEGY_LOCK.md`](STRATEGY_LOCK.md)：经实测锁定的采集策略；
 7. [`SYSTEM_STATUS.md`](SYSTEM_STATUS.md)：截至文档日期的完成度与延后项；
 8. [`FINAL_DELIVERABLES.md`](FINAL_DELIVERABLES.md)：交付字段和目标结构。
+9. [`REQUIREMENTS_CHECKLIST.md`](REQUIREMENTS_CHECKLIST.md)：当前逐项业务与验收口径。
 
 事实源说明：
 

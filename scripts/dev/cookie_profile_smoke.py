@@ -9,7 +9,7 @@
 
 用法：
     .venv/bin/python scripts/dev/cookie_profile_smoke.py --index 0 [--headless]
-    .venv/bin/python scripts/dev/cookie_profile_smoke.py --username gimdohyeonay699
+    .venv/bin/python scripts/dev/cookie_profile_smoke.py --username <账号名>
 """
 from __future__ import annotations
 

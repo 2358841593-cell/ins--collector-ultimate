@@ -34,16 +34,25 @@ class TestPools(unittest.TestCase):
         r = full_route(clean_full(storefront_status="confirmed_no"))
         self.assertEqual(r["pool"], Pool.INCLUDE_WITHOUT_STOREFRONT)
 
+    def test_non_amazon_storefront_uses_with_pool(self):
+        # 兼容历史数据：旧记录可能 status=unknown/no，但已保存 ShopMy/LTK/自营入口。
+        r = full_route(clean_full(
+            storefront_status="unknown",
+            storefront_url="https://shopmy.us/example",
+            storefront_type="ShopMy",
+        ))
+        self.assertEqual(r["pool"], Pool.INCLUDE_WITH_STOREFRONT)
+
     def test_hard_gate_exclude(self):
         r = full_route(clean_full(fake_pct=25.0))
         self.assertEqual(r["pool"], Pool.EXCLUDE)
         self.assertIn("fake_followers_high", r["exclude_reasons"])
 
-    def test_fixed_review_overrides_high_score(self):
-        # 满分向但缺实际报价 → 固定 Review，不得 Include
+    def test_missing_paid_quote_is_scoring_na_not_fixed_review(self):
+        # 客户 2026-07-16 放宽：实际报价缺失只让评分项 N/A，不再锁死 Review。
         r = full_route(clean_full(paid_cpm=None))
-        self.assertEqual(r["pool"], Pool.REVIEW)
-        self.assertIn("paid_quote_missing", r["review_reasons"])
+        self.assertEqual(r["pool"], Pool.INCLUDE_WITH_STOREFRONT)
+        self.assertNotIn("paid_quote_missing", r["review_reasons"])
 
     def test_storefront_unknown_fixed_review(self):
         r = full_route(clean_full(storefront_status="unknown"))

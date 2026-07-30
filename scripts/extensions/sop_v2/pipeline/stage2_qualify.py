@@ -1,7 +1,9 @@
 """② 浅扫合格：seed → qualified | rejected。纯浏览器零 API（1 次 profile 页渲染）。
 
 便宜硬门槛（PIPELINE_SPEC 坑C：号问题绝不 reject，只 error 重试）：
-  私密 / 品牌号 / 粉丝越界(<2k 或 >300k 宽粗筛) / 无 Amazon 橱窗 / 非护肤美妆赛道 → reject。
+  私密 / 品牌号 / 粉丝越界(<2k 或 >300k 宽粗筛) / 非护肤美妆赛道 → reject。
+  Storefront 只记录不早淘汰：Amazon、LTK、ShopMy、自营店、购物聚合均算有橱窗；
+  确认无橱窗也继续进入 Without-Storefront，未知留 Stage 4 Review。
   精确粉丝分档（paid 10-150k / gifting 双池）留 run_v2 gate_followers。
 
 用法：cd scripts && ../.venv/bin/python -m extensions.sop_v2.pipeline.stage2_qualify \
@@ -42,8 +44,6 @@ def qualify_one(pg, cand, cfg):
     if f is not None and (f < lo or f > hi):           # 与 track 无关的宽粗筛
         return ("reject", "followers_out_of_range", cand)
     bc._resolve_storefront(cand, pg)
-    if cand.get("storefront_status") == "confirmed_no":
-        return ("reject", "no_amazon_storefront", cand)
     niche = cand.get("core_niche_key")
     if niche not in p.get("core_niches", ["skincare", "beauty_device", "beauty_wellness"]):
         bio = (cand.get("biography") or "").lower()
