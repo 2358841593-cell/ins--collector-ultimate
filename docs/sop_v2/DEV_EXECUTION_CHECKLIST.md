@@ -237,7 +237,7 @@ BatchManifest: batch_id, sop_version, campaign_track, config_sha256,
 | niche_routing | Lifestyle 主赛道→封顶 Review，产品/护肤证据充分（人工证据导入）后可提升 |
 | scoring | A15/B15/C20/D15/E20/F15 全子项显式入 config；A2 导购型四档 [40,∞)=5/[30,40)=4/[20,30)=2/[0,20)=0；C1 IG 互动率基准 micro reels≥3.0/static≥1.8、mid≥1.5（达标 5/略低 2，与 seeds.toml 现值一致）；B 模块成分/设备规格/皮肤问题三类词表独立成组（区别于发现侧 seeds 词表）；Fake [0,15)=6/[15,25)=3/≥25 淘汰；organic ≥10=2/1-9=1/0=0（中间档默认）[CONFLICT-organic]；C5 Save/Share 缺失→**N/A 不扣分不进 Review**（客户覆盖）；D2 confirmed_no 时 N/A；E4 恒 N/A |
 | cpm | 实际 Paid CPM 保留为独立未来规则：必须有红人/代理实际 USD 报价，不能使用展示估价；当前 `[scoring.F].defer_this_round=true`，整个 F 模块 N/A，缺实际报价不固定 Review |
-| pricing_estimate | 客户 2026-07-28 展示字段：登录态浏览器会话读 Instagram 同源 media info；先排置顶，再从剩余 Reels 取最近 10 条；均播只用 IG 原生 `ig_play_count`，总 `play_count`/`fb_play_count` 仅审计、不得抬价；均播×$35/1000 为默认，均播×$35–$40/1000 为区间；10条=complete、1–9条=partial、无原生样本才 fallback Modash、都无=missing；降级如实标注；不写 paid_cpm、不进 Gate/F/fixed Review/route |
+| pricing_estimate | 客户 2026-07-28 展示字段：登录态同源 media-info；先排置顶，再取最近 10 条；只用原生 `ig_play_count`，总/FB/Modash 均禁止 fallback；10条=complete；1–9条仅在健康 Reels Tab 到底两轮无增长且逐 Reel pin/source/identity 全闭合时=complete_available（置顶项只需 identity+pin 证据，非置顶项另需原生播放量），否则 partial；0条须明确空态，或两次 `/reels/` 均回同账号健康主页且无 Reels surface，才=not_applicable_no_reels/null，否则 missing；不写 paid_cpm、不进 Gate/F/fixed Review/route |
 | elite_brands | Omnilux/CurrentBody/Therabody 每命中 +1.5 封顶 4；红光面罩+VO 可直接 4；窗口 12 个月 |
 | visual | 近 30 帖、≥2 条证据；A=4/B=2/C=0；Include 最低 B；C/无证据→Review；VO 人工 |
 | ai_score | **分层判定用 normalized_total（≥75/[65,75)/[50,65)/<50），AI Score=round(nt/10,1) 仅展示**；9.5+ 按 docx §13 严口径六条件，否则封顶 9.4 [CONFLICT-9.5VO] |

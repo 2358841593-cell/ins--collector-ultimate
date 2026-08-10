@@ -1,13 +1,16 @@
 """Strict deep-collection gates distinguish genuine low activity from failures."""
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import sys
 
 import browser_collect_v2
 import pytest
 
+from extensions.sop_v2 import comments as comment_semantics
 from extensions.sop_v2 import creator_cache as cc
+from extensions.sop_v2 import pricing as pricing_mod
 from extensions.sop_v2.config import load_config
 from extensions.sop_v2.pipeline import (
     audit_collect,
@@ -81,6 +84,201 @@ def test_strict_contract_accepts_explicit_repeated_low_comment_unavailable():
         ],
     )
 
+    assert cc.strict_deep_reasons(
+        candidate, status="collected", target_posts=10
+    ) == []
+
+
+def _verified_empty_thread_post():
+    endpoint = {
+        "http_status": 200,
+        "status": "ok",
+        "comment_count": 0,
+        "comments_count": 0,
+        "fb_comments_count": 0,
+        "has_more_comments": False,
+        "has_more_headload_comments": False,
+        "has_more_headload_fb_comments": False,
+    }
+    post = {
+        "code": "/p/EMPTY/",
+        "url": "https://www.instagram.com/p/EMPTY/",
+        "like_count": 3,
+        "comment_count": 3,
+        "comments_collected": 0,
+        "comment_sampling_status": "verified_empty_thread",
+        "comment_empty_thread_evidence": {
+            "schema": comment_semantics.EMPTY_THREAD_EVIDENCE_SCHEMA,
+            "source": comment_semantics.EMPTY_THREAD_EVIDENCE_SOURCE,
+            "marker": "No comments yet.",
+            "marker_visible": True,
+            "reported_count": 3,
+            "endpoint": endpoint,
+        },
+    }
+    unavailable = {
+        "url": post["url"],
+        "reported_count": 3,
+        "reason": comment_semantics.EMPTY_THREAD_REASON,
+        "source": comment_semantics.EMPTY_THREAD_EVIDENCE_SOURCE,
+        "marker": "No comments yet.",
+        "endpoint_summary": deepcopy(endpoint),
+    }
+    return post, unavailable
+
+
+def _explicit_verified_empty_candidate():
+    post, unavailable = _verified_empty_thread_post()
+    return _explicit_complete(
+        sampled_posts=[post, *_posts(9)],
+        comment_attempted_posts=1,
+        comment_completed_posts=10,
+        comment_failed_posts=[],
+        comment_unavailable_posts=[unavailable],
+    )
+
+
+def test_strict_contract_accepts_dom_and_endpoint_verified_empty_thread():
+    assert cc.strict_deep_reasons(
+        _explicit_verified_empty_candidate(),
+        status="collected",
+        target_posts=10,
+    ) == []
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing_evidence",
+        "invalid_marker",
+        "endpoint_not_ok",
+        "endpoint_nonempty",
+        "pairs_present",
+        "reported_count_mismatch",
+        "missing_unavailable_row",
+    ],
+)
+def test_strict_contract_rejects_forged_verified_empty_thread(mutation):
+    candidate = _explicit_verified_empty_candidate()
+    post = candidate["sampled_posts"][0]
+    unavailable = candidate["comment_unavailable_posts"][0]
+    if mutation == "missing_evidence":
+        post.pop("comment_empty_thread_evidence")
+    elif mutation == "invalid_marker":
+        post["comment_empty_thread_evidence"]["marker"] = "comments hidden"
+    elif mutation == "endpoint_not_ok":
+        post["comment_empty_thread_evidence"]["endpoint"]["status"] = "fail"
+    elif mutation == "endpoint_nonempty":
+        post["comment_empty_thread_evidence"]["endpoint"]["comments_count"] = 1
+    elif mutation == "pairs_present":
+        post["comments_collected"] = 1
+    elif mutation == "reported_count_mismatch":
+        unavailable["reported_count"] = 2
+    elif mutation == "missing_unavailable_row":
+        candidate["comment_unavailable_posts"] = []
+
+    reasons = cc.strict_deep_reasons(
+        candidate, status="collected", target_posts=10
+    )
+
+    assert any("评论不可见终态证据无效" in reason for reason in reasons)
+
+
+def test_strict_contract_never_accepts_count_three_as_low_retry_terminal():
+    candidate = _explicit_complete(
+        sampled_posts=[
+            {
+                "code": "/p/HIGH/",
+                "like_count": 12,
+                "comment_count": 3,
+                "comments_collected": 0,
+                "comment_sampling_status": "unavailable_after_retry",
+            },
+            *_posts(9),
+        ],
+        comment_attempted_posts=1,
+        comment_completed_posts=10,
+        comment_failed_posts=[],
+        comment_unavailable_posts=[
+            {
+                "url": "https://www.instagram.com/p/HIGH/",
+                "reported_count": 3,
+                "reason": "reported_low_count_unavailable_after_retry",
+            }
+        ],
+    )
+
+    reasons = cc.strict_deep_reasons(
+        candidate, status="collected", target_posts=10
+    )
+
+    assert any("评论不可见终态证据无效" in reason for reason in reasons)
+
+
+def test_strict_contract_rejects_positive_post_with_forged_collected_status():
+    candidate = _explicit_complete(
+        sampled_posts=[
+            {
+                "code": "/p/FORGED/",
+                "like_count": 12,
+                "comment_count": 3,
+                "comments_collected": 0,
+                "comment_sampling_status": "collected",
+            },
+            *_posts(9),
+        ],
+        comment_attempted_posts=1,
+        comment_completed_posts=10,
+        comment_failed_posts=[],
+    )
+
+    reasons = cc.strict_deep_reasons(
+        candidate, status="collected", target_posts=10
+    )
+
+    assert any("逐帖评论完成证据无效" in reason for reason in reasons)
+
+
+def test_strict_contract_checks_low_terminal_retry_state_when_present():
+    candidate = _explicit_complete(
+        sampled_posts=[
+            {
+                "code": "/p/LOW/",
+                "like_count": 12,
+                "comment_count": 2,
+                "comments_collected": 0,
+                "comment_sampling_status": "unavailable_after_retry",
+            },
+            *_posts(9),
+        ],
+        comment_attempted_posts=1,
+        comment_completed_posts=10,
+        comment_failed_posts=[],
+        comment_unavailable_posts=[
+            {
+                "url": "https://www.instagram.com/p/LOW/",
+                "reported_count": 2,
+                "reason": "reported_low_count_unavailable_after_retry",
+            }
+        ],
+        stage3_comment_retry_state=[
+            {
+                "identity": "LOW",
+                "url": "https://www.instagram.com/p/LOW/",
+                "state": "retry_pending",
+                "failure_streak": 1,
+            }
+        ],
+    )
+
+    reasons = cc.strict_deep_reasons(
+        candidate, status="collected", target_posts=10
+    )
+    assert any("评论不可见终态证据无效" in reason for reason in reasons)
+
+    candidate["stage3_comment_retry_state"][0].update(
+        state="terminal_unavailable", failure_streak=2
+    )
     assert cc.strict_deep_reasons(
         candidate, status="collected", target_posts=10
     ) == []
@@ -171,7 +369,7 @@ def test_stage3_strict_mode_blocks_incomplete_but_allows_genuine_low(
     monkeypatch.setattr(
         browser_collect_v2,
         "deep_collect",
-        lambda *args: (_explicit_complete(), []),
+        lambda *args, **kwargs: (_explicit_complete(), []),
     )
     verdict = stage3_collect.collect_one(
         object(), candidate, cfg, "BATCH", 10, strict_completeness=True
@@ -185,7 +383,7 @@ def test_stage3_strict_mode_blocks_incomplete_but_allows_genuine_low(
         sampled_posts=_posts(7),
     )
     monkeypatch.setattr(
-        browser_collect_v2, "deep_collect", lambda *args: (failed, [])
+        browser_collect_v2, "deep_collect", lambda *args, **kwargs: (failed, [])
     )
     verdict = stage3_collect.collect_one(
         object(), candidate, cfg, "BATCH", 10, strict_completeness=True
@@ -193,6 +391,71 @@ def test_stage3_strict_mode_blocks_incomplete_but_allows_genuine_low(
     assert verdict[0] == "error"
     assert verdict[1].startswith("deep_incomplete:")
     assert verdict[2] is failed
+
+
+def test_formal_stage3_disables_pre_cas_cache_write(monkeypatch):
+    cfg = load_config()
+    observed = {}
+
+    def fake_deep_collect(*args, **kwargs):
+        observed.update(kwargs)
+        return _explicit_complete(), []
+
+    monkeypatch.setattr(browser_collect_v2, "deep_collect", fake_deep_collect)
+
+    verdict = stage3_collect.collect_one(
+        object(),
+        {"handle": "creator"},
+        cfg,
+        "BATCH",
+        10,
+        strict_completeness=True,
+    )
+
+    assert verdict[0:2] == ("advance", "collected")
+    assert observed["persist_cache"] is False
+
+
+def test_stage3_optional_translator_enriches_result_without_recollecting(
+    monkeypatch,
+):
+    cfg = load_config()
+    collected = _explicit_complete(
+        comments_analyzed=1,
+        valid_comments=1,
+        comment_sample=["Où acheter ?"],
+    )
+    monkeypatch.setattr(
+        browser_collect_v2,
+        "deep_collect",
+        lambda *args, **kwargs: (collected, []),
+    )
+    calls = []
+
+    def translate(result):
+        calls.append(result)
+        result["comment_translations"] = [
+            {
+                "original_text": "Où acheter ?",
+                "translated_zh": "在哪里买？",
+                "source_language": "fr",
+                "status": "translated",
+            }
+        ]
+
+    verdict = stage3_collect.collect_one(
+        object(),
+        {"handle": "creator"},
+        cfg,
+        "BATCH",
+        10,
+        strict_completeness=True,
+        comment_translator=translate,
+    )
+
+    assert verdict[0:2] == ("advance", "collected")
+    assert calls == [collected]
+    assert verdict[2]["comment_translations"][0]["translated_zh"] == "在哪里买？"
 
 
 def test_stage3_strict_error_carries_failed_urls_and_partial_evidence(
@@ -223,7 +486,7 @@ def test_stage3_strict_error_carries_failed_urls_and_partial_evidence(
         evidence_dir="data/evidence/BATCH/creator",
     )
     monkeypatch.setattr(
-        browser_collect_v2, "deep_collect", lambda *args: (failed, [])
+        browser_collect_v2, "deep_collect", lambda *args, **kwargs: (failed, [])
     )
 
     verdict = stage3_collect.collect_one(
@@ -347,6 +610,16 @@ def test_machine_reject_requeue_clears_reject_state_but_preserves_pricing(
         "pricing_reel_samples": [{"code": "/reel/KEEP/"}],
         "pricing_estimate": {"status": "complete"},
         "pricing_captured_at": "2026-07-29T10:00:00+08:00",
+        "deep_collection_attempts": [{"attempt_id": "old-attempt"}],
+        "deep_canonical_attempt_id": "old-attempt",
+        "deep_canonical_quality": {"sampled_posts": 2},
+        "pricing_canonical_attempt_id": "old-attempt",
+        "pricing_canonical_quality": {"pricing_rank": 4},
+        "stage3_comment_retry_state": {
+            "schema_version": 1,
+            "by_identity": {"P0": {"state": "terminal_unavailable"}},
+        },
+        "deep_evidence_merge_provenance": {"internal": True},
     }
     with cc._conn() as conn:  # noqa: SLF001 - isolated test database
         conn.execute(
@@ -368,18 +641,49 @@ def test_machine_reject_requeue_clears_reject_state_but_preserves_pricing(
     assert "sampled_posts" not in saved
     assert "deep_collection_status" not in saved
     assert "comment_unavailable_posts" not in saved
+    assert "deep_collection_attempts" not in saved
+    assert "deep_canonical_attempt_id" not in saved
+    assert "deep_canonical_quality" not in saved
+    assert "pricing_canonical_attempt_id" not in saved
+    assert "pricing_canonical_quality" not in saved
+    assert "stage3_comment_retry_state" not in saved
+    assert "deep_evidence_merge_provenance" not in saved
     assert saved["pricing_estimate"]["status"] == "complete"
     assert saved["pricing_reel_samples"] == [{"code": "/reel/KEEP/"}]
+
+
+def test_requeue_reset_covers_every_stage3_internal_field():
+    from extensions.sop_v2.pipeline import deep_attempts
+
+    assert set(deep_attempts.STAGE3_RESET_FIELDS) <= set(cc._DEEP_FIELDS)  # noqa: SLF001
 
 
 def test_stage4_strict_and_all_candidate_modes_block_before_output(
     tmp_path, monkeypatch
 ):
+    pricing_rows = [
+        {
+            "code": f"/reel/PRICE{index}/",
+            "url": f"https://www.instagram.com/reel/PRICE{index}/",
+            "is_reel": True,
+            "pinned": False,
+            "play_count": 10_000,
+            "play_count_status": "observed",
+            "play_count_source": "ig_media_info.ig_play_count",
+            "grid_rank": index,
+        }
+        for index in range(10)
+    ]
+    pricing_estimate = pricing_mod.derive_quote_estimate(
+        {"pricing_reel_samples": pricing_rows}, load_config()
+    )
     active = clean_full(
         handle="active",
         _status="collected",
         _reject_reason=None,
         _discovery_batch="NEW",
+        pricing_reel_samples=pricing_rows,
+        pricing_estimate=pricing_estimate,
         **_explicit_complete(),
     )
     rejected = {
@@ -432,6 +736,57 @@ def test_stage4_strict_and_all_candidate_modes_block_before_output(
     )
     assert stage4_decide.main() == 1
     assert not all_out.exists()
+
+
+def test_stage4_strict_blocks_unproven_short_pricing_before_output(
+    tmp_path, monkeypatch, capsys
+):
+    rows = [
+        {
+            "code": f"/reel/SHORT{index}/",
+            "url": f"https://www.instagram.com/reel/SHORT{index}/",
+            "is_reel": True,
+            "pinned": False,
+            "play_count": 10_000,
+            "play_count_status": "observed",
+            "play_count_source": "ig_media_info.ig_play_count",
+            "grid_rank": index,
+        }
+        for index in range(5)
+    ]
+    partial = pricing_mod.derive_quote_estimate(
+        {"pricing_reel_samples": rows}, load_config()
+    )
+    candidate = clean_full(
+        handle="partial_price",
+        _status="collected",
+        _reject_reason=None,
+        _discovery_batch="NEW",
+        pricing_reel_samples=rows,
+        pricing_estimate=partial,
+        **_explicit_complete(),
+    )
+    monkeypatch.setattr(
+        stage4_decide.cc, "export_all_with_data", lambda _scope: [candidate]
+    )
+    monkeypatch.setattr(stage4_decide.cc, "advance", lambda *args: None)
+    out = tmp_path / "blocked.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stage4_decide",
+            "--batch-id", "NEW",
+            "--track", "paid",
+            "--strict-completeness",
+            "--out", str(out),
+            "--no-xlsx",
+        ],
+    )
+
+    assert stage4_decide.main() == 1
+    assert not out.exists()
+    assert "报价总体证据未闭合(status=partial)" in capsys.readouterr().out
 
 
 def test_stage4_explicit_zero_modash_cap_processes_full_shortlist(

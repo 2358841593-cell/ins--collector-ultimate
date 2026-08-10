@@ -12,7 +12,115 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "scripts"))
 
+from extensions.sop_v2 import pricing as pricing_mod  # noqa: E402
+from extensions.sop_v2.config import load_config  # noqa: E402
 from extensions.sop_v2.pipeline import stage3_pricing_backfill as backfill  # noqa: E402
+from extensions.sop_v2.pipeline import deep_attempts  # noqa: E402
+from extensions.sop_v2.pipeline import recover_deep_evidence as recovery  # noqa: E402
+
+
+def _complete_pricing_stage(handle="complete"):
+    rows = [
+        {
+            "code": f"/reel/R{index}/",
+            "url": f"https://www.instagram.com/reel/R{index}/",
+            "is_reel": True,
+            "pinned": False,
+            "play_count": 10_000,
+            "play_count_status": "observed",
+            "play_count_source": "ig_media_info.ig_play_count",
+            "grid_rank": index,
+        }
+        for index in range(10)
+    ]
+    stage = {"handle": handle, "pricing_reel_samples": rows}
+    stage["pricing_estimate"] = pricing_mod.derive_quote_estimate(
+        stage, load_config()
+    )
+    return stage
+
+
+def _pricing_stage(handle: str, sample_count: int) -> dict:
+    rows = [
+        {
+            "code": f"/reel/R{index}/",
+            "url": f"https://www.instagram.com/reel/R{index}/",
+            "is_reel": True,
+            "pinned": False,
+            "pinned_source": "ig_media_info_pin_lists",
+            "play_count": 10_000 + index,
+            "play_count_status": "observed",
+            "play_count_source": "ig_media_info.ig_play_count",
+            "grid_rank": index,
+            "media_identity_provenance": {
+                "requested_shortcode": f"R{index}",
+                "original_shortcode": f"R{index}",
+                "canonical_shortcode": None,
+                "response_code": f"R{index}",
+                "identity_verified": True,
+            },
+        }
+        for index in range(sample_count)
+    ]
+    stage = {
+        "handle": handle,
+        "pricing_reel_samples": rows,
+        "pricing_captured_at": "2026-08-11T10:00:00+08:00",
+    }
+    stage["pricing_estimate"] = pricing_mod.derive_quote_estimate(
+        stage, load_config()
+    )
+    return stage
+
+
+def _exhausted_stage(handle: str, sample_count: int) -> dict:
+    stage = _pricing_stage(handle, sample_count)
+    rows = stage["pricing_reel_samples"]
+    stage["pricing_reels_tab_evidence"] = {
+        "schema_version": pricing_mod.REELS_TAB_EVIDENCE_SCHEMA_VERSION,
+        "source": pricing_mod.REELS_TAB_EVIDENCE_SOURCE,
+        "status": "exhausted",
+        "reason": pricing_mod.REELS_TAB_EXHAUSTED_REASON,
+        "unique_reels_seen": len(rows),
+        "ordered_reel_identity_sha256": pricing_mod.reel_identity_sha256(rows),
+        "scroll_attempts": 2,
+        "stable_bottom_rounds": 2,
+        "required_stable_bottom_rounds": 2,
+        "at_bottom": True,
+        "loading_visible": False,
+        "page_identity_verified": True,
+        "reels_tab_route_verified": True,
+        "page_healthy": True,
+        "challenge": False,
+        "logged_out": False,
+        "private_account": False,
+        "error_page": False,
+        "expected_handle": handle,
+        "observed_handle": handle,
+        "requested_pathname": f"/{handle}/reels/",
+        "final_pathname": f"/{handle}/reels/",
+        "empty_state_verified": sample_count == 0,
+        "empty_reels_marker": "No Reels Yet" if sample_count == 0 else None,
+        "captured_at": "2026-08-11T11:00:00+08:00",
+    }
+    stage["pricing_captured_at"] = "2026-08-11T11:00:00+08:00"
+    stage["pricing_estimate"] = pricing_mod.derive_quote_estimate(
+        stage, load_config()
+    )
+    return stage
+
+
+def _ledgerized_pricing_stage(handle: str, sample_count: int = 5) -> dict:
+    stage = _pricing_stage(handle, sample_count)
+    if stage["pricing_estimate"]["status"] in {"partial", "missing"}:
+        stage["pricing_estimate"]["schema_version"] = 1
+        stage["pricing_estimate"].pop("population_basis")
+        stage["pricing_estimate"].pop("population_evidence")
+    return deep_attempts.finalize_stage3_verdict(
+        deep_attempts.prepare_stage3_attempt(stage),
+        ("advance", "collected", stage),
+        attempted_at="2026-08-11T02:00:00+00:00",
+    )[2]
 
 
 def _db(path: Path, rows: list[dict]) -> Path:
@@ -244,6 +352,134 @@ def test_save_pricing_refuses_customer_finalized_candidate(tmp_path):
     assert "pricing_reel_samples" not in stage
 
 
+def test_pricing_only_attempt_keeps_partial5_when_new_capture_is_missing():
+    prior = _ledgerized_pricing_stage("creator", 5)
+    attempted = {
+        "handle": "creator",
+        "pricing_reel_samples": [],
+        "pricing_captured_at": "2026-08-11T12:00:00+08:00",
+    }
+    attempted["pricing_estimate"] = pricing_mod.derive_quote_estimate(
+        attempted, load_config()
+    )
+    old_ledger_len = len(prior[deep_attempts.LEDGER_FIELD])
+    old_deep_id = prior[deep_attempts.CANONICAL_ATTEMPT_FIELD]
+    old_pricing_id = prior[deep_attempts.PRICING_CANONICAL_ATTEMPT_FIELD]
+    old_retry = json.loads(json.dumps(
+        prior[deep_attempts.COMMENT_RETRY_STATE_FIELD]
+    ))
+
+    finalized = deep_attempts.finalize_pricing_only_attempt(
+        prior,
+        attempted,
+        attempted_at="2026-08-11T04:00:00+00:00",
+    )
+
+    assert finalized["pricing_estimate"]["status"] == "partial"
+    assert finalized["pricing_estimate"]["sample_count"] == 5
+    assert finalized[deep_attempts.CANONICAL_ATTEMPT_FIELD] == old_deep_id
+    assert finalized[deep_attempts.PRICING_CANONICAL_ATTEMPT_FIELD] == old_pricing_id
+    assert finalized[deep_attempts.COMMENT_RETRY_STATE_FIELD] == old_retry
+    assert len(finalized[deep_attempts.LEDGER_FIELD]) == old_ledger_len + 1
+    attempt = finalized[deep_attempts.LEDGER_FIELD][-1]
+    assert attempt["outcome"] == "pricing_only"
+    assert attempt["evidence"]["pricing_estimate"]["status"] == "missing"
+    recovery._assert_canonical_metadata(finalized, handle="creator")  # noqa: SLF001
+
+
+def test_pricing_only_forged_no_reels_cannot_replace_partial5():
+    prior = _ledgerized_pricing_stage("creator", 5)
+    attempted = {
+        "handle": "creator",
+        "pricing_reel_samples": [],
+        "pricing_captured_at": "2026-08-11T12:00:00+08:00",
+        "pricing_estimate": {
+            "schema_version": 2,
+            "status": "not_applicable_no_reels",
+            "sample_count": 0,
+            "quote_usd": {"default": None, "min": None, "max": None},
+        },
+    }
+
+    finalized = deep_attempts.finalize_pricing_only_attempt(
+        prior,
+        attempted,
+        attempted_at="2026-08-11T04:00:00+00:00",
+    )
+
+    assert finalized["pricing_estimate"]["status"] == "partial"
+    assert finalized["pricing_estimate"]["sample_count"] == 5
+    assert finalized[deep_attempts.LEDGER_FIELD][-1]["evidence"] == {
+        "handle": "creator",
+        **{
+            key: attempted[key]
+            for key in backfill._PRICING_FIELDS
+            if key in attempted
+        },
+    }
+    recovery._assert_canonical_metadata(finalized, handle="creator")  # noqa: SLF001
+
+
+@pytest.mark.parametrize(
+    ("sample_count", "expected_status", "expected_rank"),
+    [
+        (5, "complete_available", 4),
+        (0, "not_applicable_no_reels", 3),
+    ],
+)
+def test_pricing_only_legal_terminal_capture_gets_full_owner_and_closure(
+    sample_count,
+    expected_status,
+    expected_rank,
+):
+    prior = _ledgerized_pricing_stage("creator", 5)
+    attempted = _exhausted_stage("creator", sample_count)
+
+    finalized = deep_attempts.finalize_pricing_only_attempt(
+        prior,
+        attempted,
+        attempted_at="2026-08-11T04:00:00+00:00",
+    )
+
+    attempt = finalized[deep_attempts.LEDGER_FIELD][-1]
+    assert attempt["outcome"] == "pricing_only"
+    assert isinstance(attempt.get("evidence"), dict)
+    assert finalized["pricing_estimate"]["status"] == expected_status
+    assert finalized[deep_attempts.PRICING_CANONICAL_ATTEMPT_FIELD] == (
+        attempt["attempt_id"]
+    )
+    assert finalized[deep_attempts.PRICING_CANONICAL_QUALITY_FIELD][
+        "selection_tuple"
+    ][0] == expected_rank
+    recovery._assert_canonical_metadata(finalized, handle="creator")  # noqa: SLF001
+
+
+def test_pricing_only_claim_loss_rolls_back_ledger_and_quote(tmp_path):
+    prior = _ledgerized_pricing_stage("creator", 5)
+    db = _db(
+        tmp_path / "cache.db",
+        [{"handle": "creator", "status": "collected", "stage_json": prior}],
+    )
+    claimed = backfill.claim_candidates(
+        db, batch_id="NEW", retry_incomplete=True
+    )[0]
+    finalized = deep_attempts.finalize_pricing_only_attempt(
+        claimed.cand,
+        _exhausted_stage("creator", 5),
+        attempted_at="2026-08-11T04:00:00+00:00",
+    )
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "UPDATE creator_profiles SET locked_at='other-worker' WHERE handle='creator'"
+    )
+    conn.commit()
+    conn.close()
+
+    assert backfill.save_pricing(db, claimed, finalized) is False
+    after = json.loads(_row(db, "creator")["stage_json"])
+    assert after == prior
+
+
 def test_release_claim_does_not_clear_other_workers_lock(tmp_path):
     db = _db(
         tmp_path / "cache.db",
@@ -395,7 +631,7 @@ def test_retry_incomplete_selects_three_statuses_but_never_complete(tmp_path):
             },
             {
                 "handle": "complete",
-                "stage_json": {"pricing_estimate": {"status": "complete"}},
+                "stage_json": _complete_pricing_stage("complete"),
             },
         ],
     )
@@ -413,6 +649,74 @@ def test_retry_incomplete_selects_three_statuses_but_never_complete(tmp_path):
         "fallback",
     }
     assert "complete" not in {item.handle for item in queue}
+
+
+def test_retry_incomplete_selects_tampered_complete_contract(tmp_path):
+    tampered = _complete_pricing_stage("tampered_complete")
+    tampered["pricing_estimate"]["currency"] = "EUR"
+    db = _db(
+        tmp_path / "cache.db",
+        [
+            {
+                "handle": "tampered_complete",
+                "stage_json": tampered,
+            }
+        ],
+    )
+
+    queue = backfill.claim_candidates(
+        db,
+        batch_id="NEW",
+        retry_incomplete=True,
+        dry_run=True,
+    )
+
+    assert [item.handle for item in queue] == ["tampered_complete"]
+
+
+def test_b3_pricing_audit_counts_only_fail_closed_nonterminal_evidence(
+    tmp_path, capsys
+):
+    db = _db(
+        tmp_path / "cache.db",
+        [
+            {
+                "handle": "complete",
+                "status": "collected",
+                "stage_json": _complete_pricing_stage(),
+            },
+            {
+                "handle": "partial",
+                "status": "collected",
+                "stage_json": {
+                    "pricing_estimate": {"status": "partial"}
+                },
+            },
+            {
+                "handle": "legacy_fallback",
+                "status": "collected",
+                "stage_json": {
+                    "pricing_estimate": {"status": "fallback_modash"},
+                    "avg_reels_plays": 99_000,
+                },
+            },
+        ],
+    )
+
+    failures = backfill.audit_pricing(db, batch_id="NEW")
+
+    assert {item["handle"] for item in failures} == {
+        "partial",
+        "legacy_fallback",
+    }
+    before = db.read_bytes()
+    assert backfill.main(
+        ["--batch-id", "NEW", "--db", str(db), "--audit-only"]
+    ) == 1
+    assert db.read_bytes() == before
+    output = capsys.readouterr().out
+    assert "failures=2" in output
+    assert "浏览器" not in output
 
 
 def test_handles_file_supports_lines_and_json_and_rejects_duplicates(tmp_path):
@@ -501,7 +805,7 @@ def test_handles_only_scope_can_retry_exact_incomplete_set(tmp_path):
             },
             {
                 "handle": "complete",
-                "stage_json": {"pricing_estimate": {"status": "complete"}},
+                "stage_json": _complete_pricing_stage("complete"),
             },
         ],
     )
@@ -551,7 +855,7 @@ def test_retry_dry_run_main_displays_exact_allowlist_without_browser(
             },
             {
                 "handle": "skip_complete",
-                "stage_json": {"pricing_estimate": {"status": "complete"}},
+                "stage_json": _complete_pricing_stage("skip_complete"),
             },
         ],
     )

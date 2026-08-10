@@ -14,10 +14,11 @@ Instagram 同源 media info，定价优先且只采用 IG 原生 `ig_play_count`
 3. [`../ACCOUNT_POOL_ARCHITECTURE.md`](../ACCOUNT_POOL_ARCHITECTURE.md)：账号、会话、代理与轮换；
 4. [`PIPELINE_SPEC.md`](PIPELINE_SPEC.md)：状态机、软锁和数据库 API；
 5. [`RUNBOOK.md`](RUNBOOK.md)：分阶段运行命令；
-6. [`STRATEGY_LOCK.md`](STRATEGY_LOCK.md)：经实测锁定的采集策略；
-7. [`SYSTEM_STATUS.md`](SYSTEM_STATUS.md)：截至文档日期的完成度与延后项；
-8. [`FINAL_DELIVERABLES.md`](FINAL_DELIVERABLES.md)：交付字段和目标结构。
-9. [`REQUIREMENTS_CHECKLIST.md`](REQUIREMENTS_CHECKLIST.md)：当前逐项业务与验收口径。
+6. [`FEEDBACK_GOVERNANCE.md`](FEEDBACK_GOVERNANCE.md)：客户反馈、策略提案、回放与审计；
+7. [`STRATEGY_LOCK.md`](STRATEGY_LOCK.md)：经实测锁定的采集策略；
+8. [`SYSTEM_STATUS.md`](SYSTEM_STATUS.md)：截至文档日期的完成度与延后项；
+9. [`FINAL_DELIVERABLES.md`](FINAL_DELIVERABLES.md)：交付字段和目标结构；
+10. [`REQUIREMENTS_CHECKLIST.md`](REQUIREMENTS_CHECKLIST.md)：当前逐项业务与验收口径。
 
 事实源说明：
 

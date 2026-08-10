@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from .contracts import GateResult, GateVerdict
+from .countries import normalize_country_code
 from . import storefront
 
 
@@ -56,14 +57,31 @@ def gate_followers(cand, cfg):
 
 def gate_country(cand, cfg):
     c = cfg["country"]
-    allowed = set(c["tier1"]) | set(c["tier2"])
-    cc = cand.get("creator_country")
-    tac = cand.get("top_audience_country")
-    if cc is None or tac is None:
+    allowed = {
+        code
+        for value in (*c["tier1"], *c["tier2"])
+        if (code := normalize_country_code(value)) is not None
+    }
+    raw_cc = cand.get("creator_country")
+    raw_tac = cand.get("top_audience_country")
+    cc = normalize_country_code(raw_cc)
+    tac = normalize_country_code(raw_tac)
+
+    # 创作者国家本身已能确定为非目标时立即淘汰，不能因受众国家缺失而放过。
+    if cc is not None and cc not in allowed:
+        return _g("GATE-04", GateVerdict.EXCLUDE, cc, sorted(allowed),
+                  "creator_country_not_target", "modash")
+    if cc is None:
+        if raw_cc is not None and str(raw_cc).strip():
+            return _g("GATE-04", GateVerdict.REVIEW, raw_cc, sorted(allowed),
+                      "creator_country_unrecognized", "modash")
         return None  # 交固定 Review（modash_core_missing）
-    if cc.upper() not in allowed:
-        return _g("GATE-04", GateVerdict.EXCLUDE, cc, sorted(allowed), "creator_country_not_target", "modash")
-    if c["require_creator_equals_top_audience"] and cc.upper() != tac.upper():
+    if tac is None:
+        if raw_tac is not None and str(raw_tac).strip():
+            return _g("GATE-05", GateVerdict.REVIEW, raw_tac, "known_country",
+                      "top_audience_country_unrecognized", "modash")
+        return None  # 交固定 Review（modash_core_missing）
+    if c["require_creator_equals_top_audience"] and cc != tac:
         return _g("GATE-05", GateVerdict.EXCLUDE, {"creator": cc, "top_audience": tac}, "equal",
                   "country_mismatch", "modash")
     return _g("GATE-04", GateVerdict.PASS, {"creator": cc, "top_audience": tac}, sorted(allowed))

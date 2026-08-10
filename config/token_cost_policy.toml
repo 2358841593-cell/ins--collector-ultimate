@@ -1,0 +1,38 @@
+schema_version = 1
+
+[storage]
+database = "data/token_costs.db"
+status_file = "data/token_cost_status.json"
+
+[monitor]
+timezone = "Asia/Shanghai"
+poll_interval_seconds = 5
+stale_after_seconds = 60
+listen_host = "127.0.0.1"
+listen_port = 9469
+
+# warning 会告警但不影响任务；hard_limit=0 表示暂不自动阻断。
+# 正式交付前应由项目负责人按客户预算填写 hard_limit。
+[budgets]
+day_warning_usd = 1.0
+day_hard_limit_usd = 0
+month_warning_usd = 10.0
+month_hard_limit_usd = 0
+
+[pricing]
+currency = "USD"
+source = "Anthropic official pricing; verified 2026-08-10"
+
+[pricing.models."anthropic/claude-haiku-4-5-20251001"]
+input_usd_per_million = 1.0
+output_usd_per_million = 5.0
+cache_read_usd_per_million = 0.1
+cache_write_usd_per_million = 1.25
+
+# 本地推理仍记录 token/吞吐量，但不产生供应商 API 账单。
+[pricing.models."ollama/*"]
+input_usd_per_million = 0
+output_usd_per_million = 0
+cache_read_usd_per_million = 0
+cache_write_usd_per_million = 0
+local_zero_cost = true

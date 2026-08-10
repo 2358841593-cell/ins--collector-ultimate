@@ -2,7 +2,7 @@
 """五池 XLSX 业务交付导出（专业可读版）。
 
 对齐客户 SOP §8 字段；以"购买意向评论证据"为重点（客户核心诉求）；可点真实链接
-（IG 主页 / 电商橱窗）；评论区截图嵌入证据 sheet 并内链跳转。
+（IG 主页 / 电商橱窗）；全部已存评论的中文翻译与原文写入证据 sheet，截图作为可选附件。
 风格：色标验收建议 + 隔行底纹 + 合理行高列宽 + 冻结窗格 + 自动筛选，专业可读。
 """
 from __future__ import annotations
@@ -12,9 +12,14 @@ import json
 import os
 from collections import Counter
 from pathlib import Path
+from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
-from export_v2_comment_status import comment_collection_complete
+from export_v2_comment_status import (
+    comment_collection_complete,
+    comment_unavailable_note,
+)
+from extensions.sop_v2 import comment_translation as translation_mod
 from extensions.sop_v2 import storefront as storefront_mod
 POOLS = ["Include-With-Storefront", "Include-Without-Storefront",
          "Priority-Review", "Review", "Exclude"]
@@ -40,7 +45,7 @@ COLS = [
     ("全名", "full_name", 22, False),
     ("粉丝", "follower_count", 9, False),
     ("赛道", "niche", 11, False),
-    ("购买意向评论（原话）", "intent_snippet", 40, True),
+    ("购买意向评论（中文 / 原文）", "intent_snippet", 40, True),
     ("评论证据", "comment_ev", 10, False),
     ("电商橱窗 / 购物入口", "storefront_link", 20, False),
     ("赞助占比", "sponsorship", 9, False),
@@ -51,6 +56,7 @@ COLS = [
     ("预估报价 USD（CPM 35）", "pricing_quote", 17, False),
     ("预估上限 USD（CPM 40）", "pricing_quote_high", 17, False),
     ("报价状态 / 来源", "pricing_status", 26, True),
+    ("Reels 总体证据", "pricing_population", 34, True),
     ("AI 评分", "ai", 8, False),
     ("结论", "summary", 30, True),
     ("待补/原因", "reasons", 34, True),
@@ -72,6 +78,83 @@ def _xlsx_safe(value):
     return value
 
 
+def _safe_http_url(value):
+    """Return a workbook-safe HTTP(S) URL or ``None``.
+
+    Comment/profile/storefront URLs are external evidence.  Rejecting local and
+    active-content schemes here prevents a malformed candidate from creating a
+    clickable ``file:``, ``javascript:`` or custom-protocol link in the delivery.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = urlparse(raw)
+    except ValueError:
+        return None
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return None
+    return raw
+
+
+def _comment_evidence_rows(candidate):
+    """Yield normalized rows for the dedicated comment-evidence sheet.
+
+    Formal SKIN6 rows have ``comment_translations``.  ``comment_records`` is a
+    transparent legacy fallback so an older batch never produces an empty evidence
+    sheet merely because it predates the translation schema.
+    """
+    translations = candidate.get("comment_translations") or []
+    if isinstance(translations, list) and translations:
+        for item in translations:
+            if not isinstance(item, dict):
+                continue
+            original = str(item.get("original_text") or "")
+            translated = str(
+                item.get("translated_zh") or item.get("translated_text") or ""
+            )
+            yield {
+                "username": item.get("username") or "",
+                "translated_zh": translated,
+                "original_text": original,
+                "source_language": item.get("source_language") or "und",
+                "intent_grade": (
+                    item.get("translated_intent_grade_zh")
+                    or item.get("grade_zh")
+                    or "—"
+                ),
+                "low_quality": (
+                    "是" if item.get("translated_low_quality") is True else "否"
+                ),
+                "translation_status": (
+                    item.get("status")
+                    or item.get("translation_status")
+                    or "unknown"
+                ),
+                "post_url": _safe_http_url(item.get("post_url")),
+                "evidence_source": "中文翻译 + 原文",
+            }
+        return
+
+    records = candidate.get("comment_records") or []
+    if not isinstance(records, list):
+        return
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        yield {
+            "username": item.get("username") or "",
+            "translated_zh": "",
+            "original_text": str(item.get("text") or ""),
+            "source_language": "und",
+            "intent_grade": "—",
+            "low_quality": "—",
+            "translation_status": "not_translated_legacy",
+            "post_url": _safe_http_url(item.get("post_url")),
+            "evidence_source": "历史结构化原文",
+        }
+
+
 def _cell(c, key):
     if key == "_blank":
         return ""
@@ -86,8 +169,13 @@ def _cell(c, key):
         return NICHE_LABEL.get(c.get("core_niche_key"), c.get("core_niche_key") or "—")
     if key == "intent_snippet":
         snips = c.get("high_intent_snippets") or []
+        translated_rows = translation_mod.delivery_evidence_rows(c, limit=6)
+        translated_intent = bool(
+            translated_rows and translated_rows[0].get("evidence_kind") == "intent"
+        )
+        translation_note = translation_mod.delivery_translation_note(c)
         deep_complete = comment_collection_complete(c)
-        comment_unavailable_count = len(c.get("comment_unavailable_posts") or [])
+        unavailable_note = comment_unavailable_note(c)
         sampled_posts = [
             post for post in (c.get("sampled_posts") or [])
             if isinstance(post, dict)
@@ -100,10 +188,8 @@ def _cell(c, key):
         vc = c.get("valid_comments")
         valid_count = int(vc or 0)
         completion_note = ""
-        if deep_complete and comment_unavailable_count:
-            completion_note = (
-                f"{comment_unavailable_count}帖低量评论重复不可见（已复采）"
-            )
+        if deep_complete and unavailable_note:
+            completion_note = unavailable_note
         elif verified_zero:
             completion_note = "未发现公开评论（已完成采集）"
         elif deep_complete and valid_count < 20:
@@ -112,9 +198,25 @@ def _cell(c, key):
             )
         elif not deep_complete and snips:
             completion_note = "评论采集未完成（待复采）"
-        if snips:
+        if snips or translated_intent:
             rows = [completion_note] if completion_note else []
-            rows.extend(f"· {s}" for s in snips[:3])
+            if translation_note:
+                rows.append(translation_note)
+            if translated_intent:
+                for row in translated_rows[:6]:
+                    grade_zh = row.get("grade_zh") or "—"
+                    who = f"@{row['username']}（{grade_zh}）" if row.get("username") else f"评论（{grade_zh}）"
+                    if row.get("status") == "translated" and row.get("translated_zh"):
+                        rows.append(f"· {who} 中文：{row['translated_zh']}")
+                        rows.append(
+                            f"  原文[{row.get('source_language') or 'und'}]："
+                            f"{row.get('original_text') or ''}"
+                        )
+                    else:
+                        rows.append(f"· {who} 原文：{row.get('original_text') or ''}")
+                        rows.append("  中文翻译失败 · 原文已保留")
+            else:
+                rows.extend(f"· {s}" for s in snips[:3])
             return "\n".join(rows)
         if completion_note:
             return completion_note
@@ -125,9 +227,31 @@ def _cell(c, key):
             return "评论抽取失败（待复采）"
         if (vc or 0) < 20:
             return f"样本偏少（{vc} 条，待补采）"
-        return f"无明显购买意向（有效评论 {vc} 条）"
+        rows = [f"无明显购买意向（有效评论 {vc} 条）"]
+        if translation_note:
+            rows.append(translation_note)
+        if translated_rows:
+            for row in translated_rows[:6]:
+                if row.get("status") == "translated" and row.get("translated_zh"):
+                    rows.append(f"· 评论样本中文：{row['translated_zh']}")
+                    rows.append(
+                        f"  原文[{row.get('source_language') or 'und'}]："
+                        f"{row.get('original_text') or ''}"
+                    )
+                else:
+                    rows.append(f"· 评论原文：{row.get('original_text') or ''}")
+                    rows.append("  中文翻译失败 · 原文已保留")
+        elif c.get("comment_sample"):
+            rows.append("中文翻译尚未执行（原始评论已保留）")
+        return "\n".join(rows)
     if key == "comment_ev":
-        return "帖子 ↗" if (c.get("intent_posts") or c.get("comment_shots")) else "—"
+        return "证据 ↗" if (
+            c.get("comment_translations")
+            or c.get("comment_records")
+            or c.get("translated_intent_comments")
+            or c.get("intent_posts")
+            or c.get("comment_shots")
+        ) else "—"
     if key == "storefront_link":
         st = storefront_mod.effective_status(c)
         if st == "confirmed_yes":
@@ -158,9 +282,20 @@ def _cell(c, key):
         requested = int(p.get("requested_reels") or 10)
         sample = int(p.get("sample_count") or 0)
         if key == "pricing_sample":
+            if status == "not_applicable_no_reels":
+                return f"0/{requested}（无 Reels）"
             if status == "fallback_modash":
                 return "第三方"
             return f"{sample}/{requested}" if sample else "待补"
+        if key == "pricing_population":
+            population = p.get("population_evidence") or {}
+            return (
+                f"basis={p.get('population_basis') or 'unproven'} · "
+                f"proof={population.get('proof_mode') or 'unproven'} · "
+                f"Tab穷尽={'是' if population.get('reels_tab_exhausted') else '否'} · "
+                f"总体完整={'是' if population.get('population_complete') else '否'} · "
+                f"发现Reels={population.get('reels_seen') if population.get('reels_seen') is not None else '未知'}"
+            )
         if key == "pricing_avg":
             return p.get("average_plays")
         quote = p.get("quote_usd") or {}
@@ -170,11 +305,18 @@ def _cell(c, key):
             return quote.get("max")
         if status == "complete":
             return f"完整 · IG 最近 {requested} 条非置顶 Reels"
+        if status == "complete_available":
+            return f"完整 · IG 全部可用 Reels {sample}/{requested}（Tab 已穷尽）"
+        if status == "not_applicable_no_reels":
+            proof = (p.get("population_evidence") or {}).get("proof_mode")
+            if proof == "reels_surface_absent":
+                return "不适用 · 两次 /reels 均回健康主页且 Reels 入口不存在（报价为空）"
+            return "不适用 · Reels Tab 已穷尽、明确空态（报价为空）"
         if status == "partial":
-            return f"样本不足 · IG {sample}/{requested}（暂估）"
+            return f"暂估 · IG {sample}/{requested}（Tab 穷尽未证明）"
         if status == "fallback_modash":
-            return "第三方 Reels 均播替代（未验证最近 10 条/置顶）"
-        return "待补 Reels 播放量"
+            return "历史第三方均播（当前正式口径禁止，B3 阻断）"
+        return "待补 Reels 播放量（Tab 穷尽/原生指标未证明）"
     if key == "ai":
         return c.get("ai_vetting_score") if c.get("ai_vetting_score") is not None else "—"
     if key == "summary":
@@ -193,15 +335,33 @@ def _cell(c, key):
 def _url(c, key):
     if key == "profile":
         h = (c.get("handle") or "").lstrip("@")
-        return c.get("profile_url") or f"https://www.instagram.com/{h}/"
+        return _safe_http_url(c.get("profile_url")) or _safe_http_url(
+            f"https://www.instagram.com/{h}/"
+        )
     if key == "comment_ev":       # 评论证据 → 有意图评论的帖子链接（客户点开核验"谁说了什么"）
+        translated = c.get("translated_intent_comments") or []
+        for row in translated:
+            if url := _safe_http_url(row.get("post_url")):
+                return url
         ip = c.get("intent_posts") or []
-        return ip[0].get("post_url") if ip else None
+        if ip and (url := _safe_http_url(ip[0].get("post_url"))):
+            return url
+        for row in c.get("comment_translations") or []:
+            if isinstance(row, dict) and (
+                url := _safe_http_url(row.get("post_url"))
+            ):
+                return url
+        for row in c.get("comment_records") or []:
+            if isinstance(row, dict) and (
+                url := _safe_http_url(row.get("post_url"))
+            ):
+                return url
+        return None
     if key == "storefront_link" and storefront_mod.has_storefront(c):
-        return storefront_mod.storefront_url(c)
+        return _safe_http_url(storefront_mod.storefront_url(c))
     if key == "pricing_sample":
         reels = (c.get("pricing_estimate") or {}).get("reels") or []
-        return reels[0].get("url") if reels else None
+        return _safe_http_url(reels[0].get("url")) if reels else None
     return None
 
 
@@ -223,22 +383,98 @@ def build_workbook(decisions):
 
     wb = Workbook()
 
-    # ── 证据截图 sheet（评论区）──
+    # ── 结构化评论证据 sheet（截图仅作可选附件）──
     wse = wb.active
     wse.title = "评论证据"
-    wse.cell(1, 1, "评论区截图 · 购买意向证据（浏览器真实抓取）").font = Font(bold=True, size=13, name="Microsoft YaHei")
-    wse.cell(2, 1, "每个候选取近帖评论区截图；点候选表『评论证据』列跳到对应截图").font = Font(size=9, color="5E6672")
-    wse.column_dimensions["A"].width = 46
+    wse.cell(1, 1, "结构化评论证据 · 中文翻译与原文对照").font = Font(
+        bold=True, size=13, name="Microsoft YaHei"
+    )
+    wse.cell(
+        2,
+        1,
+        "覆盖全部已保存评论；中文译文与原文并列，帖子链接可点击核验。截图如有则附在表格下方。",
+    ).font = Font(size=9, color="5E6672")
+    evidence_columns = [
+        ("Handle", "handle", 22),
+        ("全名", "full_name", 22),
+        ("评论者", "username", 20),
+        ("中文译文", "translated_zh", 48),
+        ("原文", "original_text", 48),
+        ("原语言", "source_language", 10),
+        ("购买意向等级", "intent_grade", 13),
+        ("低质评论", "low_quality", 10),
+        ("翻译状态", "translation_status", 16),
+        ("帖子链接", "post_url", 42),
+        ("证据来源", "evidence_source", 18),
+    ]
+    for column, (title, _key, width) in enumerate(evidence_columns, 1):
+        cell = wse.cell(3, column, title)
+        cell.font = head_font
+        cell.fill = head_fill
+        cell.alignment = center
+        cell.border = border
+        wse.column_dimensions[get_column_letter(column)].width = width
     anchor = {}
     er = 4
+    for c in cands:
+        rows = list(_comment_evidence_rows(c))
+        if rows:
+            handle = str(c.get("handle") or "").lstrip("@")
+            anchor.setdefault(handle, er)
+        for evidence in rows:
+            values = {
+                **evidence,
+                "handle": (
+                    str(c.get("handle") or "")
+                    if str(c.get("handle") or "").startswith("@")
+                    else f"@{c.get('handle') or ''}"
+                ),
+                "full_name": c.get("full_name") or "",
+            }
+            for column, (_title, key, _width) in enumerate(
+                evidence_columns, 1
+            ):
+                cell = wse.cell(er, column, _xlsx_safe(values.get(key, "")))
+                cell.font = base_font
+                cell.border = border
+                cell.alignment = wrap
+                if er % 2 == 0:
+                    cell.fill = PatternFill("solid", fgColor=C_STRIPE)
+                if key == "post_url" and evidence.get("post_url"):
+                    cell.hyperlink = evidence["post_url"]
+                    cell.font = link_font
+            er += 1
+
+    structured_end = er - 1
+    wse.freeze_panes = "A4"
+    if structured_end >= 4:
+        wse.auto_filter.ref = (
+            f"A3:{get_column_letter(len(evidence_columns))}{structured_end}"
+        )
+    else:
+        wse.cell(4, 1, "本批没有可导出的结构化评论证据")
+        er = 6
+
+    screenshot_heading_written = False
     for c in cands:
         shots = c.get("comment_shots") or []
         shots = [s for s in shots if (ROOT / s).exists()]
         if not shots:
             continue
-        h = c.get("handle")
-        anchor[h] = er
-        hc = wse.cell(er, 1, f"@{h} · {c.get('full_name') or ''}")
+        if not screenshot_heading_written:
+            er += 1
+            wse.cell(er, 1, "可选评论区截图附件").font = Font(
+                bold=True, size=12, name="Microsoft YaHei"
+            )
+            er += 2
+            screenshot_heading_written = True
+        h = str(c.get("handle") or "").lstrip("@")
+        anchor.setdefault(h, er)
+        hc = wse.cell(
+            er,
+            1,
+            _xlsx_safe(f"@{h} · {c.get('full_name') or ''}"),
+        )
         hc.font = Font(bold=True, size=11, name="Microsoft YaHei")
         row = er + 1
         for sp in shots[:4]:
@@ -270,19 +506,24 @@ def build_workbook(decisions):
         ("纳入·有橱窗 / 无橱窗", f"{pc.get('Include-With-Storefront',0)} / {pc.get('Include-Without-Storefront',0)}"),
         ("优先复核 / 待复核 / 已排除", f"{pc.get('Priority-Review',0)} / {pc.get('Review',0)} / {pc.get('Exclude',0)}"),
         ("确认有电商橱窗/购物入口", f"{len(sf)} 个"),
-        ("原生报价口径完整", f"{price_status.get('complete', 0)} 个"),
-        ("报价样本不足 / 第三方替代 / 缺失",
+        (
+            "报价完整（10条 / 全部可用 / 无Reels不适用）",
+            f"{price_status.get('complete', 0)} / "
+            f"{price_status.get('complete_available', 0)} / "
+            f"{price_status.get('not_applicable_no_reels', 0)}",
+        ),
+        ("报价未闭合（暂估 / 历史第三方 / 缺失）",
          f"{price_status.get('partial', 0)} / {price_status.get('fallback_modash', 0)} / {price_status.get('missing', 0)}"),
         ("", ""),
-        ("阅读说明", "五个决策池互斥，一人一池。『验收建议』色标区分；『购买意向评论』是核心，评论证据列可跳截图。"),
+        ("阅读说明", "五个决策池互斥，一人一池。『验收建议』色标区分；『购买意向评论』是核心，评论证据列可跳到中文翻译与原文对照，截图如有亦附。"),
         ("链接", "Handle/主页/电商橱窗或购物入口均可点击核验。"),
         ("ER 口径", "Modash ER（近两月中位数，偏低）与 IG 实算 ER（近帖，部分藏赞）并列参考；本赛道 Modash ER 普遍<2%，硬门槛以可靠标准+购买意向评论为准。"),
-        ("预估报价口径", "先排除置顶 Reels，再取最近 10 条平均播放量；默认 CPM $35，参考区间 $35–40。样本不足/第三方替代会明确标记；仅供预算参考，不是博主实际报价，也不参与评分或路由。"),
+        ("预估报价口径", "先排除置顶 Reels，再取最近 10 条平均播放量；少于 10 条仅在 Reels Tab 已到底且连续两轮无增长、全部媒体原生指标均闭合时，按全部可用 Reels 估价；0 条 Reels 为不适用且报价留空。只用 Instagram 原生播放量，禁止第三方/总播放/Facebook 替代。默认 CPM $35，参考区间 $35–40；仅供预算参考，不是博主实际报价，也不参与评分或路由。"),
         ("Herman 两列", "供客户审批回填。"),
     ]
     for r, (k, v) in enumerate(rows, 3):
         ws.cell(r, 1, k).font = Font(bold=True, size=10.5, name="Microsoft YaHei")
-        cell = ws.cell(r, 2, v)
+        cell = ws.cell(r, 2, _xlsx_safe(v))
         cell.alignment = wrap
         cell.font = base_font
     ws.column_dimensions["A"].width = 26
@@ -317,8 +558,11 @@ def build_workbook(decisions):
                 if u:
                     cell.hyperlink = u
                     cell.font = link_font
-                if key == "comment_ev" and c.get("handle") in anchor:
-                    cell.hyperlink = f"#评论证据!A{anchor[c['handle']]}"
+                normalized_handle = str(c.get("handle") or "").lstrip("@")
+                if key == "comment_ev" and normalized_handle in anchor:
+                    cell.hyperlink = (
+                        f"#评论证据!A{anchor[normalized_handle]}"
+                    )
                     cell.font = link_font
                 if key == "pricing_avg" and isinstance(cell.value, (int, float)):
                     cell.number_format = "#,##0.00"

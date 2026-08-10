@@ -19,19 +19,21 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import random
 import re
 import sys
 import time
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
 SECRETS = ROOT / ".secrets"
 EVIDENCE_ROOT = ROOT / "data" / "evidence"
 sys.path.insert(0, str(ROOT / "scripts"))
 from extensions.sop_v2 import content as content_mod  # noqa: E402
+from extensions.sop_v2 import pricing as pricing_mod  # noqa: E402
 from extensions.sop_v2 import storefront as storefront_mod  # noqa: E402
 from extensions.sop_v2.config import load_config  # noqa: E402
 
@@ -524,11 +526,29 @@ _DEEP_READ_JS = r"""(shortcode) => {
   const meta=(p)=>{const e=document.querySelector(`meta[property="${p}"]`);return e?e.content:null;};
   const html=document.documentElement.innerHTML||'';
   const body=(document.body.innerText||'');
+  const ogurl=meta('og:url');
+  const canonical=document.querySelector('link[rel="canonical"]')?.href||null;
   let taken=meta('article:published_time');
   if(!taken){const m=html.match(/"taken_at"\s*:\s*(\d+)/i);if(m)taken=Number(m[1]);}
   return {caption: meta('og:description')||'', video: !!meta('og:video'),
-          taken_at:taken, text: body.slice(0, 12000)}; }"""
-_GRID_JS = r"""() => {
+          taken_at:taken, text: body.slice(0, 12000),
+          canonical_url:ogurl||canonical,
+          canonical_source:ogurl ? 'og:url' : (canonical ? 'link:canonical' : null)}; }"""
+_GRID_JS = r"""(expectedHandle) => {
+  const body=(document.body?.innerText||'');
+  const segments=(location.pathname||'').split('/').filter(Boolean);
+  const observedHandle=segments[0]||'';
+  const expected=String(expectedHandle||'').replace(/^@/,'').toLowerCase();
+  const identityVerified=!!expected && observedHandle.toLowerCase()===expected;
+  const reelsRouteVerified=segments[1]==='reels';
+  const redirectedToProfile=segments.length===1 && identityVerified;
+  const challenge=/verify you'?re a real person|confirm you'?re human|suspicious|unusual activity|请验证你是真人/i.test(body.slice(0,800));
+  const loggedOut=/创建新账户|Create new account|Log into Instagram/.test(body.slice(0,500)) ||
+    !!document.querySelector('input[name="username"],input[name="password"]');
+  const privateAccount=/This account is private|Esta cuenta es privada|账号私密|This Account is Private/i.test(body.slice(0,2500));
+  const errorPage=/Sorry, this page isn'?t available|Page Not Found|Something went wrong|There was a problem loading|We couldn'?t load (?:the|this) page|页面不存在|无法加载(?:此)?页面|Une erreur s'est produite|Página no disponible/i.test(body.slice(0,3000));
+  const emptyNode=[...document.querySelectorAll('main h1,main h2,main span,main div')]
+    .find(e=>e.children.length===0 && /^(No Reels Yet|No reels yet|No posts yet)$/i.test((e.innerText||'').trim()));
   const anchors=[...document.querySelectorAll('a[href]')]
     .filter(a=>/\/(p|reel)\//.test(a.getAttribute('href')||''));
   const isPinned=(a)=>{
@@ -541,8 +561,41 @@ _GRID_JS = r"""() => {
   };
   const refs=anchors.map(a=>({url:a.getAttribute('href'),pinned:isPinned(a)}))
     .filter((x,i,a)=>a.findIndex(y=>y.url===x.url)===i);
+  const reelsTabLinkPresent=[...document.querySelectorAll('a[href]')].some(a=>{
+    try {
+      const u=new URL(a.getAttribute('href')||'',location.origin);
+      const p=u.pathname.split('/').filter(Boolean);
+      return p.length===2 && p[0].toLowerCase()===expected && p[1]==='reels';
+    } catch(e) { return false; }
+  });
+  const profileHealthy=identityVerified && !!document.querySelector('main') &&
+    !challenge && !loggedOut && !privateAccount && !errorPage;
+  const pageHealthy=profileHealthy && reelsRouteVerified;
+  const reelRefs=refs.filter(x=>/\/reel\//.test(x.url));
+  const feedRefs=refs.filter(x=>/\/p\//.test(x.url));
   return {codes:refs.map(x=>x.url).slice(0,30),post_refs:refs.slice(0,30),
-    logged_out:/创建新账户|Create new account|Log into Instagram/.test(document.body.innerText.slice(0,120))};
+    logged_out:loggedOut,challenge,private_account:privateAccount,error_page:errorPage,
+    page_identity_verified:identityVerified,reels_tab_route_verified:reelsRouteVerified,
+    page_healthy:pageHealthy,profile_healthy:profileHealthy,
+    redirected_to_profile:redirectedToProfile,
+    reels_tab_link_present:reelsTabLinkPresent,
+    visible_feed_posts:feedRefs.length,reel_links_seen:reelRefs.length,
+    observed_handle:observedHandle,final_pathname:location.pathname,
+    empty_reels_marker:emptyNode ? (emptyNode.innerText||'').trim() : null,
+    empty_state_verified:pageHealthy && reelRefs.length===0 && !!emptyNode};
+}"""
+_REELS_SCROLL_STATE_JS = r"""() => {
+  const root=document.scrollingElement||document.documentElement;
+  const top=Math.max(0, Number(root.scrollTop||window.scrollY||0));
+  const viewport=Math.max(0, Number(window.innerHeight||root.clientHeight||0));
+  const height=Math.max(Number(root.scrollHeight||0),
+    Number(document.documentElement.scrollHeight||0),
+    Number(document.body?.scrollHeight||0));
+  const loading=!!document.querySelector(
+    '[role="progressbar"],svg[aria-label="Loading..."],svg[aria-label="Loading"]'
+  );
+  return {scroll_top:top,viewport_height:viewport,scroll_height:height,
+    at_bottom:height>0 && top+viewport>=height-4,loading_visible:loading};
 }"""
 
 # Reel 详情页当前不在可见 DOM / OG 元数据中展示播放量。登录 Cookie 下的 Web 同源详情接口
@@ -577,6 +630,12 @@ _IG_MEDIA_INFO_JS = r"""async (mediaId) => {
 }"""
 
 _SHORTCODE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+_MEDIA_ROUTE_RE = re.compile(
+    r"^/(?:[A-Za-z0-9._]+/)?(?P<kind>reel|p)/"
+    r"(?P<code>[A-Za-z0-9_-]+)/?$",
+    re.IGNORECASE,
+)
+_INSTAGRAM_MEDIA_HOSTS = frozenset({"instagram.com", "www.instagram.com"})
 
 
 def _shortcode_to_media_id(shortcode):
@@ -590,6 +649,53 @@ def _shortcode_to_media_id(shortcode):
     for ch in code:
         value = value * 64 + _SHORTCODE_ALPHABET.index(ch)
     return value
+
+
+def _media_route(value, *, require_instagram_host=False):
+    """Return a strictly parsed ``(kind, code)`` media route.
+
+    Page canonical evidence must be absolute HTTPS on Instagram.  Candidate
+    refs may remain relative, but an absolute non-Instagram ref is never used
+    to select a same-origin media-info identity.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    parsed = urlparse(raw)
+    if parsed.scheme or parsed.netloc:
+        if (
+            parsed.scheme.lower() != "https"
+            or (parsed.hostname or "").lower() not in _INSTAGRAM_MEDIA_HOSTS
+        ):
+            return None
+    elif require_instagram_host:
+        return None
+    match = _MEDIA_ROUTE_RE.fullmatch(parsed.path)
+    if not match:
+        return None
+    return match.group("kind").lower(), match.group("code")
+
+
+def _validated_page_shortcode(href, canonical_url):
+    """Use only a page-declared canonical alias that is bound to ``href``.
+
+    Collaborative grid links may append a long access token to the real
+    shortcode.  Blindly truncating that token would be unauditable, so the
+    fallback is allowed only when ``og:url``/canonical supplies an Instagram
+    media route of the same kind and its code is the exact token or its prefix.
+    The API response is independently checked by ``_fetch_reel_metric``.
+    """
+    original = _media_route(href)
+    canonical = _media_route(canonical_url, require_instagram_host=True)
+    if not original or not canonical or original[0] != canonical[0]:
+        return None
+    original_code = original[1]
+    canonical_code = canonical[1]
+    if original_code != canonical_code and not original_code.startswith(
+        canonical_code
+    ):
+        return None
+    return canonical_code
 
 
 def _normalize_media_metric(payload):
@@ -646,15 +752,188 @@ def _normalize_media_metric(payload):
     }
 
 
-def _fetch_reel_metric(pg, href):
-    shortcode = str(href or "").rstrip("/").split("/")[-1]
+def _fetch_reel_metric(pg, href, *, canonical_url=None, canonical_source=None):
+    original_route = _media_route(href)
+    if original_route is None:
+        return _normalize_media_metric({"fetch_error": "invalid_media_route"})
+    original_shortcode = original_route[1]
+    canonical_shortcode = _validated_page_shortcode(href, canonical_url)
+    shortcode = canonical_shortcode or original_shortcode
     media_id = _shortcode_to_media_id(shortcode)
     if media_id is None:
         return _normalize_media_metric({"fetch_error": "invalid_shortcode"})
     try:
-        return _normalize_media_metric(pg.evaluate(_IG_MEDIA_INFO_JS, str(media_id)))
+        payload = pg.evaluate(_IG_MEDIA_INFO_JS, str(media_id))
     except Exception as exc:  # noqa: BLE001
         return _normalize_media_metric({"fetch_error": type(exc).__name__})
+    response_code = str((payload or {}).get("code") or "")
+    allowed_response_codes = {original_shortcode}
+    if canonical_shortcode:
+        allowed_response_codes.add(canonical_shortcode)
+    if (payload or {}).get("http_status") == 200:
+        if response_code not in allowed_response_codes:
+            return _normalize_media_metric({"fetch_error": "identity_mismatch"})
+    result = _normalize_media_metric(payload)
+    result["media_identity_provenance"] = {
+        "requested_shortcode": shortcode,
+        "original_shortcode": original_shortcode,
+        "canonical_shortcode": canonical_shortcode,
+        "requested_shortcode_source": (
+            canonical_source or "page_canonical"
+            if canonical_shortcode
+            else "post_href"
+        ),
+        "page_canonical_url": canonical_url if canonical_shortcode else None,
+        "response_code": (payload or {}).get("code"),
+        "identity_verified": bool(
+            (payload or {}).get("http_status") == 200
+            and response_code in allowed_response_codes
+        ),
+    }
+    return result
+
+
+_VERIFIED_ALIAS_REFRESH_FIELDS = (
+    "play_count",
+    "play_count_status",
+    "play_count_source",
+    "play_count_raw",
+    "ig_play_count",
+    "total_play_count",
+    "fb_play_count",
+    "like_count",
+    "comment_count",
+    "pinned",
+    "pinned_source",
+    "taken_at",
+    "like_and_view_counts_disabled",
+    "media_identity_provenance",
+)
+
+
+def _refresh_pricing_sample_from_verified_alias(sample, fresh_metric):
+    """Atomically replace a failed long-token sample with its proven alias data."""
+    if not isinstance(sample, dict) or not isinstance(fresh_metric, dict):
+        return False
+    provenance = fresh_metric.get("media_identity_provenance")
+    if not isinstance(provenance, dict) or not (
+        provenance.get("identity_verified") is True
+        and provenance.get("page_canonical_url")
+    ):
+        return False
+    sample_route = _media_route(sample.get("code") or sample.get("url"))
+    requested_shortcode = str(provenance.get("requested_shortcode") or "")
+    prior_provenance = sample.get("media_identity_provenance")
+    if (
+        sample_route is None
+        or not requested_shortcode
+        or sample_route[1] == requested_shortcode
+        or not sample_route[1].startswith(requested_shortcode)
+        or sample.get("play_count_status") == "observed"
+        or (
+            isinstance(prior_provenance, dict)
+            and prior_provenance.get("identity_verified") is True
+        )
+    ):
+        return False
+    refresh = {
+        key: copy.deepcopy(fresh_metric.get(key))
+        for key in _VERIFIED_ALIAS_REFRESH_FIELDS
+    }
+    sample.update(refresh)
+    return True
+
+
+_EMPTY_COMMENT_MARKER_JS = r"""() => {
+  const allowed=new Set(['No comments yet.']);
+  for(const el of document.querySelectorAll('h1,h2,h3,h4,h5,h6,span,div,p')){
+    if(el.children.length) continue;
+    const text=(el.innerText||'').replace(/\s+/g,' ').trim();
+    if(!allowed.has(text)) continue;
+    const style=getComputedStyle(el);
+    if(style.display==='none'||style.visibility==='hidden'||Number(style.opacity)===0) continue;
+    if(el.getClientRects().length>0) return text;
+  }
+  return null;
+}"""
+
+
+_IG_COMMENT_THREAD_STATE_JS = r"""async (mediaId) => {
+  try {
+    const r=await fetch(
+      `/api/v1/media/${mediaId}/comments/?can_support_threading=true&permalink_enabled=false`,
+      {headers:{'x-ig-app-id':'936619743392459',
+                'x-requested-with':'XMLHttpRequest','accept':'application/json'},
+       credentials:'include'}
+    );
+    const contentType=r.headers.get('content-type')||'';
+    if(!r.ok || !contentType.includes('application/json')){
+      return {http_status:r.status, content_type:contentType};
+    }
+    const data=await r.json();
+    return {
+      http_status:r.status, status:data.status??null,
+      comment_count:data.comment_count??null,
+      comments_count:Array.isArray(data.comments)?data.comments.length:null,
+      fb_comments_count:Array.isArray(data.fb_comments)?data.fb_comments.length:null,
+      has_more_comments:data.has_more_comments??null,
+      has_more_headload_comments:data.has_more_headload_comments??null,
+      has_more_headload_fb_comments:data.has_more_headload_fb_comments??null
+    };
+  } catch(e) {
+    return {fetch_error:(e&&e.name)||'fetch_error'};
+  }
+}"""
+
+
+def _verify_empty_comment_thread(
+    pg, href, reported_count, *, canonical_url=None
+):
+    """Return bounded provenance only for a visible + endpoint-confirmed empty thread."""
+    from extensions.sop_v2 import comments as cmt_mod
+
+    try:
+        reported_count = int(reported_count)
+    except (TypeError, ValueError):
+        return None
+    if reported_count <= 0:
+        return None
+    try:
+        marker = pg.evaluate(_EMPTY_COMMENT_MARKER_JS)
+    except Exception:  # noqa: BLE001
+        return None
+    if marker not in cmt_mod.VISIBLE_EMPTY_THREAD_MARKERS:
+        return None
+
+    original_route = _media_route(href)
+    if original_route is None:
+        return None
+    shortcode = (
+        _validated_page_shortcode(href, canonical_url) or original_route[1]
+    )
+    media_id = _shortcode_to_media_id(shortcode)
+    if media_id is None:
+        return None
+    try:
+        endpoint = pg.evaluate(_IG_COMMENT_THREAD_STATE_JS, str(media_id))
+    except Exception:  # noqa: BLE001
+        return None
+    evidence = {
+        "schema": cmt_mod.EMPTY_THREAD_EVIDENCE_SCHEMA,
+        "source": cmt_mod.EMPTY_THREAD_EVIDENCE_SOURCE,
+        "marker": marker,
+        "marker_visible": True,
+        "reported_count": reported_count,
+        "endpoint": endpoint,
+    }
+    probe_post = {
+        "url": href,
+        "comment_count": reported_count,
+        "comments_collected": 0,
+        "comment_sampling_status": "verified_empty_thread",
+        "comment_empty_thread_evidence": evidence,
+    }
+    return evidence if cmt_mod.verified_empty_thread_evidence(probe_post) else None
 
 # 直接抽评论 {用户名,原话} 配对（不 OCR、不截图）。2026-07 实测：IG 帖子页**无 <article>**，
 # 评论正文在 span[dir=auto]，与用户名链接是**兄弟节点**（旧代码在父链找正文→抽 0，dra.aliciapaola/
@@ -662,13 +941,15 @@ def _fetch_reel_metric(pg, href):
 # 翻译/导航）→ 排除帖主 caption。owner 传帖主 handle。
 _COMMENTS_JS = r"""(owner) => {
   const isUser=h=>/^\/[a-zA-Z0-9._]+\/$/.test(h||'') && !/\/(p|reel|reels|explore|stories|direct)\//.test(h||'');
-  // UI 噪声：时间戳(20w/5d/3h) / 赞数回复 / 翻译 / 导航项 / follow 等——非评论正文
-  const NOISE=/^(\d+\s*(w|d|h|m|s|y)|\d[\d,.]*\s*(likes?|replies|reply)|reply|responder|see translation|hide|view( all)?( replies| \d)|查看翻译|ver traducci|verified|已验证|edited|editado|now|me gusta|author|pinned|más|more|profile|home|search|explore|reels|messages|notifications|create|settings|switch appearance|log ?out|meta|threads|about|help|press|api|jobs|privacy|terms|following|follow|message)$/i;
+  // UI 噪声：时间戳(20w/5d/3h/7 hours ago) / 赞数回复 / FB 提示 /
+  // 翻译 / 导航项 / follow 等——非评论正文。先归一化空白，兼容 UI 换行。
+  const NOISE=/^(liked\s+by\s+.+\s+and\s+(?:\d[\d,.]*\s+)?others|\d+\s*(?:seconds?|minutes?|hours?|days?|weeks?|months?|years?)\s+ago|this\s+reel\s+has\s+\d[\d,.]*\s+comments?\s+from\s+facebook\.?|no\s+comments\s+yet\.?|hide\s+all\s+replies|\d+\s*(w|d|h|m|s|y)|\d[\d,.]*\s*(likes?|replies|reply)|reply|responder|see translation|hide|view( all)?( replies| \d)|查看翻译|ver traducci|verified|已验证|edited|editado|now|me gusta|author|pinned|más|more|profile|home|search|explore|reels|messages|notifications|create|settings|switch appearance|log ?out|meta|threads|about|help|press|api|jobs|privacy|terms|following|follow|message)$/i;
+  const isNoise=t=>NOISE.test((t||'').replace(/\s+/g,' ').trim());
   const SKIPUSER=/^(meta|about|blog|jobs|help|api|privacy|terms|locations|instagram|threads|contact|popular|uploads|directory|explore|reels|p|reel|accounts|emails)$/i;
   const out=[], seen=new Set();
   for(const s of document.querySelectorAll('span[dir="auto"], div[dir="auto"]')){
     let txt=(s.innerText||'').trim();
-    if(txt.length<2 || txt.length>400 || NOISE.test(txt)) continue;
+    if(txt.length<2 || txt.length>400 || isNoise(txt)) continue;
     // 就近祖先里的用户名链接（评论作者）
     let box=s, uname='';
     for(let i=0;i<7&&box;i++){
@@ -679,7 +960,7 @@ _COMMENTS_JS = r"""(owner) => {
     if(!uname || SKIPUSER.test(uname)) continue;
     if(owner && uname===owner) continue;                  // 帖主 caption/自评不算评论
     if(txt.startsWith(uname+' ')) txt=txt.slice(uname.length).trim();
-    if(txt===uname || txt.length<2 || NOISE.test(txt)) continue;
+    if(txt===uname || txt.length<2 || isNoise(txt)) continue;
     const key=uname+'|'+txt.slice(0,24);
     if(!seen.has(key)){ seen.add(key); out.push({username:uname, text:txt.slice(0,240)}); }
     if(out.length>=100) break;
@@ -690,10 +971,11 @@ _COMMENTS_JS = r"""(owner) => {
 
 _COMMENT_UI_NOISE_RE = re.compile(
     r"^(?:"
-    r"liked by .+ and others|"
-    r"\d+\s+(?:seconds?|minutes?|hours?|days?|weeks?|months?|years?) ago|"
-    r"this reel has \d+ comments? from facebook\.?|"
-    r"hide all replies"
+    r"liked\s+by\s+.+\s+and\s+(?:\d[\d,.]*\s+)?others|"
+    r"\d+\s*(?:seconds?|minutes?|hours?|days?|weeks?|months?|years?)\s+ago|"
+    r"this\s+reel\s+has\s+\d[\d,.]*\s+comments?\s+from\s+facebook\.?|"
+    r"no\s+comments\s+yet\.?|"
+    r"hide\s+all\s+replies"
     r")$",
     re.IGNORECASE,
 )
@@ -743,6 +1025,8 @@ def _sample_comment_pairs(pg, owner, comment_count):
     二次加载只提高真实评论出现的机会，不会把 ``comment_count>0`` 本身视为
     完成证据；两次仍为空时调用方继续标记 ``comment_failed``。
     """
+    if comment_count == 0:
+        return [], 0
     _load_comments(pg, rounds=4)
     paired = _clean_comment_pairs(
         pg.evaluate(_COMMENTS_JS, owner) or [], owner
@@ -845,29 +1129,275 @@ def _collect_profile_grid_refs(pg, handle, target_posts=10, max_scrolls=3):
 
 
 def _collect_grid_refs(pg, handle, min_non_pinned_reels=10, max_scrolls=8):
-    """从 Reels 专页收集候选引用；返回 (refs, error)。
+    """从 Reels 专页收集候选引用；返回 ``(refs, error, evidence)``。
 
     不能使用主页主网格：创作者可把 Reel 从主网格移除，但它仍保留在 Reels 专页。
     DOM 未见 pin marker 只算 unknown；最终 true/false 由 media-info pin lists 确认。
+    少于目标数时不会因为“滚了固定次数”就声称总体完整；只有页面已到底、加载指示器消失，
+    且连续两次真实滚动后引用数和 scrollHeight 均无增长，才生成 ``exhausted`` 证据。
     """
-    if not _goto(pg, f"https://www.instagram.com/{handle}/reels/"):
-        return [], f"grid_nav_failed:{LAST_NAV_ERR or 'unknown'}"
+    tab_url = f"https://www.instagram.com/{handle}/reels/"
+    surface_probe_snapshots = []
+
+    def _evidence(
+        status, reason, refs, state, page_state, scroll_attempts,
+        stable_rounds,
+    ):
+        reel_refs = [ref for ref in refs if "/reel/" in str(ref.get("url") or "")]
+        return {
+            "schema_version": pricing_mod.REELS_TAB_EVIDENCE_SCHEMA_VERSION,
+            "source": pricing_mod.REELS_TAB_EVIDENCE_SOURCE,
+            "status": status,
+            "reason": reason,
+            "tab_url": tab_url,
+            "requested_pathname": f"/{str(handle or '').strip().lstrip('@')}/reels/",
+            "expected_handle": str(handle or "").strip().lstrip("@").lower(),
+            "unique_reels_seen": len(
+                pricing_mod.ordered_reel_identities(reel_refs)
+            ),
+            "ordered_reel_identity_sha256": (
+                pricing_mod.reel_identity_sha256(reel_refs)
+            ),
+            "scroll_attempts": scroll_attempts,
+            "stable_bottom_rounds": stable_rounds,
+            "required_stable_bottom_rounds": (
+                pricing_mod.MIN_STABLE_BOTTOM_ROUNDS
+            ),
+            "at_bottom": bool((state or {}).get("at_bottom")),
+            "loading_visible": bool((state or {}).get("loading_visible")),
+            "terminal_scroll_height": (state or {}).get("scroll_height"),
+            "terminal_scroll_top": (state or {}).get("scroll_top"),
+            "terminal_viewport_height": (state or {}).get("viewport_height"),
+            "page_identity_verified": bool(
+                (page_state or {}).get("page_identity_verified")
+            ),
+            "reels_tab_route_verified": bool(
+                (page_state or {}).get("reels_tab_route_verified")
+            ),
+            "page_healthy": bool((page_state or {}).get("page_healthy")),
+            "profile_healthy": bool((page_state or {}).get("profile_healthy")),
+            "redirected_to_profile": bool(
+                (page_state or {}).get("redirected_to_profile")
+            ),
+            "reels_tab_link_present": bool(
+                (page_state or {}).get("reels_tab_link_present")
+            ),
+            "reel_links_seen": int(
+                (page_state or {}).get("reel_links_seen") or 0
+            ),
+            "unique_feed_posts_seen": int(
+                (page_state or {}).get("unique_feed_posts_seen")
+                or (page_state or {}).get("visible_feed_posts")
+                or 0
+            ),
+            "profile_probe_rounds": int(
+                (page_state or {}).get("profile_probe_rounds") or 0
+            ),
+            "required_profile_probe_rounds": 2,
+            "reels_surface_probe_navigations": int(
+                (page_state or {}).get("reels_surface_probe_navigations") or 0
+            ),
+            "required_reels_surface_probe_navigations": 2,
+            "reels_surface_probe_snapshots": copy.deepcopy(
+                surface_probe_snapshots
+            ),
+            "challenge": bool((page_state or {}).get("challenge")),
+            "logged_out": bool((page_state or {}).get("logged_out")),
+            "private_account": bool(
+                (page_state or {}).get("private_account")
+            ),
+            "error_page": bool((page_state or {}).get("error_page")),
+            "observed_handle": (page_state or {}).get("observed_handle"),
+            "final_pathname": (page_state or {}).get("final_pathname"),
+            "empty_state_verified": bool(
+                (page_state or {}).get("empty_state_verified")
+            ),
+            "empty_reels_marker": (page_state or {}).get("empty_reels_marker"),
+            "captured_at": _now(),
+        }
+
+    if not _goto(pg, tab_url):
+        reason = f"grid_nav_failed:{LAST_NAV_ERR or 'unknown'}"
+        return [], reason, _evidence("failed", reason, [], {}, {}, 0, 0)
     pg.wait_for_timeout(5000)
     refs = []
+    previous_signature = None
+    stable_bottom_rounds = 0
+    scroll_attempts = 0
+    state = {}
+    page_state = {}
+    profile_probe_rounds = 0
+    reels_surface_probe_navigations = 1
     for i in range(max_scrolls + 1):
-        g = pg.evaluate(_GRID_JS)
-        if g.get("logged_out"):
-            return refs, "logged_out"
+        g = pg.evaluate(_GRID_JS, handle)
+        page_state = g
+        current_profile_feed_refs = _merge_post_refs(
+            [
+                ref
+                for ref in (g.get("post_refs") or [])
+                if "/p/" in str(ref.get("url") or "")
+            ],
+        )
+        page_error = next(
+            (
+                name
+                for name, present in (
+                    ("logged_out", g.get("logged_out")),
+                    ("challenge", g.get("challenge")),
+                    ("private_account", g.get("private_account")),
+                    ("error_page", g.get("error_page")),
+                    ("profile_identity_mismatch", not g.get("page_identity_verified")),
+                )
+                if present
+            ),
+            None,
+        )
+        if page_error:
+            return refs, page_error, _evidence(
+                "failed", page_error, refs, state, page_state, scroll_attempts,
+                stable_bottom_rounds,
+            )
+        if not g.get("reels_tab_route_verified"):
+            state = pg.evaluate(_REELS_SCROLL_STATE_JS) or {}
+            feed_identities = [
+                _media_identity(ref.get("url"))
+                for ref in current_profile_feed_refs
+            ]
+            feed_identity_sha256 = hashlib.sha256(
+                "\n".join(feed_identities).encode("utf-8")
+            ).hexdigest()
+            surface_probe_snapshots.append(
+                {
+                    "navigation_index": reels_surface_probe_navigations,
+                    "requested_pathname": (
+                        f"/{str(handle or '').strip().lstrip('@')}/reels/"
+                    ),
+                    "final_pathname": g.get("final_pathname"),
+                    "expected_handle": (
+                        str(handle or "").strip().lstrip("@").lower()
+                    ),
+                    "observed_handle": g.get("observed_handle"),
+                    "page_identity_verified": bool(
+                        g.get("page_identity_verified")
+                    ),
+                    "profile_healthy": bool(g.get("profile_healthy")),
+                    "redirected_to_profile": bool(
+                        g.get("redirected_to_profile")
+                    ),
+                    "reels_tab_route_verified": bool(
+                        g.get("reels_tab_route_verified")
+                    ),
+                    "reels_tab_link_present": bool(
+                        g.get("reels_tab_link_present")
+                    ),
+                    "reel_links_seen": int(g.get("reel_links_seen") or 0),
+                    "feed_post_count": len(current_profile_feed_refs),
+                    "feed_post_identities": feed_identities,
+                    "feed_post_identity_sha256": feed_identity_sha256,
+                    "loading_visible": bool(state.get("loading_visible")),
+                    "challenge": bool(g.get("challenge")),
+                    "logged_out": bool(g.get("logged_out")),
+                    "private_account": bool(g.get("private_account")),
+                    "error_page": bool(g.get("error_page")),
+                    "captured_at": _now(),
+                }
+            )
+            no_tab_probe = bool(
+                g.get("redirected_to_profile")
+                and g.get("profile_healthy")
+                and not g.get("reels_tab_link_present")
+                and int(g.get("reel_links_seen") or 0) == 0
+                and current_profile_feed_refs
+            )
+            if no_tab_probe and state.get("loading_visible") is False:
+                profile_probe_rounds += 1
+            else:
+                profile_probe_rounds = 0
+            page_state = {
+                **g,
+                "profile_probe_rounds": profile_probe_rounds,
+                "unique_feed_posts_seen": len(current_profile_feed_refs),
+                "reels_surface_probe_navigations": (
+                    reels_surface_probe_navigations
+                ),
+            }
+            if (
+                profile_probe_rounds >= 2
+                and reels_surface_probe_navigations >= 2
+            ):
+                return [], None, _evidence(
+                    "reels_surface_absent",
+                    "reels_route_redirected_to_healthy_profile_without_reels_surface",
+                    [], state, page_state, scroll_attempts,
+                    stable_bottom_rounds,
+                )
+            if not no_tab_probe:
+                reason = (
+                    "profile_redirect_without_no_reels_proof"
+                    if g.get("redirected_to_profile")
+                    else "not_reels_tab"
+                )
+                return [], reason, _evidence(
+                    "failed", reason, [], state, page_state,
+                    scroll_attempts, stable_bottom_rounds,
+                )
+            if i >= max_scrolls:
+                return [], "profile_probe_limit", _evidence(
+                    "failed", "profile_probe_limit", [], state, page_state,
+                    scroll_attempts, stable_bottom_rounds,
+                )
+            if not _goto(pg, tab_url):
+                reason = f"reels_surface_recheck_nav_failed:{LAST_NAV_ERR or 'unknown'}"
+                return [], reason, _evidence(
+                    "failed", reason, [], state, page_state,
+                    scroll_attempts, stable_bottom_rounds,
+                )
+            reels_surface_probe_navigations += 1
+            pg.wait_for_timeout(5000)
+            continue
+        if not g.get("page_healthy"):
+            return refs, "reels_tab_unhealthy", _evidence(
+                "failed", "reels_tab_unhealthy", refs, state, page_state,
+                scroll_attempts, stable_bottom_rounds,
+            )
         refs = _merge_post_refs(refs, g.get("post_refs"))
         usable = [
             r for r in refs
             if "/reel/" in r["url"] and r.get("pinned") is not True
         ]
-        if len(usable) >= min_non_pinned_reels or i >= max_scrolls:
-            break
+        state = pg.evaluate(_REELS_SCROLL_STATE_JS) or {}
+        if len(usable) >= min_non_pinned_reels:
+            return refs, None, _evidence(
+                "target_reached", "requested_window_reached", refs, state,
+                page_state, scroll_attempts, stable_bottom_rounds,
+            )
+        signature = (
+            len(pricing_mod.ordered_reel_identities(refs)),
+            state.get("scroll_height"),
+        )
+        if (
+            state.get("at_bottom") is True
+            and state.get("loading_visible") is False
+            and previous_signature == signature
+        ):
+            stable_bottom_rounds += 1
+        else:
+            stable_bottom_rounds = 0
+        if stable_bottom_rounds >= pricing_mod.MIN_STABLE_BOTTOM_ROUNDS:
+            return refs, None, _evidence(
+                "exhausted", pricing_mod.REELS_TAB_EXHAUSTED_REASON, refs,
+                state, page_state, scroll_attempts, stable_bottom_rounds,
+            )
+        previous_signature = signature
+        if i >= max_scrolls:
+            return refs, None, _evidence(
+                "not_exhausted", "max_scrolls_reached", refs, state,
+                page_state, scroll_attempts, stable_bottom_rounds,
+            )
         pg.mouse.wheel(0, 1500)
+        scroll_attempts += 1
         pg.wait_for_timeout(2200)
-    return refs, None
+    raise AssertionError("unreachable Reels grid loop")
 
 
 def collect_pricing_evidence(pg, cand):
@@ -876,15 +1406,14 @@ def collect_pricing_evidence(pg, cand):
     返回 ``(state, error)``。state 含刷新后的 refs/codes 与按 href 索引的媒体指标，
     供完整 Stage 3 复用；同时直接写入 cand 的 pricing_* 字段，供历史候选价格补采。
     """
-    from extensions.sop_v2 import pricing as pricing_mod
-
     handle = cand.get("handle")
     pricing_window = int(_CFG.get("pricing_estimate", {}).get("reels_window", 10))
     # 始终重新打开 Reels 专页：①保证 media-info fetch 有 IG 同源上下文；②拿到真实
     # Reels 顺序（不是可能缺 Reel 的主页主网格）；③多拿 3 条缓冲，剔除置顶后继续补足。
-    fresh_refs, grid_error = _collect_grid_refs(
+    fresh_refs, grid_error, grid_evidence = _collect_grid_refs(
         pg, handle, min_non_pinned_reels=pricing_window + 3
     )
+    cand["pricing_reels_tab_evidence"] = grid_evidence
     if not fresh_refs and grid_error:
         return None, grid_error
     refs = _merge_post_refs(fresh_refs)
@@ -909,20 +1438,12 @@ def collect_pricing_evidence(pg, cand):
             "grid_rank": grid_rank,
             "captured_at": _now(),
         }
-        if ref.get("pinned") is True:
-            sample.update({
-                "play_count": None,
-                "play_count_status": "skipped_pinned",
-                "play_count_source": None,
-                "taken_at": None,
-            })
+        metric = _fetch_reel_metric(pg, href)
+        sample.update(metric)
+        if str(metric.get("play_count_status") or "").startswith("api_"):
+            metric_fail_streak += 1
         else:
-            metric = _fetch_reel_metric(pg, href)
-            sample.update(metric)
-            if str(metric.get("play_count_status") or "").startswith("api_"):
-                metric_fail_streak += 1
-            else:
-                metric_fail_streak = 0
+            metric_fail_streak = 0
         pricing_reels.append(sample)
         pricing_metric_by_href[href] = sample
         pricing_sample_by_href[href] = sample
@@ -943,10 +1464,11 @@ def collect_pricing_evidence(pg, cand):
         "metric_by_href": pricing_metric_by_href,
         "sample_by_href": pricing_sample_by_href,
         "grid_error": grid_error,
+        "grid_evidence": grid_evidence,
     }, None
 
 
-def deep_collect(pg, cand, ev_dir, n_posts=10):
+def deep_collect(pg, cand, ev_dir, n_posts=10, *, persist_cache=True):
     """③深采：打开目标帖子、逐帖读取赞评并采集评论，再派生意图与实算 ER。
 
     ``comments_read`` 只保留为“深采函数执行过”的历史兼容字段；正式完整性由
@@ -972,6 +1494,7 @@ def deep_collect(pg, cand, ev_dir, n_posts=10):
         key: copy.deepcopy(cand[key])
         for key in (
             "pricing_reel_samples",
+            "pricing_reels_tab_evidence",
             "pricing_captured_at",
             "pricing_estimate",
         )
@@ -1013,6 +1536,7 @@ def deep_collect(pg, cand, ev_dir, n_posts=10):
             "pricing_reels": [],
             "metric_by_href": {},
             "sample_by_href": {},
+            "grid_evidence": cand.get("pricing_reels_tab_evidence"),
         }
     # 极少数候选没有主页 shortcode 时，才按层级使用 Reels 引用兜底核心深采：
     # 本次报价 refs 优先；若它也为空，再用进入本轮前已有的报价样本。后者只作为
@@ -1051,7 +1575,9 @@ def deep_collect(pg, cand, ev_dir, n_posts=10):
     pricing_reels = pricing_state["pricing_reels"]
     pricing_metric_by_href = pricing_state["metric_by_href"]
     pricing_sample_by_href = pricing_state["sample_by_href"]
-    all_comments, seen_c = [], set()           # 累积评论样本（供 comments.analyze 算有效样本/信任分）
+    all_comments, all_comment_records, seen_c = [], [], set()
+    # ``all_comments`` 保留历史分析输入；结构化 records 额外保留评论者与帖子 URL，
+    # 供离线 LLM 翻译后在交付中同时展示原文/译文，不需要重新访问 Instagram。
     nav_fails = 0                              # 连续帖子页导航失败数（限流探测）
     failed_post_urls = []
     metric_missing_urls = []
@@ -1086,6 +1612,7 @@ def deep_collect(pg, cand, ev_dir, n_posts=10):
         likes, comments, caption = _post_stats(info.get("caption", ""))   # 赞/评/干净caption(算实算ER)
         ref = next((r for r in refs if r["url"] == href), {"pinned": None})
         metric = pricing_metric_by_href.get(href) or {}
+        engagement_metric = metric
         if likes is None or comments is None:
             # OG 元标签会因地区/页面版本缺赞评；同源 media-info 对普通帖与 Reels 都可用。
             # 只在缺字段时补一次，避免已拿到 DOM 指标时增加请求。
@@ -1093,7 +1620,21 @@ def deep_collect(pg, cand, ev_dir, n_posts=10):
                 metric
                 if metric.get("like_count") is not None
                 or metric.get("comment_count") is not None
-                else _fetch_reel_metric(pg, href)
+                else _fetch_reel_metric(
+                    pg,
+                    href,
+                    canonical_url=info.get("canonical_url"),
+                    canonical_source=info.get("canonical_source"),
+                )
+            )
+            # The Reels-grid request may have failed because a collaboration
+            # href carried a long access token.  Once this page's canonical
+            # alias and the media response both prove identity, replace the
+            # pricing row as one bounded metric bundle.  This keeps the actual
+            # latest non-pinned Reel in the 10-row quote window instead of
+            # silently substituting an older Reel.  total/fb remain audit-only.
+            _refresh_pricing_sample_from_verified_alias(
+                metric, engagement_metric
             )
             if likes is None:
                 likes = engagement_metric.get("like_count")
@@ -1124,6 +1665,9 @@ def deep_collect(pg, cand, ev_dir, n_posts=10):
             "pinned": pinned,
             "pinned_source": metric.get("pinned_source") or (
                 "ig_profile_grid" if ref.get("pinned") is not None else None
+            ),
+            "media_identity_provenance": engagement_metric.get(
+                "media_identity_provenance"
             ),
             "captured_at": _now(),
         }
@@ -1165,11 +1709,37 @@ def deep_collect(pg, cand, ev_dir, n_posts=10):
             post_meta["comment_sampling_status"] = "collected"
             comment_completed_posts += 1
         else:
+            empty_thread_evidence = _verify_empty_comment_thread(
+                pg,
+                purl,
+                comments,
+                canonical_url=info.get("canonical_url"),
+            )
             repeated_low_unavailable = (
                 comments in (1, 2)
                 and _comment_media_identity(purl) in previous_comment_retry_ids
             )
-            if repeated_low_unavailable:
+            if empty_thread_evidence:
+                post_meta["comment_sampling_status"] = (
+                    "verified_empty_thread"
+                )
+                post_meta["comment_empty_thread_evidence"] = (
+                    empty_thread_evidence
+                )
+                comment_completed_posts += 1
+                comment_unavailable_posts.append(
+                    {
+                        "url": purl,
+                        "reported_count": comments,
+                        "reason": cmt_mod.EMPTY_THREAD_REASON,
+                        "source": cmt_mod.EMPTY_THREAD_EVIDENCE_SOURCE,
+                        "marker": empty_thread_evidence["marker"],
+                        "endpoint_summary": copy.deepcopy(
+                            empty_thread_evidence["endpoint"]
+                        ),
+                    }
+                )
+            elif repeated_low_unavailable:
                 post_meta["comment_sampling_status"] = (
                     "unavailable_after_retry"
                 )
@@ -1195,6 +1765,11 @@ def deep_collect(pg, cand, ev_dir, n_posts=10):
             if c.get("text") and k not in seen_c:
                 seen_c.add(k)
                 all_comments.append(c["text"])
+                all_comment_records.append({
+                    "username": (c.get("username") or "").lstrip("@"),
+                    "text": c["text"],
+                    "post_url": purl,
+                })
         # 有购买意图的评论(三级) → 结构化证据（谁说了什么 + 级别 + 帖子链接），不截图
         hits = cmt_mod.find_intent_comments(paired)
         if hits:
@@ -1224,6 +1799,7 @@ def deep_collect(pg, cand, ev_dir, n_posts=10):
     # 存原始评论样本：供以后按语言重判意图（不用重采）+ 客户抽查透明。德/法/意号评论非英文，
     # 意图短语表补齐后可对这些样本离线重判，不必重新烧号。
     cand["comment_sample"] = all_comments[:120]
+    cand["comment_records"] = all_comment_records[:120]
     # 评论信任分析（有效样本数/低质占比，供 routing comments_insufficient）——高意图数用上面的分级口径
     analysis = cmt_mod.analyze(all_comments)
     cand["comments_analyzed"] = analysis["comments_analyzed"]
@@ -1262,9 +1838,12 @@ def deep_collect(pg, cand, ev_dir, n_posts=10):
     # 旧证据时才替换；相同完整度时保留更新鲜的一次。
     old_estimate = previous_pricing.get("pricing_estimate")
     new_estimate = cand.get("pricing_estimate")
-    if _pricing_evidence_rank(old_estimate) > _pricing_evidence_rank(new_estimate):
+    if _pricing_evidence_rank(
+        old_estimate, previous_pricing
+    ) > _pricing_evidence_rank(new_estimate, cand):
         for key in (
             "pricing_reel_samples",
+            "pricing_reels_tab_evidence",
             "pricing_captured_at",
             "pricing_estimate",
         ):
@@ -1282,21 +1861,32 @@ def deep_collect(pg, cand, ev_dir, n_posts=10):
     cand.pop("posts", None)
     caps = " ".join(p.get("caption", "") for p in posts_meta)
     cand["core_niche_key"] = content_mod.derive_niche(cand.get("biography"), cand.get("full_name"), caps)
-    _cache_save(cand)   # 浅扫字段回写（stage3 另经 creator_cache.advance 写 stage_json）
+    if persist_cache:
+        # Standalone/legacy browser collection still refreshes the shallow cache.
+        # Formal Stage 3 disables this write and commits evidence + hot columns only
+        # through its final status/lock-token CAS.
+        _cache_save(cand)
     return cand, ev
 
 
-def _pricing_evidence_rank(estimate):
+def _pricing_evidence_rank(estimate, candidate=None):
     """报价证据单调等级；原生样本优先于第三方和 missing。"""
     if not isinstance(estimate, dict):
         return (0, 0)
     status = estimate.get("status")
+    if candidate is not None:
+        evidence = dict(candidate or {})
+        evidence["pricing_estimate"] = estimate
+        if pricing_mod.estimate_integrity_reasons(evidence, _CFG):
+            return (0, 0)
     sample = int(estimate.get("sample_count") or 0)
     order = {
         "missing": 1,
-        "fallback_modash": 2,
-        "partial": 3,
-        "complete": 4,
+        "fallback_modash": 1,
+        "partial": 2,
+        "not_applicable_no_reels": 3,
+        "complete_available": 4,
+        "complete": 5,
     }
     return (order.get(status, 0), sample)
 
@@ -1304,7 +1894,10 @@ def _pricing_evidence_rank(estimate):
 def _cache_save(cand):
     try:
         from extensions.sop_v2 import creator_cache
-        creator_cache.upsert(cand)
+        # Deep retries are not independent discovery-source hits.  Refresh shallow
+        # fields without inflating times_seen, otherwise failed retries are
+        # incorrectly promoted ahead of never-attempted candidates.
+        creator_cache.upsert(cand, increment_times_seen=False)
     except Exception:  # noqa: BLE001
         pass
 

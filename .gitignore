@@ -22,8 +22,12 @@ output/
 # ── 本地累计数据库 / 公开账号派生库（可重建，不公开）──
 data/discovery.db*
 data/creator_cache.db*
+data/resource_leases.db*
+data/token_costs.db*
+data/token_cost_status.json
 data/pod_accounts.json
 data/pod_accounts.json.bak-*
+data/backups/
 
 # ── 采集证据（截图/评论/候选，含真实数据，不公开）──
 data/evidence/

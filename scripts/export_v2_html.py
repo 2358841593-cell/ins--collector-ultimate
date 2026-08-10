@@ -14,7 +14,12 @@ import json
 from collections import Counter
 from pathlib import Path
 
-from export_v2_comment_status import comment_collection_complete
+from export_v2_comment_status import (
+    comment_collection_complete,
+    comment_unavailable_note,
+)
+from extensions.sop_v2 import comment_translation as translation_mod
+from extensions.sop_v2 import feedback_taxonomy as feedback_taxonomy_mod
 from extensions.sop_v2 import storefront as storefront_mod
 
 POOLS = ["Include-With-Storefront", "Include-Without-Storefront",
@@ -32,8 +37,29 @@ COLS = ["客户选择", "验收", "红人", "粉丝", "赛道", "购买意向评
         "预估报价（USD）", "AI", "结论", "待补 / 原因"]
 
 
+def _reason_tag_controls() -> str:
+    """从唯一 taxonomy 合同生成拒绝原因多选，避免页面维护另一套标签。"""
+    grouped: dict[str, list] = {}
+    for item in feedback_taxonomy_mod.REASON_DEFINITIONS:
+        grouped.setdefault(item.category, []).append(item)
+    groups = []
+    for category, items in grouped.items():
+        choices = "".join(
+            '<label class="ro">'
+            f'<input class="rt" type="checkbox" value="{esc(item.code)}" '
+            'onchange="saveD(this)">'
+            f'<span>{esc(item.label_zh)}</span>'
+            '</label>'
+            for item in items
+        )
+        groups.append(
+            f'<fieldset class="rg"><legend>{esc(category)}</legend>{choices}</fieldset>'
+        )
+    return "".join(groups)
+
+
 def _decide_cell(c):
-    """客户交互：合适/不合适/待定 三选 + 原因输入。状态存浏览器本地，一键导出回传。"""
+    """客户交互：三选、可选拒绝原因与反馈作用范围；状态存浏览器本地。"""
     h = (c.get("handle") or "").lstrip("@")
     return (f'<div class="dec" data-h="{esc(h)}" data-pool="{esc(c.get("final_pool",""))}" '
             f'data-score="{esc(c.get("ai_vetting_score"))}">'
@@ -42,7 +68,24 @@ def _decide_cell(c):
             "<button class=\"db no\" onclick=\"mark(this,'不合适')\">不合适</button>"
             "<button class=\"db maybe\" onclick=\"mark(this,'待定')\">待定</button>"
             '</div>'
-            '<input class="dr" placeholder="原因…" oninput="saveR(this)">'
+            '<div class="reason-panel">'
+            '<details class="rp"><summary>选择拒绝原因（可选，可多选）</summary>'
+            f'<div class="rgs">{_reason_tag_controls()}</div></details>'
+            '<label class="sl"><span>本次不合适的范围</span>'
+            '<select class="rs" onchange="saveD(this)">'
+            '<option value="campaign">仅当前活动不合适（未来可重评）</option>'
+            '<option value="temporary">暂时不合适（后续复核）</option>'
+            '<option value="global">永久排除（所有后续轮次）</option>'
+            '</select></label>'
+            '<div class="scope-note">默认只影响当前活动；只有“永久排除”会进入永久负向库。</div>'
+            '</div>'
+            '<input class="dr" placeholder="补充说明（可选）…" oninput="saveD(this)">'
+            '<label class="sl"><span>反馈作用范围</span>'
+            '<select class="fs" onchange="saveD(this)">'
+            '<option value="account">仅此账号</option>'
+            '<option value="policy_signal">希望后续统一参考</option>'
+            '</select></label>'
+            '<div class="scope-note">“统一参考”只生成策略建议，不会自动变成全局规则。</div>'
             '</div>')
 
 
@@ -50,24 +93,43 @@ def esc(x):
     return html.escape(str(x)) if x is not None else ""
 
 
-# 客户交互 JS：三选 + 原因存浏览器本地（不丢），一键导出 JSON 回传。自包含、离线可用、无外部依赖。
+# 客户交互 JS：三选 + 结构化原因 + 作用范围存浏览器本地，一键导出 JSON 回传。
+# 自包含、离线可用、无外部依赖；同时保留旧 JSON 的 verdict/reason/pool/score 字段。
 _INTERACT_JS = """<script>
 (function(){
   var B = window.__BATCH__ || 'batch';
+  var TAXONOMY_VERSION = window.__FEEDBACK_TAXONOMY_VERSION__ || '';
   var CLS = {'合适':'yes','不合适':'no','待定':'maybe'};
   function key(h){ return 'dec_'+B+'_'+h; }
-  function save(h,v,r){ localStorage.setItem(key(h), JSON.stringify({verdict:v, reason:r})); }
+  function reasonTags(dec){
+    return Array.from(dec.querySelectorAll('.rt:checked')).map(function(input){ return input.value; });
+  }
+  function feedbackScope(dec){
+    var select = dec.querySelector('.fs'); return select ? select.value : 'account';
+  }
+  function rejectionScope(dec){
+    var select = dec.querySelector('.rs');
+    var value = select ? select.value : 'campaign';
+    return value === 'global' || value === 'temporary' ? value : 'campaign';
+  }
+  function state(dec){
+    return {verdict:dec.dataset.verdict||'', reason:dec.querySelector('.dr').value||'',
+            reason_tags:reasonTags(dec), feedback_scope:feedbackScope(dec),
+            rejection_scope:rejectionScope(dec)};
+  }
+  function save(dec){ localStorage.setItem(key(dec.dataset.h), JSON.stringify(state(dec))); }
   window.mark = function(btn, v){
     var dec = btn.closest('.dec');
     dec.querySelectorAll('.db').forEach(function(b){ b.classList.remove('on'); });
     if(dec.dataset.verdict === v){ dec.dataset.verdict=''; }   // 再点一次取消
     else { dec.dataset.verdict = v; btn.classList.add('on'); }
-    save(dec.dataset.h, dec.dataset.verdict, dec.querySelector('.dr').value);
+    save(dec);
     summary();
   };
-  window.saveR = function(inp){
-    var dec = inp.closest('.dec'); save(dec.dataset.h, dec.dataset.verdict||'', inp.value);
+  window.saveD = function(input){
+    var dec = input.closest('.dec'); save(dec); summary();
   };
+  window.saveR = window.saveD; // 兼容旧交付页的内联调用名称
   function restore(){
     document.querySelectorAll('.dec').forEach(function(dec){
       var raw = localStorage.getItem(key(dec.dataset.h)); if(!raw) return;
@@ -75,34 +137,53 @@ _INTERACT_JS = """<script>
       if(d.verdict){ dec.dataset.verdict = d.verdict;
         var b = dec.querySelector('.db.'+CLS[d.verdict]); if(b) b.classList.add('on'); }
       if(d.reason) dec.querySelector('.dr').value = d.reason;
+      if(Array.isArray(d.reason_tags)){
+        dec.querySelectorAll('.rt').forEach(function(input){
+          input.checked = d.reason_tags.indexOf(input.value) !== -1;
+        });
+      }
+      var scope = d.feedback_scope === 'policy_signal' ? 'policy_signal' : 'account';
+      var select = dec.querySelector('.fs'); if(select) select.value = scope;
+      var rejection = d.rejection_scope === 'global' || d.rejection_scope === 'temporary'
+        ? d.rejection_scope : 'campaign';
+      var rejectionSelect = dec.querySelector('.rs');
+      if(rejectionSelect) rejectionSelect.value = rejection;
     });
   }
   function summary(){
-    var y=0,n=0,m=0,t=0;
+    var y=0,n=0,m=0,t=0,tagged=0;
     document.querySelectorAll('.dec').forEach(function(dec){ t++;
-      var v=dec.dataset.verdict; if(v==='合适')y++; else if(v==='不合适')n++; else if(v==='待定')m++; });
+      var v=dec.dataset.verdict; if(v==='合适')y++; else if(v==='不合适'){ n++; if(reasonTags(dec).length) tagged++; }
+      else if(v==='待定')m++; });
     document.getElementById('cstat').textContent =
-      '✓合适 '+y+'  ✗不合适 '+n+'  待定 '+m+'  未选 '+(t-y-n-m)+' / 共 '+t;
+      '✓合适 '+y+'  ✗不合适 '+n+'（已标原因 '+tagged+'）  待定 '+m+'  未选 '+(t-y-n-m)+' / 共 '+t;
   }
   window.exportDecisions = function(){
     var out = [];
     document.querySelectorAll('.dec').forEach(function(dec){
       var v = dec.dataset.verdict || '';
       var r = (dec.querySelector('.dr').value||'').trim();
-      if(v || r) out.push({handle:dec.dataset.h, verdict:v, reason:r,
-                           pool:dec.dataset.pool, score:dec.dataset.score});
+      var tags = v === '不合适' ? reasonTags(dec) : [];
+      if(v || r || tags.length) out.push({handle:dec.dataset.h, verdict:v, reason:r,
+                           pool:dec.dataset.pool, score:dec.dataset.score,
+                           reason_tags:tags, feedback_scope:feedbackScope(dec),
+                           rejection_scope:v === '不合适' ? rejectionScope(dec) : null});
     });
     if(!out.length){ alert('还没做任何选择'); return; }
-    var payload = {batch:B, exported_at:new Date().toISOString(), decisions:out};
+    var payload = {feedback_schema_version:2, taxonomy_version:TAXONOMY_VERSION,
+                   batch:B, exported_at:new Date().toISOString(), decisions:out};
     var blob = new Blob([JSON.stringify(payload, null, 2)], {type:'application/json'});
     var a = document.createElement('a'); a.href = URL.createObjectURL(blob);
     a.download = 'client_decisions_'+B+'.json'; a.click();
+    setTimeout(function(){ URL.revokeObjectURL(a.href); }, 0);
   };
   window.clearDecisions = function(){
     if(!confirm('清空本机所有选择？')) return;
     document.querySelectorAll('.dec').forEach(function(dec){ localStorage.removeItem(key(dec.dataset.h));
       dec.dataset.verdict=''; dec.querySelectorAll('.db').forEach(function(b){b.classList.remove('on');});
-      dec.querySelector('.dr').value=''; });
+      dec.querySelectorAll('.rt').forEach(function(input){input.checked=false;});
+      dec.querySelector('.dr').value=''; dec.querySelector('.fs').value='account';
+      dec.querySelector('.rs').value='campaign'; });
     summary();
   };
   restore(); summary();
@@ -200,8 +281,24 @@ def _pricing_cell(c):
     status = p.get("status") or "missing"
     quote = p.get("quote_usd") or {}
     avg = p.get("average_plays")
+    population = p.get("population_evidence") or {}
+    if status == "not_applicable_no_reels":
+        if population.get("proof_mode") == "reels_surface_absent":
+            proof = (
+                "Reels 入口不存在：两次访问 /reels 均回到同账号健康主页，"
+                "页面有普通帖子但无 Reels Tab / Reel 链接"
+            )
+        else:
+            proof = "Reels Tab 已穷尽且显示明确空态"
+        return (
+            f'<span class="muted">不适用：{proof}</span>'
+            '<div class="aud">报价留空；未使用第三方/总播放/Facebook 数据</div>'
+        )
     if avg is None or quote.get("default") is None:
-        return '<span class="muted">待补近 10 条非置顶 Reels 播放量</span>'
+        return (
+            '<span class="muted">待补近 10 条非置顶 Reels 播放量</span>'
+            '<div class="aud">Reels Tab 穷尽或原生指标完整性尚未证明</div>'
+        )
 
     sample = int(p.get("sample_count") or 0)
     requested = int(p.get("requested_reels") or 10)
@@ -209,8 +306,17 @@ def _pricing_cell(c):
     high = quote.get("max")
     if status == "complete":
         source = f"IG 近 {requested} 条非置顶 Reels"
+    elif status == "complete_available":
+        source = (
+            f'<span class="ok">IG 全部可用 Reels {sample}/{requested}；'
+            f'Tab 已穷尽（连续 {int(population.get("stable_bottom_rounds") or 0)}'
+            ' 轮到底无增长）</span>'
+        )
     elif status == "partial":
-        source = f'<span class="warn">IG 样本不足 {sample}/{requested}，暂估</span>'
+        source = (
+            f'<span class="warn">IG 样本 {sample}/{requested}，暂估；'
+            'Reels Tab 穷尽未证明</span>'
+        )
     elif status == "fallback_modash":
         source = '<span class="warn">第三方均播替代，未验证近 10 条/置顶</span>'
     else:
@@ -246,6 +352,12 @@ def _pricing_detail_block(c):
             f'{int(p.get("sample_count") or 0)}/{int(p.get("requested_reels") or 10)} · '
             f'{esc(p.get("source") or "missing")}',
         ),
+        _kv(
+            "总体口径",
+            f'{esc(p.get("population_basis") or "unproven")} · '
+            f'Reels Tab 穷尽={"是" if (p.get("population_evidence") or {}).get("reels_tab_exhausted") else "否"} · '
+            f'总体完整={"是" if (p.get("population_evidence") or {}).get("population_complete") else "否"}',
+        ),
     ]
     reels = p.get("reels") or []
     if reels:
@@ -260,7 +372,16 @@ def _pricing_detail_block(c):
                 links.append(label)
         rows.append(_kv("Reels 明细", "<br>".join(links)))
     elif p.get("status") == "fallback_modash":
-        rows.append(_kv("限制", "使用第三方账号级 Reels 均播；未验证是否为最近 10 条，也无法确认置顶排除。"))
+        rows.append(_kv("限制", "历史第三方账号级 Reels 均播；当前正式报价口径禁止使用，B3 必须阻断并补原生证据。"))
+    elif p.get("status") == "not_applicable_no_reels":
+        population = p.get("population_evidence") or {}
+        proof = (
+            "两次独立访问 /reels 均重定向同账号健康主页；主页有普通帖子，"
+            "但没有 Reels Tab 或 Reel 链接"
+            if population.get("proof_mode") == "reels_surface_absent"
+            else "Reels Tab 已到底并连续两轮无增长，且显示明确空态"
+        )
+        rows.append(_kv("不适用证据", f"{proof}；报价为空。"))
     elif p.get("status") == "missing":
         rows.append(_kv("待补", "未取得足够的 Reels 播放量，未生成报价。"))
     return '<div class="grp"><div class="gt">预估报价证据与口径</div>' + "".join(rows) + '</div>'
@@ -396,10 +517,20 @@ def _detail_panel(c, ncols):
 def _intent_cell(c):
     snips = c.get("high_intent_snippets") or []
     posts = c.get("intent_posts") or []
-    post_url = posts[0].get("post_url") if posts else None
+    translated_rows = translation_mod.delivery_evidence_rows(c, limit=6)
+    translated_intent = bool(
+        translated_rows and translated_rows[0].get("evidence_kind") == "intent"
+    )
+    post_url = (
+        translated_rows[0].get("post_url")
+        if translated_rows and translated_rows[0].get("post_url")
+        else posts[0].get("post_url") if posts else None
+    )
     g = c.get("intent_by_grade") or {}
+    if translated_intent:
+        g = c.get("translated_intent_by_grade") or g
     deep_complete = comment_collection_complete(c)
-    comment_unavailable_count = len(c.get("comment_unavailable_posts") or [])
+    unavailable_note = comment_unavailable_note(c)
     sampled_posts = [
         post for post in (c.get("sampled_posts") or [])
         if isinstance(post, dict)
@@ -412,10 +543,8 @@ def _intent_cell(c):
     vc = c.get("valid_comments")
     valid_count = int(vc or 0)
     completion_note = ""
-    if deep_complete and comment_unavailable_count:
-        completion_note = (
-            f"{comment_unavailable_count}帖低量评论重复不可见（已复采）"
-        )
+    if deep_complete and unavailable_note:
+        completion_note = unavailable_note
     elif verified_zero:
         completion_note = "未发现公开评论（已完成采集）"
     elif deep_complete and valid_count < 20:
@@ -424,22 +553,44 @@ def _intent_cell(c):
         )
     elif not deep_complete and snips:
         completion_note = "评论采集未完成（待复采）"
-    if snips:
+    translation_note = translation_mod.delivery_translation_note(c)
+    if snips or translated_intent:
         rows = []
-        for s in snips[:6]:
-            # s 形如 "@user（低）: 原话"
-            cls = "g-lo"
-            for zh, cl in GRADE_CLASS.items():
-                if f"（{zh}）" in s:
-                    cls = cl
-            rows.append(f'<div class="cmt {cls}">{esc(s)}</div>')
+        if translated_intent:
+            for row in translated_rows:
+                grade_zh = row.get("grade_zh") or "—"
+                cls = GRADE_CLASS.get(grade_zh, "g-lo")
+                who = f"@{row['username']}（{grade_zh}）" if row.get("username") else f"评论（{grade_zh}）"
+                if row.get("status") == "translated" and row.get("translated_zh"):
+                    rows.append(
+                        f'<div class="cmt {cls}"><b>{esc(who)}</b>: {esc(row["translated_zh"])}'
+                        f'<div class="tr-original">原文 [{esc(row.get("source_language") or "und")}]：'
+                        f'{esc(row.get("original_text"))}</div></div>'
+                    )
+                else:
+                    rows.append(
+                        f'<div class="cmt {cls}"><b>{esc(who)}</b>: {esc(row.get("original_text"))}'
+                        '<div class="warn">中文翻译失败 · 原文已保留</div></div>'
+                    )
+        else:
+            for s in snips[:6]:
+                # 兼容尚未执行离线翻译的历史交付。
+                cls = "g-lo"
+                for zh, cl in GRADE_CLASS.items():
+                    if f"（{zh}）" in s:
+                        cls = cl
+                rows.append(f'<div class="cmt {cls}">{esc(s)}</div>')
         head = (f'<div class="tier">高{g.get("high",0)} 中{g.get("medium",0)} 低{g.get("low",0)}'
                 + (f' · <a href="{esc(post_url)}" target="_blank">看帖 ↗</a>' if post_url else '') + '</div>')
-        note = (
-            f'<div class="{"muted" if deep_complete else "warn"}">'
-            f'{esc(completion_note)}</div>'
-            if completion_note else ""
-        )
+        notes = []
+        if completion_note:
+            notes.append(
+                f'<div class="{"muted" if deep_complete else "warn"}">'
+                f'{esc(completion_note)}</div>'
+            )
+        if translation_note:
+            notes.append(f'<div class="tier">{esc(translation_note)}</div>')
+        note = "".join(notes)
         return note + head + "".join(rows)
     if completion_note:
         return f'<span class="muted">{esc(completion_note)}</span>'
@@ -450,18 +601,28 @@ def _intent_cell(c):
         return '<span class="warn">评论抽取失败（待复采）</span>'   # 深采跑了但一条没抽到 = 系统侧待修
     if (vc or 0) < 20:
         return f'<span class="muted">样本偏少（{vc} 条，待补采）</span>'
-    # 诚实标注：受众语言非意图短语覆盖（英/西/葡/德/法/意）→ 不敢断言"无意向"，标待按该语言复判。
-    # 早期采的德/法/意号是用英文口径判的 0 意向，不可靠（客户实测 skincare.and.tea 德语 262 条被误判）。
-    _GRADED = ("english", "spanish", "portuguese", "german", "french", "italian")
-    lang = (c.get("top_language") or "").lower()
-    has_sample = bool(c.get("comment_sample"))
-    if lang and lang not in _GRADED:
-        return (f'<span class="warn">评论主要为{esc(c.get("top_language"))}，意图判定暂未覆盖该语言'
-                f'（有效 {vc} 条）</span>')
-    if lang in ("german", "french", "italian") and not has_sample:
-        return (f'<span class="warn">评论主要为{esc(c.get("top_language"))}，本轮英文口径可能漏判'
-                f'（有效 {vc} 条，待按该语言复判）</span>')
-    return f'<span class="muted">无明显购买意向（有效评论 {vc} 条）</span>'
+    base = f'<span class="muted">无明显购买意向（有效评论 {vc} 条）</span>'
+    if translated_rows:
+        samples = []
+        for row in translated_rows[:3]:
+            if row.get("status") == "translated" and row.get("translated_zh"):
+                samples.append(
+                    f'<div class="cmt"><b>评论样本：</b>{esc(row["translated_zh"])}'
+                    f'<div class="tr-original">原文 [{esc(row.get("source_language") or "und")}]：'
+                    f'{esc(row.get("original_text"))}</div></div>'
+                )
+            else:
+                samples.append(
+                    f'<div class="cmt"><b>评论原文：</b>{esc(row.get("original_text"))}'
+                    '<div class="warn">中文翻译失败 · 原文已保留</div></div>'
+                )
+        note = f'<div class="tier">{esc(translation_note)}</div>' if translation_note else ""
+        return base + note + "".join(samples)
+    if translation_note:
+        return base + f'<div class="warn">{esc(translation_note)}</div>'
+    if c.get("comment_sample"):
+        return base + '<div class="warn">中文翻译尚未执行（原始评论已保留）</div>'
+    return base
 
 
 def _storefront_cell(c):
@@ -593,6 +754,7 @@ a{{color:#1a6e64;text-decoration:none}} a:hover{{text-decoration:underline}}
 .badge.inc,.badge.inc2{{background:#dceee4;color:#1e7a47}} .badge.pri,.badge.rev{{background:#fbf0d9;color:#9a6a1e}} .badge.exc{{background:#f7e7e5;color:#a43b37}}
 .cmt{{padding:3px 8px;border-radius:6px;margin:2px 0;font-size:12.5px;background:#f2f6f4}}
 .cmt.g-hi{{background:#dcefe2;border-left:3px solid #1e7a47}} .cmt.g-mid{{background:#eef4ea;border-left:3px solid #6a9d3a}} .cmt.g-lo{{background:#f5f7f3;border-left:3px solid #b9c4ad}}
+.tr-original{{color:#7b857f;font-size:11px;margin-top:2px;white-space:pre-wrap}}
 .tier{{font-size:11.5px;color:#5e6672;margin-bottom:3px}}
 td b{{color:#1c2b28}}
 .aud{{display:block;font-size:12px;color:#41504c}}
@@ -617,6 +779,18 @@ tr.det details[open] summary{{border-bottom:1px solid #e3e8e6}}
 .db.no.on{{background:#c0554f;border-color:#c0554f}}
 .db.maybe.on{{background:#b98b2e;border-color:#b98b2e}}
 .dr{{border:1px solid #e0e6e3;border-radius:6px;padding:3px 6px;font-size:11px;width:100%}}
+.reason-panel{{display:none}}
+.dec[data-verdict="不合适"] .reason-panel{{display:block}}
+.rp{{border:1px solid #ead7d5;border-radius:6px;background:#fff9f8}}
+.rp summary{{cursor:pointer;color:#9a423d;font-size:11px;padding:4px 6px;user-select:none}}
+.rgs{{max-height:300px;overflow:auto;padding:4px 6px 7px;min-width:260px}}
+.rg{{border:0;border-top:1px solid #f0dfdd;margin:4px 0 0;padding:4px 0 0}}
+.rg legend{{font-size:10px;color:#8b6c68;padding:0 4px}}
+.ro{{display:flex;gap:5px;align-items:flex-start;font-size:11px;padding:2px 0;cursor:pointer}}
+.ro input{{margin:2px 0 0;flex-shrink:0}}
+.sl{{display:flex;flex-direction:column;gap:2px;color:#68736f;font-size:10px}}
+.fs,.rs{{border:1px solid #e0e6e3;border-radius:6px;padding:3px 4px;background:#fff;color:#41504c;font-size:11px;width:100%}}
+.scope-note{{color:#8a9490;font-size:9.5px;line-height:1.35}}
 tr:has(.db.yes.on) td{{background:#f2fbf6!important}}
 tr:has(.db.no.on) td{{background:#fdf5f4!important}}
 #cbar{{position:fixed;left:0;right:0;bottom:0;background:#1f4e4a;color:#fff;display:flex;justify-content:space-between;align-items:center;gap:12px;padding:10px 22px;font-size:13px;z-index:200;box-shadow:0 -2px 10px rgba(0,0,0,.18);flex-wrap:wrap}}
@@ -627,11 +801,11 @@ tr:has(.db.no.on) td{{background:#fdf5f4!important}}
 <h1>Instagram 红人筛选 · 交付表</h1>
 <div class="meta">批次 {esc(meta.get('batch_id',''))} · {esc(meta.get('campaign_track',''))} · 生成 {esc(decisions.get('generated_at',''))} · 候选 {len(cands)} · 确认有电商橱窗/购物入口 {sf}</div>
 <div class="cards">{cards}</div>
-<div class="note"><b>如何使用（客户）：</b>最左列『客户选择』直接点 <b>合适 / 不合适 / 待定</b>，可在下方填『原因』。选择<b>自动存本机浏览器</b>（关页不丢，随时接着选）。选完点底部 <b>⬇ 导出客户决策</b> 下载一个 JSON 文件，<b>回传给我们</b>即可——我们据此更新入选/排除。<br><b>阅读说明：</b>五池互斥，一人一池。<b>购买意向评论分三级</b>——高(求链接/已下单)·中(考虑/问适用)·低(真诚产品热情，非水军)，标明"谁说了什么"，点『看帖 ↗』核验。<b>每行下方『▸ 完整受众画像』可展开</b>：真人/机器人拆解、点赞者画像、受众国家/年龄/性别/语言、跨平台、涨粉、赞助帖（接入权威第三方受众数据源交叉核验）。<b>橱窗</b>：Amazon、LTK、ShopMy、自营店和购物聚合入口都计入；确认无橱窗也不在浅扫阶段直接淘汰。ER：第三方受众数据(参考) + IG 实算中位(门槛依据，抗爆款)。<b>预估报价</b>：先排除置顶 Reels，再取最近 10 条的平均播放量，按 CPM $35 估算并给出 $35–40 区间；样本不足或使用第三方均播时会明确标记。该数值仅供预算参考，<b>不是博主实际报价，也不参与评分/路由</b>。</div>
+<div class="note"><b>如何使用（客户）：</b>最左列『客户选择』直接点 <b>合适 / 不合适 / 待定</b>。选择“不合适”后可多选结构化拒绝原因，也可填写补充说明；<b>原因不是必填项</b>，但填写后才能用于后续策略分析。拒绝范围默认『仅当前活动不合适』，未来仍可重新评估；只有客户明确选择『永久排除』，账号才会进入所有后续轮次共用的永久负向库。『反馈作用范围』默认仅记录此账号；选择『希望后续统一参考』只会生成策略建议，<b>不会自动修改全局规则</b>。所有选择<b>自动存本机浏览器</b>（关页不丢，随时接着选）。选完点底部 <b>⬇ 导出客户决策</b> 下载一个 JSON 文件，<b>回传给我们</b>即可——我们据此更新入选/排除。<br><b>阅读说明：</b>五池互斥，一人一池。<b>购买意向评论分三级</b>——高(求链接/已下单)·中(考虑/问适用)·低(真诚产品热情，非水军)，标明"谁说了什么"，点『看帖 ↗』核验。<b>每行下方『▸ 完整受众画像』可展开</b>：真人/机器人拆解、点赞者画像、受众国家/年龄/性别/语言、跨平台、涨粉、赞助帖（接入权威第三方受众数据源交叉核验）。<b>橱窗</b>：Amazon、LTK、ShopMy、自营店和购物聚合入口都计入；确认无橱窗也不在浅扫阶段直接淘汰。ER：第三方受众数据(参考) + IG 实算中位(门槛依据，抗爆款)。<b>预估报价</b>：先排除置顶 Reels，再取最近 10 条的平均播放量，按 CPM $35 估算并给出 $35–40 区间；样本不足或使用第三方均播时会明确标记。该数值仅供预算参考，<b>不是博主实际报价，也不参与评分/路由</b>。</div>
 {''.join(sections)}
 </div>
 <div id="cbar"><span id="cstat"></span><div class="r"><button class="ghost" onclick="clearDecisions()">清空</button><button onclick="exportDecisions()">⬇ 导出客户决策</button></div></div>
-<script>window.__BATCH__={json.dumps(meta.get('batch_id',''))};</script>
+<script>window.__BATCH__={json.dumps(meta.get('batch_id',''))};window.__FEEDBACK_TAXONOMY_VERSION__={json.dumps(feedback_taxonomy_mod.TAXONOMY_VERSION)};</script>
 {_INTERACT_JS}
 </body></html>"""
 

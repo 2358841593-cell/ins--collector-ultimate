@@ -23,12 +23,19 @@ from extensions.sop_v2.pipeline._base import (  # noqa: E402
 
 
 def collect_one(
-    pg, cand, cfg, batch_id, n_posts, strict_completeness: bool = False
+    pg, cand, cfg, batch_id, n_posts, strict_completeness: bool = False,
+    comment_translator=None,
 ):
     import browser_collect_v2 as bc
     h = cand["handle"]
     ev_dir = bc.EVIDENCE_ROOT / batch_id / h
-    result, ev = bc.deep_collect(pg, cand, ev_dir, n_posts)
+    result, ev = bc.deep_collect(
+        pg,
+        cand,
+        ev_dir,
+        n_posts,
+        persist_cache=False,
+    )
     if result is None:
         return ("error", ev or "logged_out")          # logged_out/grid_nav_failed = 号问题，可重试
     # 产出完整性校验：深采真跑过必写 comments_read + sampled_posts。缺 = 零产出被静默放行（历史 bug）→
@@ -39,6 +46,11 @@ def collect_one(
     # （livvvmarkley/mirandacorneliusbeauty 教训：codes=12 但 sampled_posts=0 仍被放行进 collected）
     if result.get("codes") and not result.get("sampled_posts"):
         return ("error", "deep_all_posts_failed")
+    if comment_translator is not None:
+        # LLM runs only on persisted comment text and is independent of the IG
+        # browser session.  Provider failures become explicit translation rows;
+        # they never erase source comments or force another Instagram read.
+        comment_translator(result)
     if strict_completeness:
         strict_reasons = cc.strict_deep_reasons(
             result,
@@ -84,8 +96,55 @@ def main(argv: list[str] | None = None) -> int:
         default=0,
         help="仅使用 offset 起连续 N 个账号；0 表示使用整个池",
     )
+    ap.add_argument(
+        "--account-rotation",
+        type=nonnegative_int,
+        default=0,
+        help="在已选账号子池内轮换起点；不会跨越并行 worker 的子池边界",
+    )
+    ap.add_argument("--translate-comments", action="store_true",
+                    help="采集后用本机 LLM 生成结构化中文评论译文")
+    ap.add_argument("--translation-provider", choices=["ollama", "anthropic"],
+                    default="ollama")
+    ap.add_argument("--translation-model", default=None)
+    ap.add_argument("--translation-api-url", default=None)
+    ap.add_argument("--translation-batch-size", type=int, default=40)
+    ap.add_argument(
+        "--translation-source-limit",
+        "--translation-display-limit",
+        dest="translation_source_limit",
+        type=int,
+        default=120,
+        help="每个候选送 LLM 的已存评论上限；旧参数名仍兼容（默认 120）",
+    )
     args = ap.parse_args(argv)
+    if args.translation_batch_size <= 0 or args.translation_source_limit <= 0:
+        ap.error("translation batch/source limit 必须为正整数")
     cfg = load_config()
+    comment_translator = None
+    if args.translate_comments:
+        from extensions.sop_v2 import comment_translation
+
+        model = args.translation_model or (
+            comment_translation.DEFAULT_MODEL
+            if args.translation_provider == "ollama"
+            else comment_translation.DEFAULT_ANTHROPIC_MODEL
+        )
+
+        def comment_translator(candidate):
+            return comment_translation.translate_candidate(
+                candidate,
+                provider=args.translation_provider,
+                model=model,
+                api_url=args.translation_api_url,
+                batch_size=args.translation_batch_size,
+                source_limit=args.translation_source_limit,
+                usage_context={
+                    "batch_id": args.batch_id,
+                    "stage": "stage3_collect",
+                    "feature": "comment_translation",
+                },
+            )
     p = cfg.get("pipeline", {})
     # 深采用隔离号池（存在则用，否则回退默认池）
     deep = p.get("deep_accounts_file")
@@ -101,12 +160,14 @@ def main(argv: list[str] | None = None) -> int:
                           args.batch_id,
                           args.posts,
                           args.strict_completeness,
+                          comment_translator,
                       ),
                       per_account=p.get("collect_per_account", 5),
                       stale_minutes=p.get("resume_stale_minutes", 30),
                       accounts_file=deep_file,
                       account_offset=args.account_offset,
-                      account_count=args.account_count)
+                      account_count=args.account_count,
+                      account_rotation=args.account_rotation)
     return 0
 
 

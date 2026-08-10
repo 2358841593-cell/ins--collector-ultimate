@@ -86,18 +86,33 @@ range = average_plays × [35, 40] / 1000 USD
 
 数据合同必须保留 `requested_reels=10`、`sample_count`、`pinned_excluded`、
 `average_plays`、`source`、`captured_at`、逐 Reel 证据及
-`quote_usd.default/min/max`。每条媒体的总 `play_count` 和 `fb_play_count` 可以留作
+`quote_usd.default/min/max`、`population_basis` 和可复核的 `population_evidence`。每条媒体的总 `play_count` 和 `fb_play_count` 可以留作
 审计，但不能进入 `average_plays` 或报价；报价指标优先且只使用 IG 原生
 `ig_play_count`。状态只能是：
 
 - `complete`：10 条 Instagram 原生合格样本；
-- `partial`：1–9 条原生合格样本；
-- `fallback_modash`：没有原生合格样本，使用明确标注的 Modash 均播；
-- `missing`：两类均无数据，价格为空。
+- `complete_available`：严格证明总体已闭合，使用账号全部 1–9 条可用原生样本；
+- `not_applicable_no_reels`：严格证明 Reels surface 为空或不存在，价格为空；
+- `partial`：1–9 条原生样本但总体未闭合；
+- `missing`：没有原生样本，也无法严格证明没有 Reels，价格为空。
 
-`partial/fallback_modash/missing` 必须在 JSON/XLSX/HTML 中如实标注。该值只用于展示，
+短总体的常规证据是健康 Reels Tab 到底后连续两轮引用数/页面高度无增长；无 Reels surface
+的独立证据为 `reels_surface_absent`，必须两次请求精确 `/reels/` 均回到同账号健康主页、
+每次当前页都有普通帖子、无 exact Reels Tab link/Reel link、无
+loading/login/challenge/private，并分别保存 `/p/` identity/计数/哈希快照；不得跨导航累计。
+1–9 条的每个媒体还必须由同源 media-info 同时证明 pin list 与响应身份；已确认置顶的
+Reel 是排除项、无需播放量，只有已确认非置顶的 Reel 才必须证明原生播放量。
+每行 provenance 的 original 必须精确绑定本行 `code/url`；canonical alias 只接受 HTTPS
+Instagram 同媒体类型、original 前缀与 requested 闭合，跨行复制证据不能通过。
+Modash、总播放与 Facebook 播放禁止报价 fallback。`partial/missing` 和历史
+`fallback_modash` 必须在 JSON/XLSX/HTML 中如实标注并阻断 B3。该值只用于展示，
 不是实际报价，不得写 `paid_cpm`，也不得进入 Gate、F 模块、固定 Review 或五池路由。
 实际报价和实际 Paid CPM 始终是另一类人工/报价证据。
+
+pricing-only 写回先追加不可变 full ledger event，再按 canonical integrity、状态、样本和时间
+单调选择 pricing owner/pointer/quality；失败尝试可审计但不能降级旧证据。写回不运行普通
+Stage 3 comment retry transition，deep canonical 窗口保持不变。B3/Stage 4 将 raw evidence
+重派生并核对完整报价合同字段，而不是信任存储对象中的手工值。
 
 ## 5. 冻结的 creator_cache 流水线 API（其余模块只调这些，不写裸 SQL）
 

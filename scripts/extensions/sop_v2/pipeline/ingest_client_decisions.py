@@ -18,6 +18,9 @@ SQLite 事务中写业务状态与文件 SHA-256 ledger。
 
 若旧版脚本已经写入业务状态但没有 ledger，先核对后显式加
 ``--adopt-existing``；该模式不刷新已存在的 approved_at。
+
+若 ledger 已存在但创建于逐条事件表上线之前，显式加 ``--backfill-events``；
+该模式只追加历史 events，不改账号投影和原 ledger。
 """
 from __future__ import annotations
 
@@ -32,6 +35,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from extensions.sop_v2 import creator_cache as cc  # noqa: E402
+from extensions.sop_v2.feedback_taxonomy import (  # noqa: E402
+    TAXONOMY_VERSION,
+    FeedbackTaxonomyError,
+    normalize_evidence_status,
+    normalize_feedback_scope,
+    normalize_reason_tags,
+    normalize_rejection_scope,
+)
 
 _APPROVE = {"合适", "approve", "approved", "yes", "y"}
 _REJECT = {"不合适", "reject", "rejected", "no", "n"}
@@ -105,6 +116,20 @@ def load_validated_decisions(
     exported_at = data.get("exported_at")
     if not isinstance(exported_at, str) or not exported_at.strip():
         raise FeedbackValidationError("客户反馈 exported_at 必须是非空字符串")
+    feedback_schema_version = data.get("feedback_schema_version")
+    if feedback_schema_version is not None and (
+        type(feedback_schema_version) is not int or feedback_schema_version != 2
+    ):
+        raise FeedbackValidationError(
+            f"客户反馈 feedback_schema_version 未知：{feedback_schema_version!r}"
+        )
+    taxonomy_version = data.get("taxonomy_version")
+    if feedback_schema_version == 2 and taxonomy_version is None:
+        raise FeedbackValidationError("v2 客户反馈缺少 taxonomy_version")
+    if taxonomy_version is not None and taxonomy_version != TAXONOMY_VERSION:
+        raise FeedbackValidationError(
+            f"客户反馈 taxonomy_version 未知：{taxonomy_version!r}"
+        )
     raw_decisions = data.get("decisions")
     if not isinstance(raw_decisions, list) or not raw_decisions:
         raise FeedbackValidationError("客户反馈 decisions 必须是非空数组")
@@ -124,12 +149,59 @@ def load_validated_decisions(
         if not isinstance(reason, str):
             raise FeedbackValidationError(f"@{handle} 的 reason 必须是字符串")
         action = _action(item.get("verdict"), handle=handle, reason=reason)
+        try:
+            raw_reason_tags = item.get("reason_tags")
+            if raw_reason_tags is not None and not isinstance(raw_reason_tags, list):
+                raise FeedbackTaxonomyError("reason_tags 必须是字符串数组")
+            reason_tags = normalize_reason_tags(raw_reason_tags)
+            feedback_scope = normalize_feedback_scope(item.get("feedback_scope"))
+            evidence_status = normalize_evidence_status(item.get("evidence_status"))
+            rejection_scope = None
+            if action == "rejected":
+                rejection_scope = normalize_rejection_scope(
+                    item.get("rejection_scope"),
+                    # v2 UI 明示“仅当前活动”为默认；旧 JSON 没有这个维度，
+                    # 必须保留上线前“拒绝即永久负向”的历史语义。
+                    default="campaign" if feedback_schema_version == 2 else "global",
+                )
+            elif item.get("rejection_scope") not in (None, ""):
+                raise FeedbackTaxonomyError(
+                    "只有 rejected 事件可以设置 rejection_scope"
+                )
+        except FeedbackTaxonomyError as exc:
+            raise FeedbackValidationError(f"@{handle} 的结构化反馈无效：{exc}") from exc
+        if feedback_scope == "confirmed_policy":
+            raise FeedbackValidationError(
+                f"@{handle} 的客户反馈只能提出 policy_signal，不能直接确认全局策略"
+            )
+        # 空理由/空标签只是一条账号结果，不能被标成可用于策略学习的信号。
+        if feedback_scope == "policy_signal" and not (
+            reason.strip() or reason_tags
+        ):
+            feedback_scope = "account"
+
+        structured_values = {}
+        for field in ("target_field", "old_value", "claimed_value"):
+            value = item.get(field)
+            if value is not None and not isinstance(value, str):
+                raise FeedbackValidationError(f"@{handle} 的 {field} 必须是字符串")
+            structured_values[field] = value.strip() if isinstance(value, str) else None
+        if feedback_scope == "fact_correction" and not structured_values["target_field"]:
+            raise FeedbackValidationError(
+                f"@{handle} 的 fact_correction 缺少 target_field"
+            )
         decisions.append(
             {
                 "handle": handle,
                 "key": key,
                 "action": action,
                 "reason": reason.strip(),
+                "reason_tags": reason_tags,
+                "feedback_scope": feedback_scope,
+                "rejection_scope": rejection_scope,
+                "evidence_status": evidence_status,
+                "taxonomy_version": TAXONOMY_VERSION,
+                **structured_values,
             }
         )
 
@@ -180,11 +252,18 @@ def load_validated_decisions(
                 raise FeedbackValidationError(
                     f"基线账号 @{candidate_handle} 的来源批次不在 manifest.batches"
                 )
+            try:
+                source_context = cc.freeze_source_context(candidate)
+            except cc.ClientDecisionImportError as exc:
+                raise FeedbackValidationError(
+                    f"基线账号 @{candidate_handle} 的冻结来源上下文无效：{exc}"
+                ) from exc
             whitelist[key] = {
                 "handle": candidate_handle,
                 "origin_batch": candidate_batch,
                 "pool": candidate.get("final_pool"),
                 "score": candidate.get("ai_vetting_score"),
+                "source_context": source_context,
             }
 
         outside = [item["handle"] for item in decisions if item["key"] not in whitelist]
@@ -218,6 +297,7 @@ def load_validated_decisions(
             # origin_batch 与本轮 review batch 正交，支持不改写历史 discovery_batch 的结转。
             item["handle"] = source["handle"]
             item["origin_batch"] = source["origin_batch"]
+            item["source_context"] = source["source_context"]
 
     # key 只用于本函数内部的大小写无关校验，不进入业务 API。
     for item in decisions:
@@ -225,6 +305,8 @@ def load_validated_decisions(
     return {
         "batch": batch,
         "exported_at": exported_at,
+        "feedback_schema_version": feedback_schema_version,
+        "taxonomy_version": taxonomy_version or TAXONOMY_VERSION,
         "decisions": decisions,
         "file_sha256": file_sha256,
         "source_sha256": source_sha256,
@@ -254,7 +336,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--file", required=True, help="客户导出的 client_decisions_*.json")
     ap.add_argument(
         "--source-decisions",
-        help="原交付 decisions_*.json；真实写入必填，用于批次与111人白名单校验",
+        help="原交付 decisions_*.json；真实写入必填，用于批次与原交付候选白名单校验",
     )
     ap.add_argument("--dry-run", action="store_true", help="只预览/校验，不写业务数据和 ledger")
     ap.add_argument(
@@ -267,6 +349,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="仅客户明确改判时使用；允许 approved/rejected 覆盖已有相反客户终判",
     )
+    ap.add_argument(
+        "--backfill-events",
+        action="store_true",
+        help="仅为已有 ledger 且无逐条事件的历史反馈补 events；不改账号投影",
+    )
     args = ap.parse_args(argv)
 
     if not args.dry_run and not args.source_decisions:
@@ -278,6 +365,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.adopt_existing and args.allow_status_change:
         print(
             "✗ --adopt-existing 与 --allow-status-change 不能同时使用",
+            file=sys.stderr,
+        )
+        return 2
+    if args.backfill_events and not args.source_decisions:
+        print("✗ --backfill-events 必须同时提供 --source-decisions", file=sys.stderr)
+        return 2
+    if args.backfill_events and (args.adopt_existing or args.allow_status_change):
+        print(
+            "✗ --backfill-events 不能与 --adopt-existing/--allow-status-change 同时使用",
             file=sys.stderr,
         )
         return 2
@@ -296,6 +392,7 @@ def main(argv: list[str] | None = None) -> int:
             source_sha256=payload["source_sha256"],
             adopt_existing=args.adopt_existing,
             allow_status_change=args.allow_status_change,
+            backfill_events=args.backfill_events,
             dry_run=args.dry_run,
         )
     except (
@@ -307,7 +404,19 @@ def main(argv: list[str] | None = None) -> int:
         print(f"✗ 安全导入中止：{exc}", file=sys.stderr)
         return 2
 
-    if result["already_imported"]:
+    if args.backfill_events and result.get("events_already_present"):
+        print("\n文件对应的逐条 events 已完整存在，本次幂等跳过。")
+    elif args.backfill_events and args.dry_run:
+        print(
+            f"\n✓ 历史反馈与数据库校验通过；将补 "
+            f"{result['events_to_backfill']} 条 events，本次未写入。"
+        )
+    elif args.backfill_events:
+        print(
+            f"\n✓ 已追加 {result['events_backfilled']} 条历史 events；"
+            "账号投影和原 ledger 未改变。"
+        )
+    elif result["already_imported"]:
         print("\n文件 SHA-256 已存在于 ledger，本次幂等跳过，没有重复写入。")
     elif args.dry_run:
         print("\n✓ 文件、白名单与数据库状态校验通过；未写入。")

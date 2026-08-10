@@ -115,6 +115,26 @@ class TestCountry(unittest.TestCase):
         self.assertEqual(verdict(base(follower_count=50000, creator_country="NL",
                                        top_audience_country="NL")), GateVerdict.PASS)
 
+    def test_non_target_creator_excluded_even_when_audience_missing(self):
+        self.assertEqual(verdict(base(follower_count=50000, creator_country="Russia",
+                                       top_audience_country=None)), GateVerdict.EXCLUDE)
+        self.assertEqual(verdict(base(follower_count=50000, creator_country="South Korea",
+                                       top_audience_country=None)), GateVerdict.EXCLUDE)
+
+    def test_non_target_top_audience_excluded_as_mismatch(self):
+        self.assertEqual(verdict(base(follower_count=50000, creator_country="DE",
+                                       top_audience_country="Ukraine")), GateVerdict.EXCLUDE)
+        self.assertEqual(verdict(base(follower_count=50000, creator_country="UK",
+                                       top_audience_country="Iran")), GateVerdict.EXCLUDE)
+
+    def test_full_target_names_are_normalized(self):
+        self.assertEqual(verdict(base(follower_count=50000, creator_country="United Kingdom",
+                                       top_audience_country="GB")), GateVerdict.PASS)
+
+    def test_unknown_country_is_review_not_guessed(self):
+        self.assertEqual(verdict(base(follower_count=50000, creator_country="Atlantis",
+                                       top_audience_country="US")), GateVerdict.REVIEW)
+
 
 class TestStorefrontAndCollect(unittest.TestCase):
     def test_storefront_dual_track(self):

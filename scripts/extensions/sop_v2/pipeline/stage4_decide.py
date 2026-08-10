@@ -20,7 +20,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-from extensions.sop_v2 import creator_cache as cc, run_v2  # noqa: E402
+from extensions.sop_v2 import (  # noqa: E402
+    creator_cache as cc,
+    pricing as pricing_mod,
+    round_contract as round_contract_mod,
+    run_v2,
+)
 from extensions.sop_v2.config import config_sha256, load_config  # noqa: E402
 
 
@@ -29,6 +34,117 @@ class CarryoverManifestError(ValueError):
 
 
 _CARRYOVER_RETRY_READY_STATUSES = {"collected", "rejected"}
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+_MODASH_REPORT_FIELDS = (
+    "fake_pct",
+    "creator_country",
+    "top_audience_country",
+    "general_er",
+    "target_countries_audience_pct",
+    "top_language_pct",
+)
+_POOL_PROGRESS_RANK = {
+    "Exclude": 0,
+    "Review": 1,
+    "Priority-Review": 2,
+    "Include-Without-Storefront": 3,
+    "Include-With-Storefront": 3,
+}
+
+
+def _delivery_file_reference(path: Path) -> str:
+    """Return a stable customer-safe file reference without host paths."""
+    resolved = path.resolve()
+    try:
+        return resolved.relative_to(_REPO_ROOT).as_posix()
+    except ValueError:
+        return resolved.name
+
+
+def _modash_route_projection(cand: dict, cfg: dict) -> tuple[str, str]:
+    """Return current and optimistic post-Modash decision pools."""
+    countries = cfg.get("country", {})
+    allowed = list(countries.get("tier1") or countries.get("tier2") or [])
+    if not allowed:
+        return "Review", "Review"
+    audience = cfg.get("audience", {})
+    optimistic = dict(cand)
+    optimistic_values = {
+        "fake_pct": 0.0,
+        "creator_country": allowed[0],
+        "top_audience_country": allowed[0],
+        "target_countries_audience_pct": max(
+            float(audience.get("target_share_full", 100.0)),
+            float(audience.get("target_share_partial", 0.0)),
+        ),
+        "top_language_pct": max(
+            100.0, float(audience.get("language_min_share", 0.0))
+        ),
+        "general_er": 100.0,
+    }
+    # Mirror modash_cdp._apply: an existing observed value is never overwritten.
+    for field, value in optimistic_values.items():
+        if optimistic.get(field) is None:
+            optimistic[field] = value
+    current_pool = run_v2.decide(dict(cand), cfg)["final_pool"]
+    optimistic_pool = run_v2.decide(optimistic, cfg)["final_pool"]
+    return current_pool, optimistic_pool
+
+
+def _modash_enrichment_actionable(cand: dict, cfg: dict) -> bool:
+    """Return whether a best-case Modash report can still change the route.
+
+    Profile reports cannot repair Instagram/browser facts such as too few valid
+    comments, unknown storefront, low real ER, sponsorship review, graph audit or
+    the lifestyle cap.  Spending a credit on such a row cannot unlock Include.
+    We therefore inject only optimistic *Modash-owned* values and require all
+    remaining gates/fixed reviews to pass.  The real report may of course still
+    reveal an exclusion; this predicate only prevents credits that are guaranteed
+    to be non-actionable before the request.
+    """
+    current_pool, optimistic_pool = _modash_route_projection(cand, cfg)
+    return _POOL_PROGRESS_RANK.get(optimistic_pool, -1) > _POOL_PROGRESS_RANK.get(
+        current_pool, -1
+    )
+
+
+def _build_modash_shortlist(
+    active: list[dict], cfg: dict, cap: int
+) -> tuple[list[dict], dict[str, int]]:
+    """Build a deterministic, budget-aware Profile Report shortlist."""
+    from extensions.sop_v2 import storefront
+
+    modash_core = tuple(cfg["modash_gates"]["core_fields"])
+    missing_report = [
+        cand
+        for cand in active
+        if any(cand.get(field) is None for field in _MODASH_REPORT_FIELDS)
+    ]
+    actionable = [
+        cand
+        for cand in missing_report
+        if _modash_enrichment_actionable(cand, cfg)
+    ]
+    actionable.sort(
+        key=lambda cand: (
+            _POOL_PROGRESS_RANK.get(_modash_route_projection(cand, cfg)[1], -1),
+            storefront.has_storefront(cand),
+            cand.get("real_er") or 0,
+        ),
+        reverse=True,
+    )
+    selected = actionable if cap == 0 else actionable[:cap]
+    return selected, {
+        "active": len(active),
+        "missing_core": sum(
+            any(cand.get(field) is None for field in modash_core)
+            for cand in active
+        ),
+        "missing_report_fields": len(missing_report),
+        "actionable": len(actionable),
+        "non_actionable_skipped": len(missing_report) - len(actionable),
+        "selected": len(selected),
+    }
 
 
 def _carryover_retry_is_ready(
@@ -133,13 +249,17 @@ def _load_carryover_manifest(path: Path, batch_id: str) -> dict:
     client_final_count = _strict_count(counts, "client_final")
     carryover_count = _strict_count(counts, "carryover")
     retry_count = _strict_count(counts, "pipeline_retry")
+    mode_excluded = counts.get("mode_excluded", 0)
+    if isinstance(mode_excluded, bool) or not isinstance(mode_excluded, int) or mode_excluded < 0:
+        raise CarryoverManifestError("counts.mode_excluded 必须是非负整数")
     if carryover_count != len(normalized_rows):
         raise CarryoverManifestError(
             f"counts.carryover={carryover_count} 与 carryover[]={len(normalized_rows)} 不一致"
         )
-    if source_count != client_final_count + carryover_count:
+    if source_count != client_final_count + carryover_count + mode_excluded:
         raise CarryoverManifestError(
-            "counts.source_candidates 必须等于 counts.client_final + counts.carryover"
+            "counts.source_candidates 必须等于 counts.client_final + "
+            "counts.carryover + counts.mode_excluded"
         )
 
     retry_handles = manifest.get("retry_handles")
@@ -185,6 +305,7 @@ def _load_carryover_manifest(path: Path, batch_id: str) -> dict:
         "sha256": hashlib.sha256(raw).hexdigest(),
         "rows": normalized_rows,
         "source_batches": normalized_batches,
+        "manifest": manifest,
     }
 
 
@@ -194,8 +315,19 @@ def _export_with_carryover(
     *,
     target_posts: int = 10,
     require_full_deep: bool = False,
+    contract: dict | None = None,
+    contract_sha256: str | None = None,
 ) -> tuple[list[dict], dict]:
     meta = _load_carryover_manifest(path, batch_id)
+    if contract is not None:
+        try:
+            round_contract_mod.validate_carryover_for_contract(
+                contract,
+                meta["manifest"],
+                contract_sha256=contract_sha256,
+            )
+        except round_contract_mod.RoundContractError as exc:
+            raise CarryoverManifestError(str(exc)) from exc
     exported = cc.export_all_with_data(meta["source_batches"])
     carryover_by_handle = {row["handle"]: row for row in meta["rows"]}
 
@@ -287,10 +419,58 @@ def main() -> int:
     ap.add_argument("--xlsx", default=None, help="交付 XLSX 路径（默认与 --out 同目录 deliverable.xlsx）")
     ap.add_argument("--no-xlsx", action="store_true", help="只出 decisions.json，不出交付表")
     ap.add_argument("--generated-at", default=None, help="固定时间戳（可复现）")
+    ap.add_argument(
+        "--round-contract",
+        default=None,
+        help="冻结的 round_contract.json；正式决策前校验 batch/track/config/code/carryover",
+    )
+    ap.add_argument(
+        "--require-round-contract",
+        action="store_true",
+        help="缺少 --round-contract 时失败（正式交付推荐）",
+    )
     ap.add_argument("--modash-csv", default=None,
                     help="Modash Profile Report CSV：补假粉/受众/国家(解除 modash_core_missing→Include 才可能非空)")
     ap.add_argument("--manual-csv", default=None,
                     help="人工核验 CSV：raw_skin_grade/has_vo/paid_cpm(解除 raw_skin_or_vo_unverified→Include)")
+    ap.add_argument(
+        "--translate-comments",
+        action="store_true",
+        help=(
+            "草稿/补译模式：显式调用 LLM 翻译已存评论并随普通 advance 回写；"
+            "正式模式禁用（不重访 IG）"
+        ),
+    )
+    ap.add_argument(
+        "--strict-comment-translations",
+        action="store_true",
+        help=(
+            "正式交付只读门禁：仅校验 Stage 3 已存翻译，绝不调用 LLM、"
+            "不截断或改写候选"
+        ),
+    )
+    ap.add_argument(
+        "--translation-provider",
+        choices=["ollama", "anthropic"],
+        default="ollama",
+        help="评论翻译 LLM；默认使用本机 Ollama，Anthropic 仅为显式备用",
+    )
+    ap.add_argument("--translation-model", default=None,
+                    help="翻译模型；Ollama 默认 qwen3.5:4b")
+    ap.add_argument("--translation-api-url", default=None,
+                    help="自定义 Ollama / Anthropic API URL")
+    ap.add_argument("--translation-batch-size", type=int, default=40)
+    ap.add_argument(
+        "--translation-source-limit",
+        "--translation-display-limit",
+        dest="translation_source_limit",
+        type=int,
+        default=120,
+        help=(
+            "仅供 --translate-comments：每候选送 LLM 的已存评论上限；"
+            "严格只读门禁忽略此值（默认 120）"
+        ),
+    )
     ap.add_argument("--modash-cdp", action="store_true",
                     help="驱动已登录 Modash Chrome(9222)读 show-profile 补假粉/受众/国家(每个约1 credit)")
     ap.add_argument(
@@ -307,7 +487,54 @@ def main() -> int:
         ap.error("--deep-target-posts 必须为正整数")
     if args.modash_cap is not None and args.modash_cap < 0:
         ap.error("--modash-cap 不能为负数")
+    if args.translation_batch_size <= 0:
+        ap.error("--translation-batch-size 必须为正整数")
+    if args.translation_source_limit <= 0:
+        ap.error("--translation-source-limit 必须为正整数")
+    if args.translate_comments and args.strict_comment_translations:
+        print(
+            "✗ --translate-comments 与 --strict-comment-translations 无条件互斥："
+            "先独立补译，再单独运行只读验收"
+        )
+        return 1
+    formal_requested = bool(
+        args.round_contract
+        or args.require_round_contract
+        or args.strict_completeness
+        or args.full_deep_all_candidates
+    )
+    if args.translate_comments and formal_requested:
+        print(
+            "✗ 正式 Stage 4 禁止 --translate-comments：请先用独立补译流程持久化，"
+            "再以 --strict-comment-translations 只读验收，避免覆盖深采 ledger"
+        )
+        return 1
     cfg = load_config()
+    contract = None
+    contract_sha = None
+    if args.round_contract:
+        try:
+            contract_path = Path(args.round_contract)
+            contract = round_contract_mod.assert_contract_matches_runtime(
+                round_contract_mod.load_round_contract(contract_path),
+                batch_id=args.batch_id,
+                campaign_track=args.track,
+            )
+            contract_sha = round_contract_mod.round_contract_sha256(contract_path)
+        except (OSError, round_contract_mod.RoundContractError) as exc:
+            print(f"✗ 轮次合同校验失败：{exc}")
+            return 1
+        if args.all_batches:
+            print("✗ 正式轮次合同禁止 --all-batches；必须按 carryover_mode 精确选取")
+            return 1
+        if contract["carryover_mode"] != "new_only" and not args.carryover_manifest:
+            print(
+                f"✗ {contract['carryover_mode']} 轮次必须提供 --carryover-manifest"
+            )
+            return 1
+    elif args.require_round_contract:
+        print("✗ 正式决策要求 --round-contract")
+        return 1
 
     # 客户铁律：抓过就纳入——拉所有有数据候选（非 seed），rejected 也进（Exclude 池写明原因，不 silently drop）
     carryover_meta = None
@@ -318,6 +545,8 @@ def main() -> int:
                 args.batch_id,
                 target_posts=args.deep_target_posts,
                 require_full_deep=args.full_deep_all_candidates,
+                contract=contract,
+                contract_sha256=contract_sha,
             )
         else:
             scope = None if args.all_batches else [args.batch_id]
@@ -351,6 +580,8 @@ def main() -> int:
                 target_posts=args.deep_target_posts,
                 require_full_deep=args.full_deep_all_candidates,
             )
+            if status != "rejected" or args.full_deep_all_candidates:
+                reasons.extend(pricing_mod.completion_reasons(cand, cfg))
             if reasons:
                 incomplete.append((cand.get("handle"), status, reasons))
         if incomplete:
@@ -360,7 +591,7 @@ def main() -> int:
                 else "strict/active"
             )
             print(
-                f"✗ {mode} 完整性门禁失败：{len(incomplete)} 个候选未完成深采",
+                f"✗ {mode} 完整性门禁失败：{len(incomplete)} 个候选的深采/报价证据未闭合",
                 flush=True,
             )
             for handle, status, reasons in incomplete[:30]:
@@ -385,26 +616,89 @@ def main() -> int:
         scope_txt = "跨全部 batch" if args.all_batches else f"batch {args.batch_id}"
     print(f"纳入 {len(cands)}（{scope_txt}）：活跃 {len(active)}(qualified/collected/decided) + 机器淘汰 {len(rejected)}")
 
+    # 翻译完全依赖已存评论，应在任何付费 Modash 补数前完成。正式门禁只读
+    # Stage 3 已持久化缓存，绝不在 Stage 4 内补译或改写候选/attempt ledger。
+    translation_summary = None
+    if args.translate_comments:
+        from extensions.sop_v2 import comment_translation
+
+        model = args.translation_model or (
+            comment_translation.DEFAULT_MODEL
+            if args.translation_provider == "ollama"
+            else comment_translation.DEFAULT_ANTHROPIC_MODEL
+        )
+        print(
+            f"评论补译（显式草稿模式）：{args.translation_provider}/{model}，"
+            f"候选 {len(cands)}（离线处理已存原文，不访问 Instagram）…",
+            flush=True,
+        )
+        try:
+            translation_summary = comment_translation.translate_candidates(
+                cands,
+                provider=args.translation_provider,
+                model=model,
+                api_url=args.translation_api_url,
+                batch_size=args.translation_batch_size,
+                source_limit=args.translation_source_limit,
+                usage_context={
+                    "batch_id": args.batch_id,
+                    "stage": "stage4_decide",
+                    "feature": "comment_translation",
+                },
+            )
+        except comment_translation.TranslationConfigurationError as exc:
+            print(f"✗ 评论翻译配置错误：{exc}")
+            return 1
+        print(
+            "评论补译："
+            f"成功 {translation_summary['translated_count']}/"
+            f"{translation_summary['requested_count']} · "
+            f"失败 {translation_summary['failed_count']} · "
+            f"历史原文缺失 {translation_summary['source_unavailable_count']}",
+            flush=True,
+        )
+
+    if args.strict_comment_translations:
+        from extensions.sop_v2 import comment_translation
+
+        print(
+            f"评论翻译只读验收：候选 {len(cands)}（不调用 LLM、不改写候选）…",
+            flush=True,
+        )
+        translation_summary = comment_translation.validate_translation_cohort(cands)
+        print(
+            "评论翻译只读验收："
+            f"有效候选 {translation_summary['valid_candidate_count']}/"
+            f"{translation_summary['candidate_count']} · "
+            f"译文 {translation_summary['translated_count']}/"
+            f"{translation_summary['requested_count']} · "
+            f"无效候选 {translation_summary['invalid_candidate_count']}",
+            flush=True,
+        )
+        if translation_summary["invalid_candidate_count"]:
+            print(
+                "✗ 正式评论翻译门禁失败：先用独立补译/恢复流程修复缓存，"
+                "Stage 4 未调用翻译服务且未改写翻译字段",
+                flush=True,
+            )
+            for row in translation_summary["failures"]:
+                print(
+                    f"  @{row['handle']} {'；'.join(row['failures'])}",
+                    flush=True,
+                )
+            return 1
+
     if args.modash_cdp:
-        from extensions.sop_v2 import gates, storefront
-        from extensions.sop_v2.contracts import GateVerdict
         from extensions.sop_v2.pipeline.modash_cdp import enrich_via_cdp
-        # 省 credit：只补 active 里通过"非 Modash 硬门槛"的候选(补了才够 Include)；
-        # 已有 Modash 核心字段的旧 carryover、已被硬淘汰或机器 reject 的，均不重抓/不花 credit。
+        # 省 credit：只补 active 里缺核心字段、且最优 Modash 报告仍有机会解除
+        # Review 的候选。已有完整报告或存在评论/橱窗/实算ER等非 Modash 固定
+        # blocker 的账号不重抓、不花 credit。
         cap = (
             int(cfg.get("modash_budget", {}).get("profile_per_round", 20))
             if args.modash_cap is None
             else args.modash_cap
         )
-        modash_core = tuple(cfg["modash_gates"]["core_fields"])
-        shortlist = [c for c in active
-                     if any(c.get(field) is None for field in modash_core)
-                     if gates.gate_summary(gates.evaluate_gates(c, cfg)) != GateVerdict.EXCLUDE]
-        # 有橱窗优先、实算 ER 高优先（好苗子先补）
-        shortlist.sort(key=lambda c: (storefront.has_storefront(c),
-                                      c.get("real_er") or 0), reverse=True)
-        if cap > 0:
-            shortlist = shortlist[:cap]
+        shortlist, shortlist_stats = _build_modash_shortlist(active, cfg, cap)
         disc = cfg.get("discovery", {})
         t = cfg["track"][args.track]
         lo, hi = ((t["min_followers"], t["max_followers"]) if args.track == "paid"
@@ -420,7 +714,12 @@ def main() -> int:
         if cred_min:
             filt["audience"] = {"credibility": float(cred_min)}
         print(
-            f"Modash 补数(CDP)：缺核心字段 shortlist {len(shortlist)}/{len(active)}"
+            "Modash 补数(CDP)："
+            f"缺核心字段 {shortlist_stats['missing_core']} · "
+            f"报告字段缺口 {shortlist_stats['missing_report_fields']} · "
+            f"可改变结论 {shortlist_stats['actionable']} · "
+            f"非可晋级跳过 {shortlist_stats['non_actionable_skipped']} · "
+            f"本次 {len(shortlist)}/{len(active)}"
             f"（完整旧数据不重抓，"
             f"{'不设上限' if cap == 0 else f'上限 {cap}'}）…"
         )
@@ -459,14 +758,23 @@ def main() -> int:
         "config_sha256": config_sha256(None),
         "candidate_count": len(decisions),
         "strict_completeness": strict_mode,
+        "strict_pricing": strict_mode,
         "full_deep_all_candidates": args.full_deep_all_candidates,
         "deep_target_posts": args.deep_target_posts,
     }
+    if contract is not None:
+        decision_manifest["round_contract"] = {
+            "file": _delivery_file_reference(Path(args.round_contract)),
+            "sha256": contract_sha,
+            "carryover_mode": contract["carryover_mode"],
+        }
     if carryover_meta:
         decision_manifest.update(
             {
                 "carryover_manifest": {
-                    "file": carryover_meta["path"],
+                    "file": _delivery_file_reference(
+                        Path(carryover_meta["path"])
+                    ),
                     "sha256": carryover_meta["sha256"],
                 },
                 "carryover_count": carryover_meta["carryover_count"],
@@ -475,6 +783,8 @@ def main() -> int:
                 "allow_incomplete_carryover": args.allow_incomplete_carryover,
             }
         )
+    if translation_summary is not None:
+        decision_manifest["comment_translation"] = translation_summary
     out = {
         "generated_at": args.generated_at or time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "manifest": decision_manifest,

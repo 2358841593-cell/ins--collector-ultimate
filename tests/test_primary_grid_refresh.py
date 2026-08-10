@@ -189,27 +189,25 @@ class _DeepPage:
 def test_existing_complete_pricing_samples_are_last_resort_primary_window(
     tmp_path, monkeypatch
 ):
-    old_estimate = {
-        "status": "complete",
-        "sample_count": 10,
-        "average_plays": 5000,
-        "quote_usd": {"default": 175.0, "max": 200.0},
-    }
     old_samples = [
         {
             "code": f"/adan.skincare/reel/SAVED_{index}/",
             "pinned": False,
             "play_count": 5000 + index,
             "play_count_status": "observed",
+            "play_count_source": "ig_media_info.ig_play_count",
         }
         for index in range(10)
     ]
     cand = {
         "handle": "adan.skincare",
-        "pricing_estimate": copy.deepcopy(old_estimate),
         "pricing_reel_samples": copy.deepcopy(old_samples),
         "pricing_captured_at": "2026-07-28T12:00:00",
     }
+    cand["pricing_estimate"] = browser.pricing_mod.derive_quote_estimate(
+        cand, browser._CFG
+    )
+    old_estimate = copy.deepcopy(cand["pricing_estimate"])
     visited = []
     monkeypatch.setattr(browser, "ROOT", tmp_path)
     monkeypatch.setattr(

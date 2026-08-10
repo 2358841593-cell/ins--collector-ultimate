@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from extensions.sop_v2 import round_contract as round_contract_mod
 from extensions.sop_v2.pipeline import stage4_decide
 from extensions.sop_v2.pipeline import modash_cdp
 
@@ -48,6 +49,17 @@ def _write_manifest(path, *, rows=None, **overrides):
     }
     value.update(overrides)
     path.write_text(json.dumps(value), encoding="utf-8")
+    return path
+
+
+def _write_round_contract(path, *, mode):
+    contract = round_contract_mod.build_round_contract(
+        batch_id="NEW",
+        campaign_track="paid",
+        carryover_mode=mode,
+        created_at="2026-08-10T12:00:00+0800",
+    )
+    round_contract_mod.write_round_contract(path, contract)
     return path
 
 
@@ -223,8 +235,12 @@ def test_stage4_mixes_exact_carryover_with_current_batch_only(
         "new_one",
     ]
     assert {
-        row["handle"]: row["_discovery_batch"] for row in result["candidates"]
+        row["handle"]: row["discovery_batch"] for row in result["candidates"]
     } == {"old_keep": "OLD", "new_one": "NEW"}
+    assert all(
+        not any(key.startswith("_") for key in row)
+        for row in result["candidates"]
+    )
     assert set(result["manifest"]["batches"]) == {"OLD", "NEW"}
     assert result["manifest"]["candidate_count"] == 2
     assert result["manifest"]["carryover_count"] == 1
@@ -232,7 +248,7 @@ def test_stage4_mixes_exact_carryover_with_current_batch_only(
     assert result["manifest"]["retry_pending_count"] == 0
     assert result["manifest"]["allow_incomplete_carryover"] is False
     assert result["manifest"]["carryover_manifest"] == {
-        "file": str(manifest_path.resolve()),
+        "file": manifest_path.name,
         "sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
     }
     assert set(advances) == {
@@ -286,7 +302,7 @@ def test_incomplete_carryover_blocks_by_default_and_explicit_flag_is_draft(
     assert result["manifest"]["allow_incomplete_carryover"] is True
     # Even with no NEW candidate yet, NEW is the review batch and must remain ingestible.
     assert result["manifest"]["batches"] == ["NEW", "OLD"]
-    assert result["candidates"][0]["_discovery_batch"] == "OLD"
+    assert result["candidates"][0]["discovery_batch"] == "OLD"
 
 
 def test_modash_cdp_only_receives_candidates_missing_core_fields(
@@ -426,3 +442,139 @@ def test_all_batches_and_carryover_manifest_are_mutually_exclusive(
     with pytest.raises(SystemExit) as exc:
         stage4_decide.main()
     assert exc.value.code == 2
+
+
+def test_formal_new_only_blocks_nonempty_carryover_before_cache_export(
+    tmp_path, monkeypatch
+):
+    contract_path = _write_round_contract(
+        tmp_path / "round-new.json", mode="new_only"
+    )
+    manifest_path = _write_manifest(
+        tmp_path / "carryover.json",
+        carryover_mode="new_only",
+        round_contract_sha256=round_contract_mod.round_contract_sha256(
+            contract_path
+        ),
+    )
+    monkeypatch.setattr(
+        stage4_decide.cc, "export_all_with_data", lambda scope: pytest.fail("DB export")
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stage4_decide",
+            "--batch-id", "NEW",
+            "--track", "paid",
+            "--round-contract", str(contract_path),
+            "--carryover-manifest", str(manifest_path),
+            "--out", str(tmp_path / "out.json"),
+            "--no-xlsx",
+        ],
+    )
+
+    assert stage4_decide.main() == 1
+
+
+def test_formal_unresolved_requires_carryover_manifest(tmp_path, monkeypatch):
+    contract_path = _write_round_contract(
+        tmp_path / "round-unresolved.json", mode="unresolved"
+    )
+    monkeypatch.setattr(
+        stage4_decide.cc, "export_all_with_data", lambda scope: pytest.fail("DB export")
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stage4_decide",
+            "--batch-id", "NEW",
+            "--track", "paid",
+            "--round-contract", str(contract_path),
+            "--out", str(tmp_path / "out.json"),
+            "--no-xlsx",
+        ],
+    )
+
+    assert stage4_decide.main() == 1
+
+
+def test_formal_new_only_exports_current_batch_and_records_contract(
+    tmp_path, monkeypatch
+):
+    contract_path = _write_round_contract(
+        tmp_path / "round-new.json", mode="new_only"
+    )
+    out_path = tmp_path / "out.json"
+    monkeypatch.setattr(
+        stage4_decide.cc,
+        "export_all_with_data",
+        lambda scope: [_candidate("new_one", "NEW", "collected")],
+    )
+    monkeypatch.setattr(stage4_decide.cc, "advance", lambda *args: None)
+    monkeypatch.setattr(stage4_decide.cc, "status_dist", lambda batch: {})
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stage4_decide",
+            "--batch-id", "NEW",
+            "--track", "paid",
+            "--round-contract", str(contract_path),
+            "--out", str(out_path),
+            "--no-xlsx",
+        ],
+    )
+
+    assert stage4_decide.main() == 0
+    result = json.loads(out_path.read_text(encoding="utf-8"))
+    assert result["manifest"]["round_contract"] == {
+        "file": contract_path.name,
+        "sha256": round_contract_mod.round_contract_sha256(contract_path),
+        "carryover_mode": "new_only",
+    }
+    assert [row["handle"] for row in result["candidates"]] == ["new_one"]
+
+
+def test_delivery_file_reference_is_repo_relative_or_basename():
+    repo_file = stage4_decide._REPO_ROOT / "data" / "round_contract.json"
+    outside = Path("/Users/alice/private/round_contract.json")
+
+    assert stage4_decide._delivery_file_reference(repo_file) == (
+        "data/round_contract.json"
+    )
+    assert stage4_decide._delivery_file_reference(outside) == (
+        "round_contract.json"
+    )
+
+
+def test_formal_retry_only_rejects_manual_only_carryover(tmp_path, monkeypatch):
+    contract_path = _write_round_contract(
+        tmp_path / "round-retry.json", mode="retry_only"
+    )
+    manifest_path = _write_manifest(
+        tmp_path / "carryover.json",
+        carryover_mode="retry_only",
+        round_contract_sha256=round_contract_mod.round_contract_sha256(
+            contract_path
+        ),
+    )
+    monkeypatch.setattr(
+        stage4_decide.cc, "export_all_with_data", lambda scope: pytest.fail("DB export")
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stage4_decide",
+            "--batch-id", "NEW",
+            "--track", "paid",
+            "--round-contract", str(contract_path),
+            "--carryover-manifest", str(manifest_path),
+            "--out", str(tmp_path / "out.json"),
+            "--no-xlsx",
+        ],
+    )
+
+    assert stage4_decide.main() == 1

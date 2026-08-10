@@ -190,6 +190,9 @@ exclude_pinned = true
 default_cpm_usd = 35.0
 cpm_min_usd = 35.0
 cpm_max_usd = 40.0
+short_window_requires_reels_tab_exhaustion = true
+zero_reels_status = "not_applicable_no_reels"
+third_party_fallback_allowed = false
 
 # ── AI Vetting Score 与分层 ──────────────────────────────────────
 [ai_score]
@@ -223,14 +226,21 @@ instagram_first = ["content", "sponsorship", "comments", "visual"]
 # 人工证据最高优先级；冲突记 conflict 不静默覆盖
 manual_highest = true
 
-# ── 发现：本版只做「Amazon Finds 导购型」赛道（客户 2026-07-15 确认）──────────
-# 目标画像：个人红人（非品牌/店铺）+ Amazon 橱窗 + 护肤/美妆带货内容 + 评论区有购买意图。
-# 通道：Modash AI Search 带货导向多查询累积 → 浏览器浅扫过滤（登录态，零 API）。
+# ── 发现：通用电商导购型 skincare / wellness 创作者 ──────────────────
+# 客户已确认：Amazon、LTK、ShopMy、链接聚合、自营店等电商入口均可；无橱窗也可进入
+# Without-Storefront，不能再把 Amazon 当作发现或 Stage2 的隐形硬门槛。
+# 来源混合：批准金种子 Lookalike（利用）+ 通用电商（主召回）+ 主题探索（防飞轮变窄）。
 [discovery]
-niche = "amazon_shopping_guide"
+niche = "skincare_wellness_commerce"
+source_mix_pct = { golden_lookalike = 50, generic_commerce = 30, exploration = 20 }
+structured_sources = [
+  { name = "generic_commerce", query = "skincare and wellness creator who shares honest product recommendations with LTK ShopMy link in bio creator shop or other shopping links" },
+  { name = "exploration", query = "skincare wellness creator with authentic routines product reviews real audience engagement and purchase intent comments" },
+]
 # ── 结构化搜索发现（POST /api/search/v2/instagram + skip 分页，替换 AI Search 只捞6小号）──
 # 粉丝档用 track 范围（paid 10K-150K / gifting 5K-50K）；ER 硬筛；发现阶段预过滤品牌/私密。
-search_query = "skincare beauty creator with amazon storefront who posts product recommendations and honest reviews"
+# 兼容旧调用方；Stage1 新流程优先使用 structured_sources。
+search_query = "skincare wellness creator with shopping links product recommendations and honest reviews"
 search_er_min = 0.015          # engagementRate 结构化硬筛（0.015 = 1.5%）
 search_target = 120            # 累积多少高质量 seed（skip 分页每页 6）
 search_max_pages = 80
@@ -257,17 +267,19 @@ search_creator_geo_ids = [
 search_audience_credibility_min = 0.75   # 受众可信度下限（0.75→假粉≤25%，对齐 GATE-06，发现阶段就砍高假粉）
 # 待办（需真机点 UI 抓包逆向）：filters.audience 的**受众地区**筛字段（比创作者地更准，直接对齐 GATE-04/E3
 # 目标市场受众合计；届时创作者地筛可放宽避免误杀"本人在外、受众在目标国"的优质号）。
-# Modash AI Search 种子查询（旧路，保留兜底；命中"个人+橱窗+护肤/美妆带货"）
+# Modash AI Search 种子查询（旧路，保留兜底；不限定单一电商平台）
 modash_queries = [
-  "amazon storefront skincare finds link in bio",
-  "shop my amazon skincare must haves beauty",
-  "amazon beauty finds skincare routine haul",
-  "amazon skincare favorites storefront affiliate",
-  "amazon must haves beauty influencer skincare",
-  "amazon finds beauty tiktok made me buy skincare",
+  "skincare creator product recommendations shopping links",
+  "wellness beauty creator LTK ShopMy link in bio",
+  "honest skincare reviews creator shop routine",
+  "skincare favorites affiliate product links",
+  "beauty wellness must haves creator storefront",
+  "skincare routine haul authentic product recommendations",
 ]
-# 橱窗信号（bio/外链命中任一 = 有 Amazon 橱窗，硬门槛）
-storefront_signals = ["amazon.com/shop", "amazon storefront", "amzn.to", "amazon.", "/shop/", "storefront"]
+# 通用电商信号（仅作发现/取证信号，不作为是否可入选的硬门槛）
+storefront_signals = ["amazon.com/shop", "amazon storefront", "amzn.to", "shopltk", "liketoknow",
+                      "shopmy", "linktr.ee", "beacons.ai", "stan.store", "myshopify", "/shop/",
+                      "storefront", "shop my", "product links", "link in bio"]
 # 赛道关键词（护肤/美妆导购；浅扫判赛道用）
 niche_keywords = ["skincare", "skin care", "beauty", "makeup", "amazon finds", "amazon must",
                   "shop my", "link in bio", "serum", "retinol", "sunscreen", "routine", "glow"]

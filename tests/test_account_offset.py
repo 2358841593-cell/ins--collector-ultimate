@@ -68,6 +68,21 @@ def test_explicit_account_subpool_cannot_wrap_past_pool_end():
         )
 
 
+def test_account_rotation_is_modulo_selected_slice_and_never_escapes():
+    accounts = [{"username": name} for name in ("a", "b", "c", "d", "e")]
+
+    selected = _base._select_account_pool(
+        accounts,
+        account_offset=1,
+        account_count=3,
+        account_rotation=4,
+    )
+
+    # 4 % 3 == 1: rotate only (b,c,d), never pull a/e across the worker boundary.
+    assert [item["username"] for item in selected] == ["c", "d", "b"]
+    assert {item["username"] for item in selected} == {"b", "c", "d"}
+
+
 def test_run_browser_stage_uses_only_selected_subpool(monkeypatch):
     import browser_collect_v2 as browser
     import playwright.sync_api
@@ -117,7 +132,7 @@ def test_run_browser_stage_uses_only_selected_subpool(monkeypatch):
         "release_queue_locks",
         lambda rows: 0,
     )
-    monkeypatch.setattr(_base.cc, "advance", lambda *args: None)
+    monkeypatch.setattr(_base.cc, "advance", lambda *args, **kwargs: True)
     monkeypatch.setattr(_base.cc, "status_dist", lambda batch: {})
 
     result = _base.run_browser_stage(
@@ -167,7 +182,7 @@ def test_direct_negative_offset_is_rejected():
         _base._account_index(3, 0, -1)
 
 
-def test_stage3_cli_forwards_account_offset(monkeypatch):
+def test_stage3_cli_forwards_account_offset_and_rotation(monkeypatch):
     received = {}
     monkeypatch.setattr(
         stage3_collect,
@@ -188,11 +203,14 @@ def test_stage3_cli_forwards_account_offset(monkeypatch):
             "7",
             "--account-count",
             "2",
+            "--account-rotation",
+            "9",
         ]
     ) == 0
 
     assert received["account_offset"] == 7
     assert received["account_count"] == 2
+    assert received["account_rotation"] == 9
     assert received["per_account"] == 4
 
 
@@ -256,6 +274,10 @@ def test_pricing_cli_forwards_account_offset_without_real_io(monkeypatch):
         (
             stage3_collect.main,
             ["--batch-id", "BATCH", "--account-count", "-1"],
+        ),
+        (
+            stage3_collect.main,
+            ["--batch-id", "BATCH", "--account-rotation", "-1"],
         ),
         (
             stage3_pricing_backfill.main,

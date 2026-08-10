@@ -4,10 +4,12 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import sqlite3
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "scripts"))
@@ -38,6 +40,7 @@ class ClientDecisionTestCase(unittest.TestCase):
             "client_status": None,
             "approved_at": None,
             "rejected_reason": None,
+            "client_rejection_scope": None,
             "source_batch": None,
             "client_note": None,
         }
@@ -63,6 +66,23 @@ class ClientDecisionTestCase(unittest.TestCase):
                     "SELECT * FROM creator_profiles WHERE handle=?", (handle,)
                 ).fetchone()
             )
+        finally:
+            conn.close()
+
+    def _feedback_events(self, handle: str | None = None):
+        conn = cc._conn()
+        try:
+            if handle is None:
+                rows = conn.execute(
+                    "SELECT * FROM client_feedback_events ORDER BY rowid"
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """SELECT * FROM client_feedback_events
+                       WHERE handle=? COLLATE NOCASE ORDER BY rowid""",
+                    (handle,),
+                ).fetchall()
+            return [dict(row) for row in rows]
         finally:
             conn.close()
 
@@ -169,6 +189,7 @@ class TestTransactionalImport(ClientDecisionTestCase):
         self.assertEqual(rejected["tier"], 1)
         self.assertIsNone(rejected["approved_at"])
         self.assertEqual(rejected["rejected_reason"], "客户判定不合适")
+        self.assertEqual(rejected["client_rejection_scope"], "global")
         self.assertEqual(rejected["source_batch"], BATCH)
         self.assertEqual(rejected["client_note"], "keep this independent note")
 
@@ -179,6 +200,23 @@ class TestTransactionalImport(ClientDecisionTestCase):
         self.assertIsNone(pending["rejected_reason"])
         self.assertEqual(pending["source_batch"], "UNCHANGED")
         self.assertEqual(pending["client_note"], "[待定] review later")
+
+        events = self._feedback_events()
+        self.assertEqual(len(events), 3)
+        self.assertEqual(
+            [event["verdict"] for event in events],
+            ["approved", "rejected", "pending"],
+        )
+        self.assertEqual(events[0]["reason_raw"], "good fit")
+        self.assertEqual(json.loads(events[0]["reason_tags_json"]), [])
+        self.assertEqual(events[0]["feedback_scope"], "account")
+        self.assertEqual(events[0]["source_mode"], "import")
+        self.assertIsNone(events[0]["rejection_scope"])
+        self.assertEqual(events[1]["rejection_scope"], "global")
+        self.assertEqual(events[0]["feedback_file_sha256"], payload["file_sha256"])
+        self.assertEqual(
+            events[0]["source_decisions_sha256"], payload["source_sha256"]
+        )
 
         approved_at = approved["approved_at"]
         second = cc.apply_client_decisions(
@@ -197,6 +235,7 @@ class TestTransactionalImport(ClientDecisionTestCase):
             )
         finally:
             conn.close()
+        self.assertEqual(len(self._feedback_events()), 3)
 
     def test_db_validation_failure_rolls_back_entire_batch(self):
         self._insert("valid")
@@ -217,6 +256,10 @@ class TestTransactionalImport(ClientDecisionTestCase):
         try:
             self.assertEqual(
                 conn.execute("SELECT COUNT(*) FROM client_feedback_imports").fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM client_feedback_events").fetchone()[0],
                 0,
             )
         finally:
@@ -288,6 +331,9 @@ class TestTransactionalImport(ClientDecisionTestCase):
             self._row("already_approved")["approved_at"], "2026-01-01T00:00:00"
         )
         self.assertEqual(self._row("new_rejection")["client_status"], "rejected")
+        self.assertEqual(
+            self._row("new_rejection")["client_rejection_scope"], "global"
+        )
         conn = cc._conn()
         try:
             self.assertEqual(
@@ -367,6 +413,484 @@ class TestTransactionalImport(ClientDecisionTestCase):
         self.assertIsNone(self._row("approved_to_pending")["client_note"])
 
 
+class TestFeedbackEventLedger(ClientDecisionTestCase):
+    def test_v2_structured_feedback_is_preserved_and_empty_signal_is_demoted(self):
+        self._insert("country_fix")
+        self._insert("blank_rejection")
+        feedback, source = self._write_payloads(
+            [
+                {
+                    "handle": "country_fix",
+                    "verdict": "不合适",
+                    "reason": "客户确认创作者在俄罗斯",
+                    "reason_tags": ["geo_creator_outside", "geo_creator_outside"],
+                    "feedback_scope": "fact_correction",
+                    "rejection_scope": "temporary",
+                    "target_field": "creator_country",
+                    "old_value": "US",
+                    "claimed_value": "RU",
+                    "evidence_status": "verified",
+                },
+                {
+                    "handle": "blank_rejection",
+                    "verdict": "不合适",
+                    "reason": "",
+                    "reason_tags": [],
+                    "feedback_scope": "policy_signal",
+                },
+            ]
+        )
+        data = json.loads(feedback.read_text(encoding="utf-8"))
+        data.update(
+            {
+                "feedback_schema_version": 2,
+                "taxonomy_version": ingest.TAXONOMY_VERSION,
+            }
+        )
+        feedback.write_text(
+            json.dumps(data, ensure_ascii=False), encoding="utf-8"
+        )
+
+        payload = ingest.load_validated_decisions(feedback, source)
+        self.assertEqual(
+            payload["decisions"][0]["reason_tags"], ["geo_creator_outside"]
+        )
+        self.assertEqual(payload["decisions"][1]["feedback_scope"], "account")
+        cc.apply_client_decisions(
+            payload["decisions"],
+            batch_id=payload["batch"],
+            file_sha256=payload["file_sha256"],
+            source_sha256=payload["source_sha256"],
+        )
+
+        corrected, blank = self._feedback_events()
+        self.assertEqual(json.loads(corrected["reason_tags_json"]), ["geo_creator_outside"])
+        self.assertEqual(corrected["feedback_scope"], "fact_correction")
+        self.assertEqual(corrected["rejection_scope"], "temporary")
+        self.assertEqual(corrected["target_field"], "creator_country")
+        self.assertEqual(corrected["old_value"], "US")
+        self.assertEqual(corrected["claimed_value"], "RU")
+        self.assertEqual(corrected["evidence_status"], "verified")
+        self.assertEqual(corrected["taxonomy_version"], ingest.TAXONOMY_VERSION)
+        self.assertEqual(blank["feedback_scope"], "account")
+        self.assertEqual(json.loads(blank["reason_tags_json"]), [])
+        self.assertEqual(blank["rejection_scope"], "campaign")
+        self.assertEqual(
+            self._row("country_fix")["client_rejection_scope"], "temporary"
+        )
+        self.assertEqual(
+            self._row("blank_rejection")["client_rejection_scope"], "campaign"
+        )
+
+    def test_rejection_scope_default_is_global_for_legacy_and_campaign_for_v2(self):
+        for schema_version, expected in ((None, "global"), (2, "campaign")):
+            with self.subTest(schema_version=schema_version):
+                feedback, source = self._write_payloads(
+                    [{"handle": "one", "verdict": "不合适", "reason": ""}]
+                )
+                if schema_version == 2:
+                    data = json.loads(feedback.read_text(encoding="utf-8"))
+                    data.update(
+                        {
+                            "feedback_schema_version": 2,
+                            "taxonomy_version": ingest.TAXONOMY_VERSION,
+                        }
+                    )
+                    feedback.write_text(json.dumps(data), encoding="utf-8")
+                payload = ingest.load_validated_decisions(feedback, source)
+                self.assertEqual(
+                    payload["decisions"][0]["rejection_scope"], expected
+                )
+
+    def test_source_context_is_frozen_from_source_candidate_with_field_allowlist(self):
+        self._insert("lineage")
+        feedback, source = self._write_payloads(
+            [{"handle": "lineage", "verdict": "合适", "reason": ""}]
+        )
+        source_data = json.loads(source.read_text(encoding="utf-8"))
+        source_data["candidates"][0].update(
+            {
+                "discovery_sources": ["structured:commerce", "structured:commerce"],
+                "discovered_via": "lookalike",
+                "golden_seed_handles": ["@Seed_A", "seed_a", "seed_b"],
+                "biography": "must not enter feedback event",
+                "comment_records": [{"text": "private-to-this-contract"}],
+            }
+        )
+        source.write_text(json.dumps(source_data), encoding="utf-8")
+
+        payload = ingest.load_validated_decisions(feedback, source)
+        expected = {
+            "discovery_sources": ["structured:commerce"],
+            "discovered_via": "lookalike",
+            "golden_seed_handles": ["seed_a", "seed_b"],
+        }
+        self.assertEqual(payload["decisions"][0]["source_context"], expected)
+        cc.apply_client_decisions(
+            payload["decisions"],
+            batch_id=payload["batch"],
+            file_sha256=payload["file_sha256"],
+            source_sha256=payload["source_sha256"],
+        )
+        frozen = json.loads(self._feedback_events()[0]["source_context_json"])
+        self.assertEqual(frozen, expected)
+        self.assertNotIn("biography", frozen)
+        self.assertNotIn("comment_records", frozen)
+
+    def test_low_level_api_rejects_external_confirmed_policy(self):
+        self._insert("unsafe_policy")
+        with self.assertRaisesRegex(
+            cc.ClientDecisionImportError, "不能直接确认全局策略"
+        ):
+            cc.apply_client_decisions(
+                [
+                    {
+                        "handle": "unsafe_policy",
+                        "action": "rejected",
+                        "reason": "try to bypass importer",
+                        "feedback_scope": "confirmed_policy",
+                    }
+                ],
+                batch_id=BATCH,
+                file_sha256="a" * 64,
+                source_sha256="b" * 64,
+            )
+        self.assertIsNone(self._row("unsafe_policy")["client_status"])
+        self.assertEqual(self._feedback_events(), [])
+
+    def test_structured_contract_rejects_unknown_or_unsafe_values(self):
+        cases = (
+            ({"feedback_schema_version": 3}, "feedback_schema_version"),
+            (
+                {"feedback_schema_version": 2, "taxonomy_version": "999"},
+                "taxonomy_version",
+            ),
+            ({"reason_tags": "geo_mismatch"}, "reason_tags"),
+            ({"reason_tags": ["not_a_real_tag"]}, "未知 reason_tag"),
+            ({"feedback_scope": "confirmed_policy"}, "不能直接确认全局策略"),
+            ({"feedback_scope": "fact_correction"}, "target_field"),
+            ({"rejection_scope": "global"}, "只有 rejected"),
+            ({"evidence_status": "maybe"}, "evidence_status"),
+        )
+        for changes, message in cases:
+            with self.subTest(changes=changes):
+                verdict = "合适"
+                if "reason_tags" in changes or changes.get("feedback_scope") in {
+                    "confirmed_policy",
+                    "fact_correction",
+                }:
+                    verdict = "不合适"
+                decision = {"handle": "one", "verdict": verdict, "reason": "x"}
+                top_level = {}
+                for key, value in changes.items():
+                    if key in {"feedback_schema_version", "taxonomy_version"}:
+                        top_level[key] = value
+                    else:
+                        decision[key] = value
+                feedback, source = self._write_payloads([decision])
+                data = json.loads(feedback.read_text(encoding="utf-8"))
+                data.update(top_level)
+                feedback.write_text(json.dumps(data), encoding="utf-8")
+                with self.assertRaisesRegex(ingest.FeedbackValidationError, message):
+                    ingest.load_validated_decisions(feedback, source)
+
+    def test_event_insert_failure_rolls_back_profiles_ledger_and_events(self):
+        self._insert("first")
+        self._insert("second")
+        decisions = [
+            {"handle": "first", "action": "approved", "reason": ""},
+            {"handle": "second", "action": "rejected", "reason": ""},
+        ]
+        fixed_uuid = mock.Mock(hex="same-event-id")
+        with mock.patch.object(cc.uuid, "uuid4", return_value=fixed_uuid):
+            with self.assertRaises(sqlite3.IntegrityError):
+                cc.apply_client_decisions(
+                    decisions,
+                    batch_id=BATCH,
+                    file_sha256="a" * 64,
+                    source_sha256="b" * 64,
+                )
+        self.assertIsNone(self._row("first")["client_status"])
+        self.assertIsNone(self._row("second")["client_status"])
+        conn = cc._conn()
+        try:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM client_feedback_imports").fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM client_feedback_events").fetchone()[0],
+                0,
+            )
+        finally:
+            conn.close()
+
+    def test_dry_run_writes_no_projection_ledger_or_event(self):
+        self._insert("dry")
+        result = cc.apply_client_decisions(
+            [{"handle": "dry", "action": "approved", "reason": "looks good"}],
+            batch_id=BATCH,
+            file_sha256="c" * 64,
+            source_sha256="d" * 64,
+            dry_run=True,
+        )
+        self.assertTrue(result["dry_run"])
+        self.assertIsNone(self._row("dry")["client_status"])
+        self.assertEqual(self._feedback_events(), [])
+        conn = cc._conn()
+        try:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM client_feedback_imports").fetchone()[0],
+                0,
+            )
+        finally:
+            conn.close()
+
+    def test_changed_verdict_links_to_previous_event(self):
+        self._insert("changed")
+        cc.apply_client_decisions(
+            [{"handle": "changed", "action": "approved", "reason": "first"}],
+            batch_id=BATCH,
+            file_sha256="1" * 64,
+            source_sha256="2" * 64,
+        )
+        first = self._feedback_events("changed")[0]
+        cc.apply_client_decisions(
+            [{"handle": "changed", "action": "rejected", "reason": "changed mind"}],
+            batch_id=BATCH,
+            file_sha256="3" * 64,
+            source_sha256="2" * 64,
+            allow_status_change=True,
+        )
+        events = self._feedback_events("changed")
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[1]["verdict"], "rejected")
+        self.assertEqual(events[1]["supersedes_event_id"], first["event_id"])
+
+    def test_feedback_and_policy_logs_are_append_only(self):
+        self._insert("immutable")
+        cc.apply_client_decisions(
+            [{"handle": "immutable", "action": "approved", "reason": ""}],
+            batch_id=BATCH,
+            file_sha256="4" * 64,
+            source_sha256="5" * 64,
+        )
+        event_id = self._feedback_events("immutable")[0]["event_id"]
+        conn = cc._conn()
+        try:
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "append-only"):
+                conn.execute(
+                    "UPDATE client_feedback_events SET reason_raw='changed' WHERE event_id=?",
+                    (event_id,),
+                )
+            conn.rollback()
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "append-only"):
+                conn.execute(
+                    "DELETE FROM client_feedback_events WHERE event_id=?", (event_id,)
+                )
+            conn.rollback()
+
+            conn.execute(
+                """INSERT INTO policy_change_log
+                   (change_id, policy_key, status, source_event_ids_json, created_at)
+                   VALUES (?,?,?,?,?)""",
+                (
+                    "change-1",
+                    "countries.target",
+                    "proposed",
+                    json.dumps([event_id]),
+                    "2026-08-10T00:00:00",
+                ),
+            )
+            conn.commit()
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "append-only"):
+                conn.execute(
+                    "UPDATE policy_change_log SET status='approved' WHERE change_id='change-1'"
+                )
+            conn.rollback()
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "append-only"):
+                conn.execute("DELETE FROM policy_change_log WHERE change_id='change-1'")
+            conn.rollback()
+        finally:
+            conn.close()
+
+    def test_historical_backfill_is_explicit_atomic_and_idempotent(self):
+        self._insert(
+            "historical_approved",
+            client_status="rejected",
+            rejected_reason="newer decision must remain",
+            source_batch="LATER",
+        )
+        self._insert("historical_pending", client_note="operator note")
+        feedback, source = self._write_payloads(
+            [
+                {"handle": "historical_approved", "verdict": "合适", "reason": "old"},
+                {"handle": "historical_pending", "verdict": "待定", "reason": "later"},
+            ]
+        )
+        payload = ingest.load_validated_decisions(feedback, source)
+        imported_at = "2026-07-23T09:00:00"
+        conn = cc._conn()
+        try:
+            conn.execute(
+                """INSERT INTO client_feedback_imports
+                   (file_sha256, batch_id, source_sha256, imported_at,
+                    decision_count, approved_count, rejected_count, pending_count,
+                    adopted_existing)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (
+                    payload["file_sha256"],
+                    BATCH,
+                    payload["source_sha256"],
+                    imported_at,
+                    2,
+                    1,
+                    0,
+                    1,
+                    0,
+                ),
+            )
+            conn.commit()
+            ledger_before = tuple(
+                conn.execute(
+                    "SELECT * FROM client_feedback_imports WHERE file_sha256=?",
+                    (payload["file_sha256"],),
+                ).fetchone()
+            )
+        finally:
+            conn.close()
+
+        # 普通同 SHA 导入保持旧语义：严格幂等跳过，不悄悄补历史事件。
+        skipped = cc.apply_client_decisions(
+            payload["decisions"],
+            batch_id=BATCH,
+            file_sha256=payload["file_sha256"],
+            source_sha256=payload["source_sha256"],
+        )
+        self.assertTrue(skipped["already_imported"])
+        self.assertEqual(self._feedback_events(), [])
+
+        preview = cc.apply_client_decisions(
+            payload["decisions"],
+            batch_id=BATCH,
+            file_sha256=payload["file_sha256"],
+            source_sha256=payload["source_sha256"],
+            backfill_events=True,
+            dry_run=True,
+        )
+        self.assertEqual(preview["events_to_backfill"], 2)
+        self.assertEqual(self._feedback_events(), [])
+
+        result = cc.apply_client_decisions(
+            payload["decisions"],
+            batch_id=BATCH,
+            file_sha256=payload["file_sha256"],
+            source_sha256=payload["source_sha256"],
+            backfill_events=True,
+        )
+        self.assertEqual(result["events_backfilled"], 2)
+        events = self._feedback_events()
+        self.assertEqual({event["source_mode"] for event in events}, {"historical_backfill"})
+        self.assertEqual({event["imported_at"] for event in events}, {imported_at})
+        self.assertEqual(
+            {
+                json.dumps(
+                    json.loads(event["source_context_json"]), sort_keys=True
+                )
+                for event in events
+            },
+            {
+                json.dumps(
+                    {
+                        "discovery_sources": [],
+                        "discovered_via": None,
+                        "golden_seed_handles": [],
+                    },
+                    sort_keys=True,
+                )
+            },
+        )
+        # 历史回填绝不覆盖此刻的账号投影。
+        approved = self._row("historical_approved")
+        self.assertEqual(approved["client_status"], "rejected")
+        self.assertEqual(approved["rejected_reason"], "newer decision must remain")
+        self.assertEqual(self._row("historical_pending")["client_note"], "operator note")
+
+        conn = cc._conn()
+        try:
+            ledger_after = tuple(
+                conn.execute(
+                    "SELECT * FROM client_feedback_imports WHERE file_sha256=?",
+                    (payload["file_sha256"],),
+                ).fetchone()
+            )
+        finally:
+            conn.close()
+        self.assertEqual(ledger_after, ledger_before)
+
+        repeated = cc.apply_client_decisions(
+            payload["decisions"],
+            batch_id=BATCH,
+            file_sha256=payload["file_sha256"],
+            source_sha256=payload["source_sha256"],
+            backfill_events=True,
+        )
+        self.assertTrue(repeated["events_already_present"])
+        self.assertEqual(len(self._feedback_events()), 2)
+
+    def test_historical_backfill_rejects_missing_ledger_or_partial_events(self):
+        self._insert("one")
+        self._insert("two")
+        decisions = [
+            {"handle": "one", "action": "approved", "reason": ""},
+            {"handle": "two", "action": "rejected", "reason": ""},
+        ]
+        kwargs = {
+            "batch_id": BATCH,
+            "file_sha256": "a" * 64,
+            "source_sha256": "b" * 64,
+            "backfill_events": True,
+        }
+        with self.assertRaisesRegex(cc.ClientDecisionImportError, "已有同 SHA ledger"):
+            cc.apply_client_decisions(decisions, **kwargs)
+
+        conn = cc._conn()
+        try:
+            conn.execute(
+                """INSERT INTO client_feedback_imports
+                   (file_sha256, batch_id, source_sha256, imported_at,
+                    decision_count, approved_count, rejected_count, pending_count,
+                    adopted_existing)
+                   VALUES (?,?,?,?,?,?,?,?,0)""",
+                ("a" * 64, BATCH, "b" * 64, "2026-07-23T09:00:00", 2, 1, 1, 0),
+            )
+            conn.execute(
+                """INSERT INTO client_feedback_events
+                   (event_id, review_batch, origin_batch, handle, verdict,
+                    feedback_file_sha256, source_decisions_sha256,
+                    taxonomy_version, imported_at, source_mode)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    "partial",
+                    BATCH,
+                    BATCH,
+                    "one",
+                    "approved",
+                    "a" * 64,
+                    "b" * 64,
+                    ingest.TAXONOMY_VERSION,
+                    "2026-07-23T09:00:00",
+                    "historical_backfill",
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        with self.assertRaisesRegex(cc.ClientDecisionImportError, "部分逐条 events"):
+            cc.apply_client_decisions(decisions, **kwargs)
+        self.assertEqual(len(self._feedback_events()), 1)
+
+
 class TestAdoptExisting(ClientDecisionTestCase):
     def test_requires_explicit_adoption_then_repairs_without_refreshing_timestamp(self):
         old_approved_at = "2026-07-22T09:10:00"
@@ -425,6 +949,10 @@ class TestAdoptExisting(ClientDecisionTestCase):
         finally:
             conn.close()
         self.assertEqual(ledger["adopted_existing"], 1)
+        self.assertEqual(
+            {event["source_mode"] for event in self._feedback_events()},
+            {"adopt_existing"},
+        )
 
     def test_adoption_aborts_if_existing_state_does_not_match(self):
         self._insert(
@@ -511,6 +1039,19 @@ class TestStrictFileContract(ClientDecisionTestCase):
         self.assertIn("--source-decisions", stderr.getvalue())
         self.assertFalse(cc.DB.exists())
 
+    def test_event_backfill_requires_source_even_in_dry_run(self):
+        feedback, _ = self._write_payloads(
+            [{"handle": "one", "verdict": "待定", "reason": ""}]
+        )
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            result = ingest.main(
+                ["--file", str(feedback), "--backfill-events", "--dry-run"]
+            )
+        self.assertEqual(result, 2)
+        self.assertIn("--backfill-events 必须同时提供", stderr.getvalue())
+        self.assertFalse(cc.DB.exists())
+
     def test_reason_only_row_is_pending(self):
         feedback, source = self._write_payloads(
             [{"handle": "one", "verdict": "", "reason": "needs another look"}]
@@ -593,6 +1134,97 @@ class TestStrictFileContract(ClientDecisionTestCase):
                 feedback.write_text(json.dumps(data), encoding="utf-8")
                 with self.assertRaisesRegex(ingest.FeedbackValidationError, message):
                     ingest.load_validated_decisions(feedback, source)
+
+
+class TestRejectionScopeRuntime(ClientDecisionTestCase):
+    def test_only_global_or_legacy_rejections_are_permanent_negative_assets(self):
+        for handle in ("global", "campaign", "temporary"):
+            self._insert(handle)
+        cc.apply_client_decisions(
+            [
+                {
+                    "handle": "global",
+                    "action": "rejected",
+                    "reason": "",
+                    "rejection_scope": "global",
+                },
+                {
+                    "handle": "campaign",
+                    "action": "rejected",
+                    "reason": "",
+                    "rejection_scope": "campaign",
+                },
+                {
+                    "handle": "temporary",
+                    "action": "rejected",
+                    "reason": "",
+                    "rejection_scope": "temporary",
+                },
+            ],
+            batch_id=BATCH,
+            file_sha256="a" * 64,
+            source_sha256="b" * 64,
+        )
+        self._insert(
+            "legacy",
+            client_status="rejected",
+            client_rejection_scope=None,
+            rejected_reason="legacy permanent rejection",
+        )
+
+        self.assertTrue(cc.is_rejected("GLOBAL"))
+        self.assertTrue(cc.is_rejected("legacy"))
+        self.assertFalse(cc.is_rejected("campaign"))
+        self.assertFalse(cc.is_rejected("temporary"))
+
+    def test_explicit_recollect_reopens_scoped_but_not_permanent_rejections(self):
+        self._insert(
+            "campaign",
+            client_status="rejected",
+            client_rejection_scope="campaign",
+            rejected_reason="this campaign only",
+        )
+        self._insert(
+            "temporary",
+            client_status="rejected",
+            client_rejection_scope="temporary",
+            rejected_reason="retry later",
+        )
+        self._insert(
+            "global",
+            client_status="rejected",
+            client_rejection_scope="global",
+        )
+        self._insert("legacy", client_status="rejected")
+
+        self.assertEqual(
+            cc.validate_recollect_scope(["campaign", "temporary"]),
+            {"campaign", "temporary"},
+        )
+        self.assertEqual(cc.requeue_for_recollect(["campaign", "temporary"]), 2)
+        for handle in ("campaign", "temporary"):
+            row = self._row(handle)
+            self.assertEqual(row["status"], "qualified")
+            self.assertIsNone(row["client_status"])
+            self.assertIsNone(row["rejected_reason"])
+            self.assertIsNone(row["client_rejection_scope"])
+
+        for handle in ("global", "legacy"):
+            with self.subTest(handle=handle):
+                with self.assertRaisesRegex(ValueError, "客户终判|client_final"):
+                    cc.requeue_for_recollect([handle])
+                self.assertEqual(self._row(handle)["client_status"], "rejected")
+
+    def test_legacy_mark_rejected_remains_global_and_approval_clears_scope(self):
+        self._insert("legacy_api")
+        cc.mark_rejected("legacy_api", "no", BATCH)
+        self.assertEqual(
+            self._row("legacy_api")["client_rejection_scope"], "global"
+        )
+        cc.promote_golden("legacy_api", BATCH)
+        row = self._row("legacy_api")
+        self.assertEqual(row["client_status"], "approved")
+        self.assertIsNone(row["client_rejection_scope"])
 
 
 class TestGoldenSeeds(ClientDecisionTestCase):

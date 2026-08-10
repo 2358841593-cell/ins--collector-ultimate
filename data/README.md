@@ -11,6 +11,7 @@
 | `batches/` | SOP V2 批次状态与 manifest | 否 |
 | `manual_evidence/` | Raw Skin、VO、报价等人工回填 | 否 |
 | `discovery.db` | 可重建的 SQLite 发现数据库 | 否 |
+| `token_costs.db` / `token_cost_status.json` | LLM token 成本台账与监控快照（不含提示词/回复） | 否 |
 | `pod_accounts.json` | 本地累计的水军/互赞团派生库 | 否 |
 
 首次运行时脚本会按需创建数据库和运行文件。当前 V2 不使用 `data/session/` 的 Legacy

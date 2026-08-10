@@ -1,5 +1,8 @@
 """仅补采展示型预估报价，不重跑评论评分，也不改变流水线状态或路由。
 
+写回四个报价字段及其专用 immutable ledger event/pointer/quality；deep canonical
+窗口与评论重试状态保持不变。新报价按严格质量单调选择，失败尝试不能降级旧报价。
+
 候选范围是 carryover manifest 中的未终判账号，与/或 ``--batch-id`` 指定批次中
 已 ``decided`` / ``rejected`` / ``collected`` 的账号。已有完整报价的账号自动跳过。
 
@@ -13,7 +16,7 @@
       --manifest ../data/batches/SKIN4-20260723/carryover_manifest.json \
       --batch-id SKIN4-20260723 --resume
 
-    # 仅重试已有不完整报价；complete 永远跳过，可再加 --handles-file 精确收窄
+    # 仅重试不完整/合同不一致报价；严格完整项跳过，可加 --handles-file 精确收窄
     ../.venv/bin/python -m extensions.sop_v2.pipeline.stage3_pricing_backfill \
       --manifest ../data/batches/SKIN4-20260723/carryover_manifest.json \
       --batch-id SKIN4-20260723 --retry-incomplete --dry-run
@@ -21,6 +24,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import sqlite3
 import sys
@@ -33,20 +37,30 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from extensions.sop_v2 import creator_cache as cc  # noqa: E402
+from extensions.sop_v2 import pricing as pricing_mod  # noqa: E402
 from extensions.sop_v2.config import load_config  # noqa: E402
 from extensions.sop_v2.pipeline._base import (  # noqa: E402
     _select_account_pool,
     _sticky_session,
     nonnegative_int,
 )
+from extensions.sop_v2.pipeline import deep_attempts  # noqa: E402
 
 
 ELIGIBLE_STATUSES = ("decided", "rejected", "collected")
 INCOMPLETE_PRICING_STATUSES = ("missing", "partial", "fallback_modash")
 _PRICING_FIELDS = (
     "pricing_reel_samples",
+    "pricing_reels_tab_evidence",
     "pricing_captured_at",
     "pricing_estimate",
+)
+_PRICING_LEDGER_FIELDS = (
+    deep_attempts.LEDGER_FIELD,
+    deep_attempts.CANONICAL_ATTEMPT_FIELD,
+    deep_attempts.CANONICAL_QUALITY_FIELD,
+    deep_attempts.PRICING_CANONICAL_ATTEMPT_FIELD,
+    deep_attempts.PRICING_CANONICAL_QUALITY_FIELD,
 )
 
 
@@ -148,12 +162,18 @@ def _stage_json(row: sqlite3.Row) -> dict:
 
 
 def _should_collect_pricing(cand: dict, retry_incomplete: bool = False) -> bool:
-    """默认只补从未尝试；显式重试时额外纳入三种不完整结果，永不重跑 complete。"""
+    """默认只补从未尝试；显式重试时纳入所有非正式完整结果。"""
     estimate = cand.get("pricing_estimate")
     if not isinstance(estimate, dict):
         return True
     status = estimate.get("status")
-    if status == "complete":
+    if status in {
+        "complete",
+        "complete_available",
+        "not_applicable_no_reels",
+    }:
+        if pricing_mod.completion_reasons(cand, load_config()):
+            return retry_incomplete
         return False
     if status in INCOMPLETE_PRICING_STATUSES:
         return retry_incomplete
@@ -167,6 +187,7 @@ def _eligible_rows(
     manifest_handles: dict[str, str],
     allowed_handles: set[str],
     retry_incomplete: bool,
+    include_complete: bool = False,
 ) -> list[sqlite3.Row]:
     clauses = []
     params: list[str] = list(ELIGIBLE_STATUSES)
@@ -270,10 +291,56 @@ def _eligible_rows(
         row
         for row in rows
         if row["client_status"] not in ("approved", "rejected", "collaborated")
-        and _should_collect_pricing(
-            _stage_json(row), retry_incomplete=retry_incomplete
+        and (
+            include_complete
+            or _should_collect_pricing(
+                _stage_json(row), retry_incomplete=retry_incomplete
+            )
         )
     ]
+
+
+def audit_pricing(
+    db_path: Path,
+    *,
+    batch_id: str | None = None,
+    manifest_handles: dict[str, str] | None = None,
+    allowed_handles: set[str] | None = None,
+    cfg: dict | None = None,
+) -> list[dict]:
+    """Read-only B3 pricing audit for an exact scope."""
+    manifest_handles = manifest_handles or {}
+    allowed_handles = allowed_handles or set()
+    conn = _connect(db_path)
+    try:
+        rows = _eligible_rows(
+            conn,
+            batch_id=batch_id,
+            manifest_handles=manifest_handles,
+            allowed_handles=allowed_handles,
+            retry_incomplete=True,
+            include_complete=True,
+        )
+    finally:
+        conn.close()
+    policy = cfg or load_config()
+    failures = []
+    for row in rows:
+        cand = _stage_json(row)
+        cand["handle"] = row["handle"]
+        reasons = pricing_mod.completion_reasons(cand, policy)
+        if reasons:
+            failures.append(
+                {
+                    "handle": row["handle"],
+                    "status": row["status"],
+                    "pricing_status": (
+                        cand.get("pricing_estimate") or {}
+                    ).get("status", "missing"),
+                    "reasons": reasons,
+                }
+            )
+    return failures
 
 
 def claim_candidates(
@@ -353,7 +420,13 @@ def claim_candidates(
 def save_pricing(
     db_path: Path, claimed: ClaimedCandidate, enriched: dict
 ) -> bool:
-    """只合并 pricing_* 三字段；status/route/评论/热列及 stage_error 均保持原值。"""
+    """合并报价 bundle + ledger metadata；业务/评论/热列及 stage_error 保持原值。"""
+    if deep_attempts.LEDGER_FIELD in enriched:
+        from extensions.sop_v2.pipeline.recover_deep_evidence import (
+            _assert_canonical_metadata,
+        )
+
+        _assert_canonical_metadata(enriched, handle=claimed.handle)
     conn = _connect(db_path)
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -371,9 +444,13 @@ def save_pricing(
             conn.rollback()
             return False
         current = _stage_json(row)
-        for field in _PRICING_FIELDS:
+        for field in _PRICING_FIELDS + _PRICING_LEDGER_FIELDS:
             if field in enriched:
                 current[field] = enriched[field]
+            elif field in _PRICING_FIELDS or field == (
+                deep_attempts.PRICING_CANONICAL_ATTEMPT_FIELD
+            ):
+                current.pop(field, None)
         changed = conn.execute(
             "UPDATE creator_profiles SET stage_json=?,locked_at=NULL "
             "WHERE handle=? AND locked_at=? AND status=? "
@@ -501,6 +578,8 @@ def run_backfill(
         print(f"✗ 无可用 IG 号（{accounts_file or 'accounts_raw.txt'}）")
         return {
             "complete": 0,
+            "complete_available": 0,
+            "not_applicable_no_reels": 0,
             "partial": 0,
             "fallback_modash": 0,
             "missing": 0,
@@ -509,6 +588,8 @@ def run_backfill(
 
     counts = {
         "complete": 0,
+        "complete_available": 0,
+        "not_applicable_no_reels": 0,
         "partial": 0,
         "fallback_modash": 0,
         "missing": 0,
@@ -551,18 +632,29 @@ def run_backfill(
                         pg.set_default_navigation_timeout(20000)
                         print(f"  ↻ 号 {acct['username']}", flush=True)
                     used += 1
+                    prior_snapshot = copy.deepcopy(claimed.cand)
                     state, error = bc.collect_pricing_evidence(
                         pg, claimed.cand
                     )
                     if state is None:
                         raise RuntimeError(error or "pricing_no_output")
-                    if not save_pricing(db_path, claimed, claimed.cand):
+                    finalized = deep_attempts.finalize_pricing_only_attempt(
+                        prior_snapshot,
+                        claimed.cand,
+                        attempted_at=datetime.now().astimezone().isoformat(
+                            timespec="seconds"
+                        ),
+                        error=error,
+                    )
+                    if not save_pricing(db_path, claimed, finalized):
                         raise RuntimeError("pricing_claim_lost")
                     status = (
-                        claimed.cand.get("pricing_estimate") or {}
+                        finalized.get("pricing_estimate") or {}
                     ).get("status", "missing")
                     if status not in (
                         "complete",
+                        "complete_available",
+                        "not_applicable_no_reels",
                         "partial",
                         "fallback_modash",
                         "missing",
@@ -615,7 +707,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--retry-incomplete",
         action="store_true",
-        help="显式重试 missing/partial/fallback_modash；complete 永远不重跑",
+        help=(
+            "显式重试 missing/partial/历史 fallback；complete、"
+            "complete_available、not_applicable_no_reels 仅在合同完整时跳过"
+        ),
+    )
+    ap.add_argument(
+        "--audit-only",
+        action="store_true",
+        help="B3 只读报价审计；不加锁、不启动浏览器、不写数据库",
     )
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument(
@@ -651,6 +751,8 @@ def main(argv: list[str] | None = None) -> int:
         ap.error("--limit 不能为负数")
     if args.stale_minutes < 0:
         ap.error("--stale-minutes 不能为负数")
+    if args.audit_only and args.dry_run:
+        ap.error("--audit-only 已是只读模式，不能与 --dry-run 同用")
 
     try:
         manifest_handles = (
@@ -663,17 +765,27 @@ def main(argv: list[str] | None = None) -> int:
             if args.handles_file
             else set()
         )
-        queue = claim_candidates(
-            Path(args.db),
-            batch_id=args.batch_id,
-            manifest_handles=manifest_handles,
-            allowed_handles=allowed_handles,
-            retry_incomplete=args.retry_incomplete,
-            limit=args.limit,
-            resume=args.resume,
-            stale_minutes=args.stale_minutes,
-            dry_run=args.dry_run,
-        )
+        if args.audit_only:
+            queue = []
+            audit_failures = audit_pricing(
+                Path(args.db),
+                batch_id=args.batch_id,
+                manifest_handles=manifest_handles,
+                allowed_handles=allowed_handles,
+            )
+        else:
+            audit_failures = []
+            queue = claim_candidates(
+                Path(args.db),
+                batch_id=args.batch_id,
+                manifest_handles=manifest_handles,
+                allowed_handles=allowed_handles,
+                retry_incomplete=args.retry_incomplete,
+                limit=args.limit,
+                resume=args.resume,
+                stale_minutes=args.stale_minutes,
+                dry_run=args.dry_run,
+            )
     except (PricingBackfillError, sqlite3.Error) as exc:
         print(f"✗ {exc}")
         return 2
@@ -700,14 +812,33 @@ def main(argv: list[str] | None = None) -> int:
             else base_scope
         )
     )
+    if args.audit_only:
+        if audit_failures:
+            print(
+                f"✗ [pricing-audit] {scope} · failures={len(audit_failures)}",
+                flush=True,
+            )
+            for item in audit_failures:
+                print(
+                    f"  @{item['handle']} [{item['pricing_status']}] "
+                    + "；".join(item["reasons"]),
+                    flush=True,
+                )
+            return 1
+        print(
+            f"✓ [pricing-audit] {scope} · failures=0 · "
+            "数据库未修改，浏览器未启动",
+            flush=True,
+        )
+        return 0
     retry_txt = (
-        " · 显式重试 missing/partial/fallback"
+        " · 显式重试 missing/partial/历史 fallback/合同不一致终态"
         if args.retry_incomplete
         else ""
     )
     print(
         f"[pricing-only] {scope} · 待补 {len(queue)} "
-        f"· complete/客户终判/非目标状态自动跳过{retry_txt}",
+        f"· 正式完整报价/客户终判/非目标状态自动跳过{retry_txt}",
         flush=True,
     )
     if args.dry_run:
@@ -737,6 +868,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(
         f"[pricing-only] complete={counts['complete']} "
+        f"complete_available={counts.get('complete_available', 0)} "
+        f"no_reels={counts.get('not_applicable_no_reels', 0)} "
         f"partial={counts['partial']} "
         f"fallback={counts['fallback_modash']} "
         f"missing={counts['missing']} error={counts['error']}",

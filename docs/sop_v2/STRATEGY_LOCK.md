@@ -1,4 +1,4 @@
-# 采集策略固化（v2 · 2026-07-15，2026-07-28 补充）
+# 采集策略固化（v2 · 2026-07-15，更新至 2026-08-11）
 
 本文件锁定经实测收敛的关键策略，后续开发以此为准；改动需在此登记原因。
 
@@ -36,18 +36,19 @@
 - 浅扫走浏览器 + 缓存；同一号请求间 `_pause`；号池轮换。
 - 号一旦 429/redirect-loop = 临时冷却，**停手等恢复**（分钟级～小时级），不要连续重击。
 
-## 5. 种子：带货型红人（amazon-finds 导向）
+## 5. 种子：通用电商导购型红人
 - 内容关键词种子（"skincare routine"）拉来的是教育/生活方式号 → 无橱窗、无购买意图。
-- 改用带货导向 Modash 查询（amazon storefront / shop my amazon / link in bio）→ 命中真带货号；
+- 改用带货导向 Modash 查询（shopping links / LTK / ShopMy / link in bio / creator shop）→
+  命中真带货号；
   **副作用**：会混入店铺/品牌号（hebestore19 等）→ 靠浏览器品牌判定 + 早跳过滤。
 
-这里的 Amazon 关键词只是发现阶段的高精度召回信号，不是 Storefront 白名单。候选后续出现
-LTK、ShopMy、明确自营店或已识别购物聚合入口，同样算 `confirmed_yes`；确认没有任何
-Storefront 的 `confirmed_no` 也继续深采。
+Amazon 只是可用电商信号之一，不是 Storefront 白名单。候选出现 Amazon、LTK、ShopMy、
+明确自营店或已识别购物聚合入口都算 `confirmed_yes`；确认没有任何 Storefront 的
+`confirmed_no` 也继续深采。
 
 ## 5b. 客户 2026-07-15 确认变更（已落地）
-- **discovery 只做「Amazon Finds 导购型」赛道**：config `[discovery]` 换成 amazon_shopping_guide
-  （带货导向 Modash 查询 + 橱窗信号 + 护肤/美妆赛道词 + 排店铺信号）；红光设备种子退役。
+- **历史口径（已被 2026-08-10 来源策略取代）**：当时 discovery 收窄到 Amazon Finds；
+  当前不再以单一平台限定召回，但仍保留护肤/美妆赛道词和排店铺信号。
 - **ER 放宽**：Modash General ER **降为参考、不再硬淘汰**（`general_er_reference_only=true`）；
   **实算 ER = 硬门槛**，取**前 10 帖**赞评/粉丝算（`[real_er]`：<0.5% Exclude、[0.5,1.0) Review、
   缺数据 Review 不误杀）。GATE-13 落地。
@@ -70,10 +71,55 @@ Storefront 的 `confirmed_no` 也继续深采。
   均播×$35/1000，区间为均播×$35–$40/1000。播放证据由登录态浏览器会话读取
   Instagram 同源 media info；均播只使用 IG 原生 `ig_play_count`，总
   `play_count`/`fb_play_count` 仅审计、不得抬价。
-- **证据降级必须显式**：10 条=`complete`、1–9 条=`partial`、无原生样本才
-  `fallback_modash`、均无=`missing`。
+- **证据降级必须显式**：10 条=`complete`；严格闭合且实际只有 1–9 条=
+  `complete_available`；严格证明没有 Reels=`not_applicable_no_reels` 且报价为 `null`；
+  1–9 条但总体未闭合=`partial`；无法证明没有 Reels=`missing`。Modash 均播、总播放和
+  Facebook 播放都不能作报价 fallback，历史 `fallback_modash` 会阻断当前 B3。
 - **决策隔离**：展示估价不是实际报价，不写 `paid_cpm`，不进入 Gate、F 分、固定 Review
   或五池路由。
+
+## 5e. 两轮反馈后的来源与治理固化（2026-08-10）
+
+- **来源配额**：50% approved/collaborated 金种子 Lookalike、30% 通用电商搜索、20% 主题探索；
+  金种子不足时缺口按 30:20 重分配，防止整轮因人工 Lookalike 未完成而停摆，也防止飞轮变窄。
+- **轮次合同**：正式 Stage 1 前冻结 carryover 模式、国家、Storefront、CPM/Reels、翻译、
+  来源配额、配置 SHA 和代码 SHA；运行前校验漂移。
+- **拒绝原因可选**：客户只点“不合适”即可导出；空原因只更新账号状态，不能推断策略。
+- **反馈不直改规则**：客户只能提交账号结果或 `policy_signal`。策略必须经 proposed、历史回放、
+  测试和人工确认后，才能追加 approved 变更记录。
+
+## 5f. 深采边缘证据固化（2026-08-11）
+
+- **协作帖不猜 shortcode**：超长 access token 只能由页面 Instagram HTTPS canonical 绑定，
+  再由同源 media-info 响应 code 回证；双证据闭合后，播放/赞评/置顶/时间/来源/provenance
+  整个报价 bundle 一次性更新，禁止截断 token、局部补字段或覆盖已观测样本。
+- **空评论不等于零评论**：`verified_empty_thread` 仍保留正数 `reported_count`，必须同时取得
+  页面可见叶节点精确 `No comments yet.` 和登录态 comments endpoint 的全空/无更多结果，
+  并保存 DOM + endpoint provenance；它不是 `verified_zero`。普通 `reported_count>2` 空抽仍
+  严格失败，只有 1–2 条低量媒体可沿既有连续真实失败合同终止重试。
+- **Graph 换代码必须换链**：修改 `graph_runner.py` 或 run contract 覆盖的 worker/调度代码后，
+  结束旧审计链并新建版本化 schedule/event；新链从所有旧 durable consumer intents 的历史
+  最大实际 rotation 加 1 续接 `account_rotation_base`，不得重置为 0。
+
+## 5g. 生产编排、额度与交付固化（2026-08-11）
+
+- **固定 Graph**：正式 Stage 2/3 只能由 `graph_runner` 运行“一浅采 producer + 多深采
+  consumer”的流水并发；B1/B2/B3 不得跨越，不能临时改成全串行或手工多终端。
+- **尾批与轮换**：每波按 `qualified_unlocked_count` 给 worker 动态均分正数 claim cap，差值
+  最多 1；账号切片固定互斥，实际轮换序号为持久 `account_rotation_base + consumer intent
+  ordinal`，resume 不归零。
+- **报价独立入账**：短总体/无 Reels 报价只通过 pricing-only ledger finalizer 追加 attempt 并
+  单调选择 pricing owner；不得推进 deep canonical 或评论 retry state。
+- **Modash 只买可行动报告**：只对“乐观补齐缺失 Modash-owned 字段后最终池严格晋级”的
+  候选消费 Profile credit；既有值不覆盖，非 Modash blocker 不假设修复。cap 是上限，不凑数。
+- **评论证据不截断**：XLSX“评论证据”表导出决策数据中的全部结构化评论译文/原文行；HTML
+  或摘要可展示代表样本，但不能代替全量表。
+- **翻译 owner 固定在 Stage 3**：LLM 翻译在 canonical attempt 落库和 B3 前完成。正式
+  Stage 4 的 `--strict-comment-translations` 只读校验已存行/摘要/语义，不调用 LLM、不截断、
+  不重算或改写 candidate/ledger；`--translate-comments` 只允许草稿/补译，round contract 或
+  strict/full-deep 正式模式必须拒绝。
+- **正式交付**：deep/pricing/translation 三项新鲜计数与 cohort 对账共同通过 B3 后，才运行
+  Modash/Stage 4；保存 B3 工件、JSON/XLSX/HTML 和 SHA-256。已交付 revision 永不覆盖。
 
 ## 6. 硬门槛（不依赖 Modash 的先行）→ 通过者才 Modash 补数
 followers 档 / 赞助饱和 / **Storefront 三态留证（yes/no 都不早淘汰）** / 排品牌号 / 赛道 /
@@ -82,4 +128,5 @@ followers 档 / 赞助饱和 / **Storefront 三态留证（yes/no 都不早淘�
 
 ## 7. 数据库飞轮（见 DB_FLYWHEEL_DESIGN.md）
 机器自动沉淀浅扫/采集（库①②）；客户审核门控优质红人进金种子库③、拒绝进负向库④；
-金种子驱动下一轮 Modash Lookalike。越用越快、越省号。
+逐条反馈事件与策略变更记录保持 append-only。金种子驱动下一轮 Modash Lookalike，来源批准率
+决定后续配额建议，但系统不能自动修改硬门槛。

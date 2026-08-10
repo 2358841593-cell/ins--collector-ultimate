@@ -7,6 +7,19 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
+
+
+EMPTY_THREAD_EVIDENCE_SCHEMA = "instagram-empty-comment-thread-v1"
+EMPTY_THREAD_EVIDENCE_SOURCE = "instagram_visible_dom+comments_endpoint"
+EMPTY_THREAD_REASON = "verified_empty_thread_despite_reported_count"
+# Stage 3 forces an English Instagram UI.  Keep this allow-list exact and
+# intentionally narrow: a fuzzy body-text match could turn a loading/error page
+# into false completion evidence.
+VISIBLE_EMPTY_THREAD_MARKERS = frozenset({"No comments yet."})
+_MEDIA_IDENTITY_RE = re.compile(
+    r"/(?:[^/?#]+/)?(?:reel|p)/([A-Za-z0-9_-]+)", re.IGNORECASE
+)
 
 STRONG = ["ordered", "just bought", "in my cart", "link please", "where is the link",
           "where's the link", "purchased", "bought this", "just ordered", "adding to cart",
@@ -18,9 +31,115 @@ WEAK = ["need this", "want this", "obsessed", "adding to list", "wishlist", "cod
         "where to buy", "so good"]
 LOW_QUALITY = ["beautiful", "love this", "nice pic", "gorgeous", "wow", "so pretty", "amazing",
                "stunning", "great post", "love it", "perfect", "cute", "queen", "goals",
-               "content", "keep it up", "great content", "so nice"]
+               "content", "keep it up", "great content", "so nice",
+               # LLM 中文译文的泛夸赞/互赞噪声。具体产品热情在 LOW_INTENT 中优先识别。
+               "太漂亮了", "好漂亮", "真漂亮", "太美了", "好美", "真美", "好可爱",
+               "太可爱了", "很棒的内容", "内容很棒", "很棒的帖子", "拍得真好"]
 EMOJI_RE = re.compile(r"^[\s\U0001F000-\U0001FAFF☀-➿←-⇿❤️♥️👏🔥😍�['\"]*]+$")
 TAG_ONLY_RE = re.compile(r"^\s*(@[\w.]+\s*)+$")
+
+
+def _media_identity(value) -> str:
+    if isinstance(value, Mapping):
+        value = value.get("url") or value.get("code")
+    match = _MEDIA_IDENTITY_RE.search(str(value or ""))
+    return match.group(1) if match else ""
+
+
+def comment_media_identity(value) -> str:
+    """Return the stable shortcode identity used by strict retry validation."""
+    return _media_identity(value)
+
+
+def verified_empty_thread_evidence(
+    post: Mapping | None,
+    unavailable_entry: Mapping | None = None,
+) -> bool:
+    """Validate the fail-closed proof for a visibly empty IG comment thread.
+
+    This state is deliberately distinct from ``verified_zero``: the post keeps
+    its positive media-info/OG ``comment_count`` while a current, visible empty
+    marker and the authenticated structured comments endpoint independently
+    prove that no Instagram or Facebook comment rows are publicly available.
+    """
+    if not isinstance(post, Mapping):
+        return False
+    if post.get("comment_sampling_status") != "verified_empty_thread":
+        return False
+    try:
+        reported_count = int(post.get("comment_count"))
+        collected_count = int(post.get("comments_collected") or 0)
+    except (TypeError, ValueError):
+        return False
+    if reported_count <= 0 or collected_count != 0:
+        return False
+
+    evidence = post.get("comment_empty_thread_evidence")
+    if not isinstance(evidence, Mapping):
+        return False
+    marker = evidence.get("marker")
+    if (
+        evidence.get("schema") != EMPTY_THREAD_EVIDENCE_SCHEMA
+        or evidence.get("source") != EMPTY_THREAD_EVIDENCE_SOURCE
+        or evidence.get("marker_visible") is not True
+        or marker not in VISIBLE_EMPTY_THREAD_MARKERS
+        or evidence.get("reported_count") != reported_count
+    ):
+        return False
+
+    endpoint = evidence.get("endpoint")
+    if not isinstance(endpoint, Mapping):
+        return False
+    required_endpoint = {
+        "http_status": 200,
+        "status": "ok",
+        "comment_count": 0,
+        "comments_count": 0,
+        "fb_comments_count": 0,
+        "has_more_comments": False,
+        "has_more_headload_comments": False,
+        "has_more_headload_fb_comments": False,
+    }
+    if any(endpoint.get(key) != value for key, value in required_endpoint.items()):
+        return False
+
+    if unavailable_entry is None:
+        return True
+    if not isinstance(unavailable_entry, Mapping):
+        return False
+    return (
+        _media_identity(unavailable_entry) == _media_identity(post)
+        and unavailable_entry.get("reported_count") == reported_count
+        and unavailable_entry.get("reason") == EMPTY_THREAD_REASON
+        and unavailable_entry.get("source") == EMPTY_THREAD_EVIDENCE_SOURCE
+        and unavailable_entry.get("marker") == marker
+        and unavailable_entry.get("endpoint_summary") == dict(endpoint)
+    )
+
+
+def repeated_low_comment_unavailable(
+    post: Mapping | None,
+    unavailable_entry: Mapping | None,
+) -> bool:
+    """Validate the older bounded 1–2-comment retry terminal."""
+    if not isinstance(post, Mapping) or not isinstance(
+        unavailable_entry, Mapping
+    ):
+        return False
+    try:
+        reported_count = int(post.get("comment_count"))
+        collected_count = int(post.get("comments_collected") or 0)
+    except (TypeError, ValueError):
+        return False
+    return (
+        post.get("comment_sampling_status") == "unavailable_after_retry"
+        and reported_count in (1, 2)
+        and collected_count == 0
+        and _media_identity(unavailable_entry) == _media_identity(post)
+        and unavailable_entry.get("reported_count") == reported_count
+        and unavailable_entry.get("reason")
+        == "reported_low_count_unavailable_after_retry"
+    )
 
 
 def _intent(text: str):
@@ -82,6 +201,11 @@ CONSIDER_PHRASES = [
     # 意大利语
     "funziona", "ne vale la pena", "per pelle grassa", "per pelle secca", "per pelle sensibile",
     "lo consigli", "quale", "quanto spesso", "come si usa",
+    # 任意语言经 LLM 统一翻成中文后使用同一意图口径
+    "有效吗", "有用吗", "真的有效", "值得买吗", "值得入手吗", "怎么使用", "怎么用",
+    "如何使用", "适合油皮", "适合干皮", "适合敏感肌", "适合痘痘肌", "推荐哪个",
+    "哪个更好", "你推荐吗", "多久用一次", "多长时间用一次", "可以叠加吗",
+    "适合我的皮肤吗", "对敏感皮肤安全吗",
 ]
 
 # 明确购买意图短语（高精度：只留清晰买信号，不含"有效/推荐"等辩论也会中的宽词）
@@ -115,6 +239,12 @@ INTENT_PHRASES = [
     # 意大利语（IT 目标市场）
     "dove comprare", "dove lo compro", "il link per favore", "quanto costa", "appena ordinato",
     "l'ho ordinato", "lo voglio", "mi serve questo", "dove si compra",
+    # 任意语言经 LLM 统一翻成中文后使用同一意图口径
+    "在哪里可以买", "在哪可以买", "哪里可以买", "在哪里买", "哪里购买", "购买链接",
+    "求链接", "发一下链接", "把链接发给我", "链接在哪里", "链接是什么",
+    "产品链接是什么", "产品链接在哪", "怎么购买", "怎么买",
+    "多少钱", "价格是多少", "什么价格", "刚刚下单", "刚下单", "已经下单",
+    "我已经买了", "刚买了", "加入购物车", "放进购物车", "我想买", "我要买",
 ]
 
 
@@ -180,11 +310,17 @@ LOW_INTENT = [
     # 意大利语：真诚想要/产品热情
     "lo adoro", "mi serve", "lo voglio", "il migliore", "la migliore", "bellissimo",
     "bellissima", "incredibile", "ne ho bisogno", "sulla mia lista", "stupendo",
+    # 任意语言经 LLM 统一翻成中文后的真实产品热情
+    "我需要这个", "我想要这个", "我也想要", "必须拥有", "一定要试试", "我想试试",
+    "种草了", "加入愿望清单", "放进愿望清单", "加入我的清单", "这个产品太棒了",
+    "太好用了", "我喜欢这个产品", "最好的产品", "改变游戏规则",
 ]
 # 互赞团/夸内容/夸人 → 水军，不算意图（哪怕是"夸"）
 _POD_RE = re.compile(r"your\s+(content|videos?|reels?|feed|page|style)|content\s+(creator|is|looks)|"
                      r"keep\s+(it\s+up|posting|going)|love\s+your|(great|amazing)\s+content|"
-                     r"nice\s+(pic|post|shot|photo)|great\s+post", re.I)
+                     r"nice\s+(pic|post|shot|photo)|great\s+post|"
+                     r"你的(内容|视频|主页|风格)|继续(加油|发布|更新)|很棒的(内容|帖子)|"
+                     r"喜欢你的(内容|视频)|照片拍得(真好|很棒)", re.I)
 
 
 def grade_intent(text: str):
@@ -239,6 +375,11 @@ def _is_low_quality(text: str) -> bool:
     if len(t) < 30 and any(k in tl for k in LOW_QUALITY) and _intent(t) is None:
         return True
     return False
+
+
+def is_low_quality(text: str) -> bool:
+    """公开的低质判断入口，供 LLM 中文译文复用同一业务语义。"""
+    return _is_low_quality(text)
 
 
 def analyze(comment_texts: list[str], pod_library: set | None = None) -> dict:

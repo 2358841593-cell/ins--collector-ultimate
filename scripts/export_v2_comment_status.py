@@ -41,3 +41,34 @@ def comment_collection_complete(candidate: dict, target_posts: int = 10) -> bool
         and candidate.get("real_er") is not None
         and has_observed_metric
     )
+
+
+def comment_unavailable_note(candidate: dict) -> str:
+    """Return a transparent delivery label for reviewed unavailable threads."""
+    rows = [
+        row
+        for row in (candidate.get("comment_unavailable_posts") or [])
+        if isinstance(row, dict)
+    ]
+    if not rows:
+        return ""
+    empty_thread = sum(
+        row.get("reason") == "verified_empty_thread_despite_reported_count"
+        for row in rows
+    )
+    low_retry = sum(
+        row.get("reason") == "reported_low_count_unavailable_after_retry"
+        for row in rows
+    )
+    other = len(rows) - empty_thread - low_retry
+    labels = []
+    if empty_thread:
+        labels.append(
+            f"{empty_thread}帖评论线程明确为空"
+            "（页面与端点双重核验；原上报数保留）"
+        )
+    if low_retry:
+        labels.append(f"{low_retry}帖低量评论重复不可见（已复采）")
+    if other:
+        labels.append(f"{other}帖评论不可见（证据已保留）")
+    return "；".join(labels)

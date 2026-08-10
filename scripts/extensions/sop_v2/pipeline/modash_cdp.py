@@ -13,13 +13,8 @@ from __future__ import annotations
 
 import json
 
-_CC = {
-    "united states": "US", "canada": "CA", "united kingdom": "UK", "germany": "DE",
-    "italy": "IT", "france": "FR", "spain": "ES", "netherlands": "NL", "belgium": "BE",
-    "switzerland": "CH", "sweden": "SE", "australia": "AU", "brazil": "BR", "mexico": "MX",
-    "india": "IN", "indonesia": "ID", "portugal": "PT", "ireland": "IE", "austria": "AT",
-    "poland": "PL", "turkey": "TR", "philippines": "PH", "united arab emirates": "AE",
-}
+from ..countries import normalize_country_code
+
 _TARGET = {"US", "CA", "UK", "DE", "IT", "FR", "ES", "NL", "BE", "CH", "SE"}
 
 _SEARCH_JS = """async (a) => {
@@ -43,7 +38,8 @@ _SHOW_JS = """async (spid) => {
 
 
 def _cc(name):
-    return _CC.get((name or "").strip().lower())
+    """兼容旧调用；实际规范化逻辑统一维护在 countries 模块。"""
+    return normalize_country_code(name)
 
 
 def _find_modash(b):
@@ -222,6 +218,8 @@ def parse_report(data: dict, handle: str) -> dict | None:
         out["contacts_has_email"] = bool(pd.get("contactsHasEmail"))
     loc = ((pd.get("location") or {}).get("country") or {})
     if loc.get("name"):
+        # Keep an unknown raw name as evidence.  The gate will route it to
+        # Review instead of guessing a code, while known names stay canonical.
         out["creator_country"] = _cc(loc.get("name")) or loc.get("name")
 
     # ── 跨平台账号（TikTok/YouTube/Linktree…）──

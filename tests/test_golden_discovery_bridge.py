@@ -46,6 +46,31 @@ class TestGoldenDiscoveryBridge(unittest.TestCase):
             finally:
                 cc.DB = old_db
 
+    def test_golden_seed_limit_is_stable_when_approval_times_tie(self):
+        old_db = cc.DB
+        with tempfile.TemporaryDirectory() as td:
+            cc.DB = Path(td) / "cache.db"
+            try:
+                conn = cc._conn()
+                try:
+                    approved_at = "2026-07-23T10:00:00"
+                    conn.executemany(
+                        """INSERT INTO creator_profiles
+                           (handle,tier,client_status,approved_at,first_seen,last_scanned)
+                           VALUES (?,2,'approved',?,?,?)""",
+                        [
+                            (handle, approved_at, approved_at, approved_at)
+                            for handle in ("zeta", "Alpha", "beta")
+                        ],
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+
+                self.assertEqual(cc.golden_seeds(limit=2), ["Alpha", "beta"])
+            finally:
+                cc.DB = old_db
+
     def test_manifest_and_manual_results_keep_seed_lineage(self):
         golden = ["Approved.One", "collab_two"]
         manifest = ms.build_golden_seed_manifest(

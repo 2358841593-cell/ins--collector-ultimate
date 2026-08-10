@@ -56,6 +56,40 @@ REASON_TEXT = {
     "graph_unaudited_cap": "图谱来源未完整审计",
 }
 
+# Internal retry/audit state remains in creator_cache for recovery and must not
+# leak into customer-facing decisions JSON.  A multi-wave ledger can be hundreds
+# of KB per creator and may contain internal errors or local evidence paths.
+_INTERNAL_RUNTIME_FIELDS = {
+    "_cache_hit",
+    "_discovery_batch",
+    "_queue_from_status",
+    "_queue_lock_token",
+    "_reject_reason",
+    "_stage_error",
+    "_status",
+    "deep_collection_attempts",
+    "deep_canonical_attempt_id",
+    "deep_canonical_quality",
+    "pricing_canonical_attempt_id",
+    "pricing_canonical_quality",
+    "stage3_comment_retry_state",
+    "stage3_comment_retry_history",
+    "deep_evidence_merge_provenance",
+}
+
+
+def _delivery_candidate(candidate: dict) -> dict:
+    delivered = {
+        key: value
+        for key, value in candidate.items()
+        if key not in _INTERNAL_RUNTIME_FIELDS and not key.startswith("_")
+    }
+    # Carryover feedback still needs a public origin batch for safe write-back.
+    # Older cache rows may only expose the Stage 4 runtime alias.
+    if not delivered.get("discovery_batch") and candidate.get("_discovery_batch"):
+        delivered["discovery_batch"] = candidate["_discovery_batch"]
+    return delivered
+
 
 def _humanize(codes):
     out = []
@@ -104,7 +138,7 @@ def decide(cand: dict, cfg: dict) -> dict:
     r = routing.route(cand, gate_results, summ, cfg)
 
     missing = list(r.get("review_reasons") or [])
-    rec = dict(cand)
+    rec = _delivery_candidate(cand)
     rec.update({
         "final_pool": r["pool"].value,
         "review_reasons": r.get("review_reasons", []),
@@ -131,7 +165,7 @@ def decide_rejected(cand: dict, cfg: dict | None = None) -> dict:
     if cfg is not None:
         cand["pricing_estimate"] = pricing.derive_quote_estimate(cand, cfg)
     reason = cand.get("_reject_reason") or "rejected"
-    rec = dict(cand)
+    rec = _delivery_candidate(cand)
     txt = _humanize([reason])
     rec.update({
         "final_pool": "Exclude",

@@ -12,13 +12,46 @@ from __future__ import annotations
 
 import json
 import hashlib
+import re
 import sqlite3
 import time
 import uuid
 from datetime import datetime
 from pathlib import Path
 
+if __package__:
+    from . import comments as comment_semantics
+    from .feedback_taxonomy import (
+        TAXONOMY_VERSION,
+        FeedbackTaxonomyError,
+        normalize_evidence_status,
+        normalize_feedback_scope,
+        normalize_reason_tags,
+        normalize_rejection_scope,
+    )
+else:  # 保留 ``python creator_cache.py stats`` 的旧调用方式。
+    import comments as comment_semantics  # type: ignore[no-redef]
+    from feedback_taxonomy import (  # type: ignore[no-redef]
+        TAXONOMY_VERSION,
+        FeedbackTaxonomyError,
+        normalize_evidence_status,
+        normalize_feedback_scope,
+        normalize_reason_tags,
+        normalize_rejection_scope,
+    )
+
 DB = Path(__file__).resolve().parents[2].parent / "data" / "creator_cache.db"
+
+DISCOVERY_QUOTA_BUCKETS = (
+    "golden_lookalike",
+    "generic_commerce",
+    "exploration",
+)
+_FORMAL_HANDLE_RE = re.compile(r"[A-Za-z0-9._]{1,30}\Z")
+
+
+class AtomicSeedIngestError(RuntimeError):
+    """A formal Stage 1 cohort could not be committed as one indivisible batch."""
 
 SHALLOW_FIELDS = [
     "full_name", "follower_count", "media_count", "external_url", "is_business",
@@ -37,7 +70,12 @@ CREATE TABLE IF NOT EXISTS creator_profiles (
     data_json TEXT,
     tier INTEGER DEFAULT 0,            -- 0 浅扫 / 1 候选 / 2 金种子
     client_status TEXT,               -- approved / rejected / collaborated / null(pending)
-    approved_at TEXT, rejected_reason TEXT, source_batch TEXT
+    approved_at TEXT, rejected_reason TEXT,
+    client_rejection_scope TEXT
+        CHECK (client_rejection_scope IS NULL OR client_rejection_scope IN (
+            'global', 'campaign', 'temporary'
+        )),
+    source_batch TEXT
 );
 CREATE TABLE IF NOT EXISTS client_feedback_imports (
     file_sha256 TEXT PRIMARY KEY,
@@ -50,15 +88,86 @@ CREATE TABLE IF NOT EXISTS client_feedback_imports (
     pending_count INTEGER NOT NULL,
     adopted_existing INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS client_feedback_events (
+    event_id TEXT PRIMARY KEY,
+    review_batch TEXT NOT NULL,
+    origin_batch TEXT NOT NULL,
+    handle TEXT NOT NULL COLLATE NOCASE,
+    verdict TEXT NOT NULL
+        CHECK (verdict IN ('approved', 'rejected', 'pending')),
+    reason_raw TEXT NOT NULL DEFAULT '',
+    reason_tags_json TEXT NOT NULL DEFAULT '[]',
+    feedback_scope TEXT NOT NULL DEFAULT 'account'
+        CHECK (feedback_scope IN (
+            'account', 'fact_correction', 'policy_signal', 'confirmed_policy'
+        )),
+    rejection_scope TEXT
+        CHECK (rejection_scope IS NULL OR rejection_scope IN (
+            'global', 'campaign', 'temporary'
+        )),
+    target_field TEXT,
+    old_value TEXT,
+    claimed_value TEXT,
+    evidence_status TEXT NOT NULL DEFAULT 'unverified'
+        CHECK (evidence_status IN ('unverified', 'verified', 'contradicted')),
+    feedback_file_sha256 TEXT NOT NULL,
+    source_decisions_sha256 TEXT NOT NULL,
+    taxonomy_version TEXT NOT NULL,
+    imported_at TEXT NOT NULL,
+    source_mode TEXT NOT NULL DEFAULT 'import'
+        CHECK (source_mode IN ('import', 'adopt_existing', 'historical_backfill')),
+    source_context_json TEXT,
+    supersedes_event_id TEXT,
+    UNIQUE (feedback_file_sha256, handle)
+);
+CREATE TABLE IF NOT EXISTS policy_change_log (
+    change_id TEXT PRIMARY KEY,
+    policy_key TEXT NOT NULL,
+    status TEXT NOT NULL
+        CHECK (status IN ('proposed', 'approved', 'rejected', 'rolled_back')),
+    source_event_ids_json TEXT NOT NULL DEFAULT '[]',
+    before_value TEXT,
+    after_value TEXT,
+    confirmed_by TEXT,
+    confirmed_at TEXT,
+    config_sha_before TEXT,
+    config_sha_after TEXT,
+    impact_report_sha256 TEXT,
+    test_report_sha256 TEXT,
+    effective_batch TEXT,
+    created_at TEXT NOT NULL,
+    supersedes_change_id TEXT
+);
+CREATE TRIGGER IF NOT EXISTS trg_client_feedback_events_no_update
+BEFORE UPDATE ON client_feedback_events
+BEGIN
+    SELECT RAISE(ABORT, 'client_feedback_events is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_client_feedback_events_no_delete
+BEFORE DELETE ON client_feedback_events
+BEGIN
+    SELECT RAISE(ABORT, 'client_feedback_events is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_policy_change_log_no_update
+BEFORE UPDATE ON policy_change_log
+BEGIN
+    SELECT RAISE(ABORT, 'policy_change_log is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_policy_change_log_no_delete
+BEFORE DELETE ON policy_change_log
+BEGIN
+    SELECT RAISE(ABORT, 'policy_change_log is append-only');
+END;
 """
 
 _MIGRATE = ["tier INTEGER DEFAULT 0", "client_status TEXT", "approved_at TEXT",
-            "rejected_reason TEXT", "source_batch TEXT",
+            "rejected_reason TEXT", "client_rejection_scope TEXT", "source_batch TEXT",
             # ── 四阶段流水线（PIPELINE_SPEC.md 冻结）：全部 nullable，无 DEFAULT ──
             "status TEXT", "stage_updated_at TEXT", "locked_at TEXT", "stage_error TEXT",
             "reject_reason TEXT", "discovery_batch TEXT", "seed_followers INTEGER",
             "modash_er REAL", "real_er REAL", "high_intent_count INTEGER",
             "final_pool TEXT", "evidence_dir TEXT", "stage_json TEXT", "client_note TEXT"]
+_EVENT_MIGRATE = ["source_context_json TEXT"]
 _INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_brand ON creator_profiles(brand_account_type)",
     "CREATE INDEX IF NOT EXISTS idx_niche ON creator_profiles(core_niche_key)",
@@ -67,6 +176,12 @@ _INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_cstatus ON creator_profiles(client_status)",
     "CREATE INDEX IF NOT EXISTS idx_status ON creator_profiles(status)",
     "CREATE INDEX IF NOT EXISTS idx_status_batch ON creator_profiles(status, discovery_batch)",
+    "CREATE INDEX IF NOT EXISTS idx_feedback_events_handle ON "
+    "client_feedback_events(handle, imported_at)",
+    "CREATE INDEX IF NOT EXISTS idx_feedback_events_batch ON "
+    "client_feedback_events(review_batch, verdict)",
+    "CREATE INDEX IF NOT EXISTS idx_policy_changes_status ON "
+    "policy_change_log(status, effective_batch)",
 ]
 
 
@@ -81,6 +196,12 @@ def _conn():
     for col in _MIGRATE:                        # 旧库迁移：缺列则补
         if col.split()[0] not in have:
             c.execute(f"ALTER TABLE creator_profiles ADD COLUMN {col}")
+    event_have = {
+        r["name"] for r in c.execute("PRAGMA table_info(client_feedback_events)")
+    }
+    for col in _EVENT_MIGRATE:
+        if col.split()[0] not in event_have:
+            c.execute(f"ALTER TABLE client_feedback_events ADD COLUMN {col}")
     for idx in _INDEXES:                        # 列齐后再建索引
         c.execute(idx)
     # 一次性回填（user_version 守卫，绝不每次 _conn 重跑）：迁移前的历史行置 decided 终态，
@@ -92,10 +213,12 @@ def _conn():
     return c
 
 
-def upsert(cand: dict):
+def upsert(cand: dict, *, increment_times_seen: bool = True):
     """浅扫回写。ON CONFLICT 只更新 SHALLOW_FIELDS + last_scanned + times_seen+1，
     **绝不触碰** status/tier/client_status/stage_json（防清零阶段进度、防降级金种子）。
-    None 值不覆盖已有非空（COALESCE）。"""
+    None 值不覆盖已有非空（COALESCE）。深采复用本缓存写入口时可显式传入
+    ``increment_times_seen=False``，避免把同一发现来源的重复采集误算成多源命中；
+    新建行仍以 ``times_seen=1`` 初始化。"""
     h = (cand.get("handle") or "").lstrip("@")
     if not h:
         return
@@ -106,8 +229,10 @@ def upsert(cand: dict):
     cols = ["handle"] + SHALLOW_FIELDS + ["first_seen", "last_scanned", "times_seen", "data_json"]
     ins = [h] + [vals[f] for f in SHALLOW_FIELDS] + [now, now, 1, json.dumps(vals, ensure_ascii=False)]
     set_parts = [f"{f}=COALESCE(excluded.{f}, creator_profiles.{f})" for f in SHALLOW_FIELDS]
-    set_parts += ["last_scanned=excluded.last_scanned",
-                  "times_seen=creator_profiles.times_seen+1", "data_json=excluded.data_json"]
+    set_parts.append("last_scanned=excluded.last_scanned")
+    if increment_times_seen:
+        set_parts.append("times_seen=creator_profiles.times_seen+1")
+    set_parts.append("data_json=excluded.data_json")
     with _conn() as c:
         c.execute(f"INSERT INTO creator_profiles ({','.join(cols)}) VALUES ({','.join('?'*len(cols))}) "
                   f"ON CONFLICT(handle) DO UPDATE SET {', '.join(set_parts)}", ins)
@@ -194,7 +319,11 @@ def should_ingest_seed(handle: str) -> bool:
     """discovery 去重：客户拒绝 / 机器淘汰 / 已在库 → 不再造 seed。"""
     h = (handle or "").lstrip("@")
     with _conn() as c:
-        r = c.execute("SELECT status, client_status FROM creator_profiles WHERE handle=?", (h,)).fetchone()
+        r = c.execute(
+            "SELECT status, client_status FROM creator_profiles "
+            "WHERE handle=? COLLATE NOCASE",
+            (h,),
+        ).fetchone()
     if not r:
         return True
     return False  # 已存在（含 rejected/decided/在途）→ 不重复造 seed
@@ -226,6 +355,201 @@ def seed_handles(recs: list[dict], batch_id: str = "") -> dict:
                       (_now_iso(), batch_id, fol, er, json.dumps(cand, ensure_ascii=False), h))
         new += 1
     return {"new_seeds": new, "deduped": deduped, "rejected_skipped": skipped}
+
+
+def _formal_seed_record(
+    rec: dict,
+    *,
+    batch_id: str,
+    ingest_id: str,
+    quota_bucket: str | None = None,
+) -> tuple[str, int | None, float | None, str]:
+    """Validate and serialize one formal seed without touching SQLite."""
+    raw_handle = rec.get("handle")
+    if not isinstance(raw_handle, str):
+        raise AtomicSeedIngestError("formal seed handle must be a string")
+    handle = raw_handle.strip().lstrip("@")
+    if not _FORMAL_HANDLE_RE.fullmatch(handle):
+        raise AtomicSeedIngestError(f"invalid formal seed handle: {raw_handle!r}")
+
+    bucket = quota_bucket or rec.get("discovery_quota_bucket")
+    if bucket not in DISCOVERY_QUOTA_BUCKETS:
+        raise AtomicSeedIngestError(
+            f"{handle}: discovery_quota_bucket must be one of "
+            + ", ".join(DISCOVERY_QUOTA_BUCKETS)
+        )
+
+    raw_sources = rec.get("discovery_sources") or []
+    if isinstance(raw_sources, str):
+        raw_sources = [raw_sources]
+    if not isinstance(raw_sources, (list, tuple)):
+        raise AtomicSeedIngestError(f"{handle}: discovery_sources must be a list")
+    sources = list(
+        dict.fromkeys(
+            value.strip()
+            for value in raw_sources
+            if isinstance(value, str) and value.strip()
+        )
+    )
+    discovered_via = rec.get("discovered_via")
+    if not isinstance(discovered_via, str) or not discovered_via.strip():
+        discovered_via = sources[0] if sources else f"formal_quota:{bucket}"
+    else:
+        discovered_via = discovered_via.strip()
+    if not sources:
+        sources = [discovered_via]
+
+    raw_golden = rec.get("golden_seed_handles") or []
+    if isinstance(raw_golden, str):
+        raw_golden = [raw_golden]
+    if not isinstance(raw_golden, (list, tuple)):
+        raise AtomicSeedIngestError(f"{handle}: golden_seed_handles must be a list")
+    golden_handles = list(
+        dict.fromkeys(
+            normalized
+            for value in raw_golden
+            if isinstance(value, str)
+            and (normalized := value.strip().lstrip("@").lower())
+        )
+    )
+
+    followers = _to_int(rec.get("seed_followers", rec.get("followers")))
+    er = _to_float(rec.get("modash_er", rec.get("er")))
+    stage = {
+        "handle": handle,
+        "seed_followers": followers,
+        "modash_er": er,
+        "discovered_via": discovered_via,
+        "discovery_sources": sources,
+        "golden_seed_handles": golden_handles,
+        "discovery_batch": batch_id,
+        # This is the disjoint quota assignment. Multi-source attribution remains
+        # independently available in discovery_sources.
+        "discovery_quota_bucket": bucket,
+        "stage1_ingest_mode": "atomic",
+        "stage1_ingest_id": ingest_id,
+    }
+    return handle, followers, er, json.dumps(stage, ensure_ascii=False)
+
+
+def seed_handles_atomic(
+    recs: list[dict],
+    batch_id: str,
+    *,
+    quota_assignment: dict[str, str] | None = None,
+) -> dict:
+    """Atomically create one formal Stage 1 cohort.
+
+    The input is validated, global handle existence is rechecked, and every row is
+    inserted under one ``BEGIN IMMEDIATE`` transaction. Any invalid/duplicate/
+    globally-existing handle or SQL failure rolls the entire cohort back. Unlike the
+    legacy ``seed_handles`` path, this function never increments ``times_seen``.
+
+    ``quota_assignment`` keys are matched case-insensitively. Callers may instead put
+    ``discovery_quota_bucket`` directly on each record.
+    """
+    if not isinstance(batch_id, str) or not batch_id.strip():
+        raise AtomicSeedIngestError("batch_id must be a non-empty string")
+    if not isinstance(recs, list) or not recs:
+        raise AtomicSeedIngestError("formal seed cohort must be a non-empty list")
+    if quota_assignment is not None and not isinstance(quota_assignment, dict):
+        raise AtomicSeedIngestError("quota_assignment must be a mapping")
+
+    normalized_assignment = {
+        str(key).strip().lstrip("@").lower(): value
+        for key, value in (quota_assignment or {}).items()
+    }
+    ingest_id = uuid.uuid4().hex
+    prepared: list[tuple[str, int | None, float | None, str]] = []
+    identities: set[str] = set()
+    for rec in recs:
+        if not isinstance(rec, dict):
+            raise AtomicSeedIngestError("every formal seed must be an object")
+        raw_handle = rec.get("handle")
+        identity = (
+            raw_handle.strip().lstrip("@").lower()
+            if isinstance(raw_handle, str)
+            else ""
+        )
+        quota_bucket = normalized_assignment.get(identity)
+        row = _formal_seed_record(
+            rec,
+            batch_id=batch_id.strip(),
+            ingest_id=ingest_id,
+            quota_bucket=quota_bucket,
+        )
+        identity = row[0].lower()
+        if identity in identities:
+            raise AtomicSeedIngestError(
+                f"duplicate formal seed handle (case-insensitive): {row[0]}"
+            )
+        identities.add(identity)
+        prepared.append(row)
+
+    if quota_assignment is not None and set(normalized_assignment) != identities:
+        missing = sorted(identities - set(normalized_assignment))
+        extra = sorted(set(normalized_assignment) - identities)
+        raise AtomicSeedIngestError(
+            "quota_assignment must match the cohort exactly; "
+            f"missing={missing}, extra={extra}"
+        )
+
+    now = _now_iso()
+    try:
+        with _conn() as c:
+            # _conn may have migrated a legacy schema. Commit that maintenance before
+            # taking the cohort-wide write lock.
+            c.commit()
+            c.execute("BEGIN IMMEDIATE")
+            conflicts = []
+            for handle, _followers, _er, _stage_json in prepared:
+                existing = c.execute(
+                    "SELECT handle FROM creator_profiles "
+                    "WHERE handle=? COLLATE NOCASE",
+                    (handle,),
+                ).fetchone()
+                if existing is not None:
+                    conflicts.append(str(existing["handle"]))
+            if conflicts:
+                raise AtomicSeedIngestError(
+                    "formal seed cohort conflicts with global cache: "
+                    + ", ".join(sorted(conflicts, key=str.lower))
+                )
+
+            c.executemany(
+                "INSERT INTO creator_profiles "
+                "(handle,first_seen,last_scanned,times_seen,status,stage_updated_at,"
+                "discovery_batch,seed_followers,modash_er,stage_json,locked_at,stage_error) "
+                "VALUES (?,?,?,1,'seed',?,?,?,?,?,NULL,NULL)",
+                [
+                    (
+                        handle,
+                        now,
+                        now,
+                        now,
+                        batch_id.strip(),
+                        followers,
+                        er,
+                        stage_json,
+                    )
+                    for handle, followers, er, stage_json in prepared
+                ],
+            )
+    except AtomicSeedIngestError:
+        raise
+    except sqlite3.Error as exc:
+        raise AtomicSeedIngestError(
+            f"formal seed cohort transaction rolled back: {exc}"
+        ) from exc
+
+    count = len(prepared)
+    return {
+        "new_seeds": count,
+        "audited_new": count,
+        "deduped": 0,
+        "rejected_skipped": 0,
+        "stage1_ingest_id": ingest_id,
+    }
 
 
 def claim_queue(from_status: str, limit: int = 0, batch_id: str | None = None,
@@ -264,9 +588,22 @@ def claim_queue(from_status: str, limit: int = 0, batch_id: str | None = None,
         if batch_id:
             q += " AND discovery_batch=?"
             params.append(batch_id)
-        # 确认有 Amazon 橱窗的(Include 候选)优先深采；再多源命中优先；再先发现先处理
-        q += (" ORDER BY (storefront_status='confirmed_yes') DESC, "
-              "times_seen DESC, stage_updated_at ASC")
+        if from_status == "qualified":
+            # Stage 3 公平调度：从未尝试的候选永远先于重试项，不允许 storefront /
+            # times_seen 把失败项插到新候选前。重试项按最近一次尝试时间从旧到新轮转；
+            # mark_error 每次成功写入都会刷新 stage_updated_at。
+            q += (
+                " ORDER BY (stage_error IS NOT NULL) ASC, "
+                "CASE WHEN stage_error IS NOT NULL THEN stage_updated_at END ASC, "
+                "(storefront_status='confirmed_yes') DESC, "
+                "times_seen DESC, stage_updated_at ASC, handle COLLATE NOCASE ASC"
+            )
+        else:
+            # Stage 2 保持既有业务优先级：确认有橱窗、多源命中、先发现先处理。
+            q += (
+                " ORDER BY (storefront_status='confirmed_yes') DESC, "
+                "times_seen DESC, stage_updated_at ASC, handle COLLATE NOCASE ASC"
+            )
         if limit:
             q += " LIMIT ?"
             params.append(limit)
@@ -367,40 +704,129 @@ def _stage_json_and_hot(cand: dict):
     return sets, params
 
 
-def advance(handle: str, to_status: str, cand: dict | None = None):
-    """成功推进：白名单 UPDATE stage_json（候选累积）+ 热列 + status + 清 locked_at/stage_error。
-    不碰 tier(除单调升 1)/client_status/rejected_reason（正交）。"""
+def _validate_claim_cas(
+    expected_status: str | None, lock_token: str | None
+) -> bool:
+    """校验终态写入的 claim 参数；返回本次是否为 lease/CAS 写入。"""
+    if (expected_status is None) != (lock_token is None):
+        raise ValueError("expected_status 与 lock_token 必须同时提供")
+    return expected_status is not None
+
+
+def _release_owned_lock(c, handle: str, lock_token: str) -> None:
+    """CAS 失败时只释放调用方仍持有的锁，绝不清掉新 owner 的 token。"""
+    c.execute(
+        "UPDATE creator_profiles SET locked_at=NULL "
+        "WHERE handle=? AND locked_at=?",
+        (handle, lock_token),
+    )
+
+
+def advance(
+    handle: str,
+    to_status: str,
+    cand: dict | None = None,
+    *,
+    expected_status: str | None = None,
+    lock_token: str | None = None,
+) -> bool:
+    """成功推进，并在 worker 路径用 ``status + lock_token`` 做 CAS。
+
+    无 claim 参数时保留历史直接调用语义。传 claim 时，只有当前 status/token owner
+    可以写入业务证据、推进状态和清锁；CAS 失败返回 ``False``。
+    """
     h = (handle or "").lstrip("@")
+    claimed = _validate_claim_cas(expected_status, lock_token)
     with _conn() as c:
-        _ensure_row(c, h)
+        if not claimed:
+            _ensure_row(c, h)
         sets = ["status=?", "stage_updated_at=?", "locked_at=NULL", "stage_error=NULL"]
         params = [to_status, _now_iso()]
         if cand is not None:
-            s2, p2 = _stage_json_and_hot(cand)
+            persisted = dict(cand)
+            persisted.pop("_queue_lock_token", None)
+            persisted.pop("_queue_from_status", None)
+            s2, p2 = _stage_json_and_hot(persisted)
             sets += s2
             params += p2
+        where = ["handle=?"]
         params.append(h)
-        c.execute(f"UPDATE creator_profiles SET {','.join(sets)} WHERE handle=?", params)
-        if to_status in ("qualified", "collected", "decided"):
+        if claimed:
+            where += [
+                "status=?",
+                "locked_at=?",
+                "(client_status IS NULL OR client_status NOT IN "
+                "('approved','rejected','collaborated'))",
+            ]
+            params += [expected_status, lock_token]
+        changed = c.execute(
+            f"UPDATE creator_profiles SET {','.join(sets)} "
+            f"WHERE {' AND '.join(where)}",
+            params,
+        ).rowcount
+        if changed == 1 and to_status in ("qualified", "collected", "decided"):
             c.execute("UPDATE creator_profiles SET tier=MAX(COALESCE(tier,0),1) WHERE handle=?", (h,))
+        elif changed != 1 and claimed:
+            _release_owned_lock(c, h, lock_token)
+        return changed == 1
 
 
-def reject(handle: str, reason: str, cand: dict | None = None):
+def reject(
+    handle: str,
+    reason: str,
+    cand: dict | None = None,
+    *,
+    expected_status: str | None = None,
+    lock_token: str | None = None,
+) -> bool:
     """机器淘汰（候选不合格）：status=rejected + reject_reason（区别于客户侧 rejected_reason）。
     cand 给定则回写 stage_json + 热列——被淘汰号也留住已抓浅扫数据（客户铁律：抓过有数据必体现，
-    进 Exclude 池仍要展示画像+淘汰原因，不再 silently drop）。"""
+    进 Exclude 池仍要展示画像+淘汰原因，不再 silently drop）。worker 传 claim 时使用
+    ``status + lock_token`` CAS；无 claim 参数时保留历史直接调用语义。"""
     h = (handle or "").lstrip("@")
+    claimed = _validate_claim_cas(expected_status, lock_token)
     with _conn() as c:
-        _ensure_row(c, h)
+        if not claimed:
+            _ensure_row(c, h)
         sets = ["status='rejected'", "reject_reason=?", "stage_updated_at=?",
                 "locked_at=NULL", "stage_error=NULL"]
         params = [reason, _now_iso()]
         if cand is not None:
-            s2, p2 = _stage_json_and_hot(cand)
+            persisted = dict(cand)
+            persisted.pop("_queue_lock_token", None)
+            persisted.pop("_queue_from_status", None)
+            s2, p2 = _stage_json_and_hot(persisted)
             sets += s2
             params += p2
+        where = ["handle=?"]
         params.append(h)
-        c.execute(f"UPDATE creator_profiles SET {','.join(sets)} WHERE handle=?", params)
+        if claimed:
+            where += [
+                "status=?",
+                "locked_at=?",
+                "(client_status IS NULL OR client_status NOT IN "
+                "('approved','rejected','collaborated'))",
+            ]
+            params += [expected_status, lock_token]
+        changed = c.execute(
+            f"UPDATE creator_profiles SET {','.join(sets)} "
+            f"WHERE {' AND '.join(where)}",
+            params,
+        ).rowcount
+        if changed != 1 and claimed:
+            _release_owned_lock(c, h, lock_token)
+        return changed == 1
+
+
+def _client_status_blocks_requeue(row) -> bool:
+    """批准/合作及永久拒绝不可重开；活动级/临时拒绝可显式进入复核。"""
+    status = row["client_status"]
+    if status in ("approved", "collaborated"):
+        return True
+    if status != "rejected":
+        return False
+    # 迁移前所有拒绝都表示永久负向；NULL 必须保留该历史语义。
+    return (row["client_rejection_scope"] or "global") == "global"
 
 
 def requeue_machine_rejections(handles, expected_reason: str, batch_ids=None) -> dict:
@@ -416,7 +842,8 @@ def requeue_machine_rejections(handles, expected_reason: str, batch_ids=None) ->
     allowed_batches = set(batch_ids or [])
     with _conn() as c:
         rows = c.execute(
-            "SELECT handle,status,reject_reason,client_status,discovery_batch,stage_json "
+            "SELECT handle,status,reject_reason,client_status,client_rejection_scope,"
+            "discovery_batch,stage_json "
             f"FROM creator_profiles WHERE lower(handle) IN ({','.join('?' * len(hs))})",
             hs,
         ).fetchall()
@@ -431,8 +858,11 @@ def requeue_machine_rejections(handles, expected_reason: str, batch_ids=None) ->
                 invalid.append(f"{h}:status={r['status']},reason={r['reject_reason']}")
             elif allowed_batches and r["discovery_batch"] not in allowed_batches:
                 invalid.append(f"{h}:batch={r['discovery_batch']}")
-            elif r["client_status"] in ("approved", "rejected", "collaborated"):
-                invalid.append(f"{h}:client_status={r['client_status']}")
+            elif _client_status_blocks_requeue(r):
+                invalid.append(
+                    f"{h}:client_status={r['client_status']},"
+                    f"rejection_scope={r['client_rejection_scope'] or 'legacy_global'}"
+                )
         if missing or invalid:
             raise ValueError(
                 "semantic requeue precondition failed; "
@@ -449,7 +879,11 @@ def requeue_machine_rejections(handles, expected_reason: str, batch_ids=None) ->
                 sj.pop(key, None)
             c.execute(
                 "UPDATE creator_profiles SET status='seed', reject_reason=NULL, stage_error=NULL, "
-                "locked_at=NULL, final_pool=NULL, stage_updated_at=?, stage_json=? WHERE lower(handle)=?",
+                "locked_at=NULL, final_pool=NULL, stage_updated_at=?, stage_json=?, "
+                "client_status=CASE WHEN client_status='rejected' THEN NULL ELSE client_status END, "
+                "rejected_reason=CASE WHEN client_status='rejected' THEN NULL ELSE rejected_reason END, "
+                "client_rejection_scope=CASE WHEN client_status='rejected' THEN NULL "
+                "ELSE client_rejection_scope END WHERE lower(handle)=?",
                 (now, json.dumps(sj, ensure_ascii=False, default=str), h),
             )
     digest = hashlib.sha256("\n".join(hs).encode()).hexdigest()
@@ -466,14 +900,16 @@ def mark_error(
 ) -> bool:
     """记录可重试错误，并可原子保存本次部分证据。
 
-    ``status`` 始终不变。worker 传入认领时的 status/token 后，更新使用 CAS，不能
+    ``status`` 和 ``times_seen`` 始终不变。worker 传入认领时的 status/token 后，更新使用 CAS，不能
     覆盖已被其他 worker 接管的行；客户已终判的资产也不会被本次采集覆盖。若 CAS
-    失败但锁仍属于本 worker，只释放自己的锁，避免留下孤儿锁。
+    失败但锁仍属于本 worker，只释放自己的锁，避免留下孤儿锁。每次成功错误写入都
+    刷新 ``stage_updated_at``，供重试队列按最旧尝试优先轮转。
     """
     h = (handle or "").lstrip("@")
+    claimed = _validate_claim_cas(expected_status, lock_token)
     with _conn() as c:
-        sets = ["stage_error=?", "locked_at=NULL"]
-        params = [str(err)[:120]]
+        sets = ["stage_error=?", "stage_updated_at=?", "locked_at=NULL"]
+        params = [str(err)[:120], _now_iso()]
         if cand is not None:
             persisted = dict(cand)
             # claim 元数据只存在于 worker 内存，绝不能写入业务证据。
@@ -490,10 +926,9 @@ def mark_error(
             "('approved','rejected','collaborated'))",
         ]
         params.append(h)
-        if expected_status is not None:
+        if claimed:
             where.append("status=?")
             params.append(expected_status)
-        if lock_token is not None:
             where.append("locked_at=?")
             params.append(lock_token)
         changed = c.execute(
@@ -501,13 +936,9 @@ def mark_error(
             f"WHERE {' AND '.join(where)}",
             params,
         ).rowcount
-        if changed != 1 and lock_token is not None:
+        if changed != 1 and claimed:
             # 终判或状态并发变化时不写证据/错误，但仍可安全释放自己持有的锁。
-            c.execute(
-                "UPDATE creator_profiles SET locked_at=NULL "
-                "WHERE handle=? AND locked_at=?",
-                (h, lock_token),
-            )
+            _release_owned_lock(c, h, lock_token)
         return changed == 1
 
 
@@ -609,6 +1040,9 @@ def strict_deep_reasons(
     comments is normally a technical failure.  A bounded exception is recorded
     explicitly in ``comment_unavailable_posts`` only after the same URL fails in
     two rounds while reporting 1–2 comments; it counts as reviewed, never as zero.
+    A separate ``verified_empty_thread`` state also counts as reviewed only when
+    an exact visible empty-thread marker and the authenticated comments endpoint
+    both prove an empty public thread; its positive reported count is preserved.
 
     Machine-rejected candidates remain exempt by default for backward
     compatibility.  ``require_full_deep`` makes the same contract apply to them.
@@ -725,6 +1159,73 @@ def strict_deep_reasons(
     if not posts:
         return reasons
 
+    raw_unavailable = cand.get("comment_unavailable_posts") or []
+    if isinstance(raw_unavailable, dict):
+        raw_unavailable = [raw_unavailable]
+    unavailable_rows = [
+        row for row in raw_unavailable if isinstance(row, dict)
+    ]
+    retry_state_present = "stage3_comment_retry_state" in cand
+    raw_retry_state = cand.get("stage3_comment_retry_state")
+    retry_rows = raw_retry_state if isinstance(raw_retry_state, list) else []
+    for post in posts:
+        if not has_explicit_contract:
+            continue
+        status_value = str(post.get("comment_sampling_status") or "")
+        try:
+            reported_count = int(post.get("comment_count"))
+            collected_count = int(post.get("comments_collected") or 0)
+        except (TypeError, ValueError):
+            reported_count = collected_count = -1
+        if status_value not in {
+            "unavailable_after_retry",
+            "verified_empty_thread",
+        }:
+            if reported_count > 0 and not (
+                status_value == "collected" and collected_count > 0
+            ):
+                reasons.append(
+                    "逐帖评论完成证据无效"
+                    f"(status={status_value or 'missing'})"
+                )
+            continue
+        validator = (
+            comment_semantics.verified_empty_thread_evidence
+            if status_value == "verified_empty_thread"
+            else comment_semantics.repeated_low_comment_unavailable
+        )
+        valid_terminal = any(
+            validator(post, row) for row in unavailable_rows
+        )
+        if (
+            valid_terminal
+            and status_value == "unavailable_after_retry"
+            and retry_state_present
+        ):
+            identity = comment_semantics.comment_media_identity(post)
+
+            def _valid_retry_row(row):
+                if not isinstance(row, dict):
+                    return False
+                try:
+                    streak = int(row.get("failure_streak") or 0)
+                except (TypeError, ValueError):
+                    return False
+                return (
+                    row.get("identity") == identity
+                    and row.get("state") == "terminal_unavailable"
+                    and streak >= 2
+                )
+
+            valid_terminal = any(
+                _valid_retry_row(row) for row in retry_rows
+            )
+        if not valid_terminal:
+            reasons.append(
+                "评论不可见终态证据无效"
+                f"(status={status_value})"
+            )
+
     observed_likes = [
         post.get("like_count") for post in posts
         if post.get("like_count") is not None
@@ -827,11 +1328,22 @@ _DEEP_FIELDS = ("comments_read", "sampled_posts", "comments_analyzed", "valid_co
                 "low_quality_ratio", "high_intent_ratio", "intent_posts", "intent_by_grade",
                 "high_intent_count", "intent_total", "high_intent_snippets", "promo_intent_hits",
                 "promotional_post_count", "real_er", "real_er_median", "real_er_window",
-                "comment_shots", "evidence_dir", "comment_sample", "deep_target_posts",
+                "comment_shots", "evidence_dir", "comment_sample", "comment_records",
+                "comment_translations", "comment_translation_summary",
+                "translated_intent_comments", "translated_intent_by_grade",
+                "deep_target_posts",
                 "deep_available_posts", "deep_successful_posts", "deep_failed_posts",
                 "deep_metric_missing_posts", "comment_attempted_posts",
                 "comment_completed_posts", "comment_failed_posts",
-                "comment_unavailable_posts", "deep_collection_status")
+                "comment_unavailable_posts", "deep_collection_status",
+                # Explicit recollection starts a new deep-attempt generation.  The
+                # prior ledger/canonical selectors and retry streak must not leak
+                # into the new generation (legacy history name included).
+                "deep_collection_attempts", "deep_canonical_attempt_id",
+                "deep_canonical_quality", "pricing_canonical_attempt_id",
+                "pricing_canonical_quality", "stage3_comment_retry_state",
+                "stage3_comment_retry_history",
+                "deep_evidence_merge_provenance")
 
 
 def requeue_for_recollect(handles) -> int:
@@ -848,14 +1360,14 @@ def requeue_for_recollect(handles) -> int:
     with _conn() as c:
         if normalized:
             rows = c.execute(
-                "SELECT handle,client_status FROM creator_profiles "
+                "SELECT handle,client_status,client_rejection_scope FROM creator_profiles "
                 f"WHERE handle IN ({','.join('?' * len(normalized))})",
                 normalized,
             ).fetchall()
             client_final = sorted(
                 row["handle"]
                 for row in rows
-                if row["client_status"] in ("approved", "rejected", "collaborated")
+                if _client_status_blocks_requeue(row)
             )
             if client_final:
                 raise ValueError(
@@ -877,7 +1389,11 @@ def requeue_for_recollect(handles) -> int:
             c.execute(
                 "UPDATE creator_profiles SET status='qualified', stage_json=?, "
                 "real_er=NULL, high_intent_count=NULL, final_pool=NULL, "
-                "reject_reason=NULL, locked_at=NULL WHERE handle=?",
+                "reject_reason=NULL, locked_at=NULL, "
+                "client_status=CASE WHEN client_status='rejected' THEN NULL ELSE client_status END, "
+                "rejected_reason=CASE WHEN client_status='rejected' THEN NULL ELSE rejected_reason END, "
+                "client_rejection_scope=CASE WHEN client_status='rejected' THEN NULL "
+                "ELSE client_rejection_scope END WHERE handle=?",
                 (json.dumps(sj, ensure_ascii=False), h),
             )
             n += 1
@@ -887,8 +1403,9 @@ def requeue_for_recollect(handles) -> int:
 def validate_recollect_scope(handles) -> set[str]:
     """Validate an exact deep-recollection allowlist before any state change.
 
-    Every handle must exist and customer-final assets are forbidden.  The
-    normalized set is returned for callers to use as an exact intersection.
+    Every handle must exist. Approved/collaborated and global (including legacy
+    NULL-scope) rejections are forbidden; campaign/temporary rejections may be
+    explicitly reconsidered. The normalized set is returned as an exact intersection.
     """
     normalized = {
         str(handle or "").strip().lstrip("@").lower()
@@ -899,7 +1416,8 @@ def validate_recollect_scope(handles) -> set[str]:
         raise ValueError("重采白名单为空")
     with _conn() as c:
         rows = c.execute(
-            "SELECT lower(handle) AS handle,client_status FROM creator_profiles "
+            "SELECT lower(handle) AS handle,client_status,client_rejection_scope "
+            "FROM creator_profiles "
             f"WHERE lower(handle) IN ({','.join('?' * len(normalized))})",
             sorted(normalized),
         ).fetchall()
@@ -908,7 +1426,7 @@ def validate_recollect_scope(handles) -> set[str]:
     client_final = sorted(
         handle
         for handle, row in by_handle.items()
-        if row["client_status"] in ("approved", "rejected", "collaborated")
+        if _client_status_blocks_requeue(row)
     )
     if missing or client_final:
         raise ValueError(
@@ -933,16 +1451,17 @@ def promote_golden(handle: str, batch_id: str = "", collaborated: bool = False):
     st = "collaborated" if collaborated else "approved"
     with _conn() as c:
         c.execute("""UPDATE creator_profiles SET tier=2, client_status=?, approved_at=?,
-                     rejected_reason=NULL, source_batch=?
+                     rejected_reason=NULL, client_rejection_scope=NULL, source_batch=?
                      WHERE handle=?""", (st, now, batch_id, h))
 
 
 def mark_rejected(handle: str, reason: str = "", batch_id: str = ""):
-    """客户 Herman Approval=No → 负向库。不自动改门槛/config。"""
+    """旧 API 的客户拒绝按历史语义进入永久负向库；不自动改门槛/config。"""
     h = (handle or "").lstrip("@")
     with _conn() as c:
         c.execute("""UPDATE creator_profiles SET client_status='rejected', rejected_reason=?,
-                     approved_at=NULL, tier=CASE WHEN tier=2 THEN 1 ELSE tier END, source_batch=?
+                     client_rejection_scope='global', approved_at=NULL,
+                     tier=CASE WHEN tier=2 THEN 1 ELSE tier END, source_batch=?
                      WHERE handle=?""", (reason, batch_id, h))
 
 
@@ -955,11 +1474,19 @@ def set_client_note(handle: str, note: str):
 
 
 def is_rejected(handle: str) -> bool:
-    """负向库命中 → 发现阶段不再重现。"""
+    """仅永久拒绝命中负向库；迁移前 scope=NULL 的历史拒绝按 global 兼容。"""
     h = (handle or "").lstrip("@")
     with _conn() as c:
-        r = c.execute("SELECT client_status FROM creator_profiles WHERE handle=?", (h,)).fetchone()
-    return bool(r and r["client_status"] == "rejected")
+        r = c.execute(
+            "SELECT client_status,client_rejection_scope FROM creator_profiles "
+            "WHERE handle=? COLLATE NOCASE",
+            (h,),
+        ).fetchone()
+    return bool(
+        r
+        and r["client_status"] == "rejected"
+        and (r["client_rejection_scope"] or "global") == "global"
+    )
 
 
 def golden_seeds(limit: int = 50) -> list[str]:
@@ -969,7 +1496,10 @@ def golden_seeds(limit: int = 50) -> list[str]:
         rows = c.execute(
             "SELECT handle FROM creator_profiles "
             "WHERE tier=2 AND client_status IN ('approved','collaborated') "
-            "ORDER BY approved_at DESC LIMIT ?",
+            # 客户批量回流会让一批账号共享同一 approved_at。LIMIT 落在并列组时
+            # 必须有稳定次序，否则同一数据库迁移/VACUUM 后种子指纹可能漂移，
+            # 已人工完成的 Lookalike 文件也会被严格回导拒绝。
+            "ORDER BY approved_at DESC, lower(handle) ASC, handle ASC LIMIT ?",
             (limit,),
         ).fetchall()
     finally:
@@ -989,6 +1519,54 @@ def _valid_sha256(value: str) -> bool:
     )
 
 
+def freeze_source_context(candidate: dict | None) -> dict:
+    """从冻结交付候选中抽取可审计的发现来源白名单。
+
+    事件不能在分析时回读会继续变化的 ``creator_profiles.stage_json``。因此导入器把
+    原始 ``source decisions`` candidate 交给这里，只保留三个来源字段并做确定性
+    归一化；其余候选画像、评论和业务字段一律不会进入反馈事件。
+    """
+    if candidate is None:
+        candidate = {}
+    if not isinstance(candidate, dict):
+        raise ClientDecisionImportError("source_context 必须是对象")
+
+    def string_list(field: str, *, handles: bool = False) -> list[str]:
+        raw = candidate.get(field)
+        if raw in (None, ""):
+            return []
+        if not isinstance(raw, (list, tuple)):
+            raise ClientDecisionImportError(f"source_context.{field} 必须是字符串数组")
+        result: list[str] = []
+        for value in raw:
+            if not isinstance(value, str) or not value.strip():
+                raise ClientDecisionImportError(
+                    f"source_context.{field} 只能包含非空字符串"
+                )
+            normalized = value.strip()
+            if handles:
+                normalized = normalized.lstrip("@").lower()
+            if normalized not in result:
+                result.append(normalized)
+        return result
+
+    discovered_via = candidate.get("discovered_via")
+    if discovered_via in (None, ""):
+        discovered_via = None
+    elif not isinstance(discovered_via, str) or not discovered_via.strip():
+        raise ClientDecisionImportError(
+            "source_context.discovered_via 必须是非空字符串或 null"
+        )
+    else:
+        discovered_via = discovered_via.strip()
+
+    return {
+        "discovery_sources": string_list("discovery_sources"),
+        "discovered_via": discovered_via,
+        "golden_seed_handles": string_list("golden_seed_handles", handles=True),
+    }
+
+
 def _client_note_after_transition(existing, label: str | None, reason: str) -> str | None:
     """Replace stale decision-tag notes while preserving unrelated operator notes."""
     if label and reason:
@@ -1000,6 +1578,77 @@ def _client_note_after_transition(existing, label: str | None, reason: str) -> s
     return existing
 
 
+def _insert_client_feedback_events(
+    c: sqlite3.Connection,
+    decisions: list[dict],
+    rows_by_key: dict[str, sqlite3.Row],
+    *,
+    batch_id: str,
+    file_sha256: str,
+    source_sha256: str,
+    imported_at: str,
+    source_mode: str,
+) -> None:
+    """Append one immutable event per normalized decision inside caller's transaction."""
+    for item in decisions:
+        if source_mode == "historical_backfill":
+            previous = c.execute(
+                """SELECT event_id, verdict FROM client_feedback_events
+                   WHERE handle=? COLLATE NOCASE AND imported_at < ?
+                   ORDER BY imported_at DESC, rowid DESC LIMIT 1""",
+                (item["handle"], imported_at),
+            ).fetchone()
+        else:
+            previous = c.execute(
+                """SELECT event_id, verdict FROM client_feedback_events
+                   WHERE handle=? COLLATE NOCASE
+                   ORDER BY imported_at DESC, rowid DESC LIMIT 1""",
+                (item["handle"],),
+            ).fetchone()
+        supersedes_event_id = None
+        if previous and previous["verdict"] != item["action"]:
+            supersedes_event_id = previous["event_id"]
+        c.execute(
+            """INSERT INTO client_feedback_events
+               (event_id, review_batch, origin_batch, handle, verdict,
+                reason_raw, reason_tags_json, feedback_scope, rejection_scope,
+                target_field, old_value, claimed_value, evidence_status,
+                feedback_file_sha256, source_decisions_sha256,
+                taxonomy_version, imported_at, source_mode, source_context_json,
+                supersedes_event_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                uuid.uuid4().hex,
+                batch_id,
+                item["origin_batch"],
+                rows_by_key[item["key"]]["handle"],
+                item["action"],
+                item["reason"],
+                json.dumps(
+                    item["reason_tags"], ensure_ascii=False, separators=(",", ":")
+                ),
+                item["feedback_scope"],
+                item["rejection_scope"],
+                item["target_field"],
+                item["old_value"],
+                item["claimed_value"],
+                item["evidence_status"],
+                file_sha256,
+                source_sha256,
+                item["taxonomy_version"],
+                imported_at,
+                source_mode,
+                json.dumps(
+                    item["source_context"],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                supersedes_event_id,
+            ),
+        )
+
+
 def apply_client_decisions(
     decisions: list[dict],
     *,
@@ -1008,6 +1657,7 @@ def apply_client_decisions(
     source_sha256: str,
     adopt_existing: bool = False,
     allow_status_change: bool = False,
+    backfill_events: bool = False,
     dry_run: bool = False,
 ) -> dict:
     """严格校验后在单个事务中落客户反馈，并用原文件 SHA-256 保证幂等。
@@ -1023,6 +1673,9 @@ def apply_client_decisions(
 
     已有客户终判与新文件冲突时默认整批中止。只有客户明确改判时，调用方才可显式
     传 ``allow_status_change=True``；它不能与 ``adopt_existing`` 同时使用。
+
+    ``backfill_events`` 是显式历史迁移路径：只允许已有同 SHA ledger 且尚无逐条事件
+    的文件，完整校验后只补 append-only events，不改账号投影或原 ledger。
     """
     if not isinstance(batch_id, str) or not batch_id.strip():
         raise ClientDecisionImportError("batch_id 不能为空")
@@ -1034,6 +1687,10 @@ def apply_client_decisions(
     if adopt_existing and allow_status_change:
         raise ClientDecisionImportError(
             "adopt_existing 与 allow_status_change 不能同时启用"
+        )
+    if backfill_events and (adopt_existing or allow_status_change):
+        raise ClientDecisionImportError(
+            "backfill_events 不能与 adopt_existing/allow_status_change 同时启用"
         )
 
     normalized = []
@@ -1064,8 +1721,74 @@ def apply_client_decisions(
             reason = ""
         if not isinstance(reason, str):
             raise ClientDecisionImportError(f"@{handle} 的 reason 不是字符串")
-        normalized.append({"handle": handle, "key": key, "action": action,
-                           "reason": reason.strip(), "origin_batch": origin_batch})
+        try:
+            raw_reason_tags = item.get("reason_tags")
+            if raw_reason_tags is not None and not isinstance(
+                raw_reason_tags, (list, tuple)
+            ):
+                raise FeedbackTaxonomyError("reason_tags 必须是字符串数组")
+            reason_tags = normalize_reason_tags(raw_reason_tags)
+            feedback_scope = normalize_feedback_scope(item.get("feedback_scope"))
+            evidence_status = normalize_evidence_status(item.get("evidence_status"))
+            rejection_scope = None
+            if action == "rejected":
+                rejection_scope = normalize_rejection_scope(
+                    item.get("rejection_scope"), default="global"
+                )
+            elif item.get("rejection_scope") not in (None, ""):
+                raise FeedbackTaxonomyError(
+                    "只有 rejected 事件可以设置 rejection_scope"
+                )
+        except FeedbackTaxonomyError as exc:
+            raise ClientDecisionImportError(f"@{handle} 的结构化反馈无效：{exc}") from exc
+        if feedback_scope == "confirmed_policy":
+            raise ClientDecisionImportError(
+                f"@{handle} 的外部反馈不能直接确认全局策略；只能提交 policy_signal"
+            )
+        if feedback_scope == "policy_signal" and not (
+            reason.strip() or reason_tags
+        ):
+            feedback_scope = "account"
+
+        try:
+            source_context = freeze_source_context(item.get("source_context"))
+        except ClientDecisionImportError as exc:
+            raise ClientDecisionImportError(
+                f"@{handle} 的冻结来源上下文无效：{exc}"
+            ) from exc
+
+        taxonomy_version = item.get("taxonomy_version", TAXONOMY_VERSION)
+        if taxonomy_version != TAXONOMY_VERSION:
+            raise ClientDecisionImportError(
+                f"@{handle} 的 taxonomy_version 无效：{taxonomy_version!r}"
+            )
+        structured_values = {}
+        for field in ("target_field", "old_value", "claimed_value"):
+            value = item.get(field)
+            if value is not None and not isinstance(value, str):
+                raise ClientDecisionImportError(f"@{handle} 的 {field} 不是字符串")
+            structured_values[field] = value.strip() if isinstance(value, str) else None
+        if feedback_scope == "fact_correction" and not structured_values["target_field"]:
+            raise ClientDecisionImportError(
+                f"@{handle} 的 fact_correction 缺少 target_field"
+            )
+
+        normalized.append(
+            {
+                "handle": handle,
+                "key": key,
+                "action": action,
+                "reason": reason.strip(),
+                "origin_batch": origin_batch,
+                "reason_tags": reason_tags,
+                "feedback_scope": feedback_scope,
+                "rejection_scope": rejection_scope,
+                "evidence_status": evidence_status,
+                "taxonomy_version": taxonomy_version,
+                "source_context": source_context,
+                **structured_values,
+            }
+        )
         counts[action] += 1
 
     c = _conn()
@@ -1083,24 +1806,112 @@ def apply_client_decisions(
                 raise ClientDecisionImportError("同一文件 SHA 的 ledger 批次不一致")
             if ledger["source_sha256"] != source_sha256:
                 raise ClientDecisionImportError("同一文件 SHA 的交付基线 SHA 不一致")
-            result = {
-                "batch_id": ledger["batch_id"],
-                "decision_count": ledger["decision_count"],
+            if not backfill_events:
+                result = {
+                    "batch_id": ledger["batch_id"],
+                    "decision_count": ledger["decision_count"],
+                    "approved": ledger["approved_count"],
+                    "rejected": ledger["rejected_count"],
+                    "pending": ledger["pending_count"],
+                    "already_imported": True,
+                    "adopted_existing": bool(ledger["adopted_existing"]),
+                    "dry_run": dry_run,
+                }
+                c.rollback()
+                return result
+            ledger_counts = {
                 "approved": ledger["approved_count"],
                 "rejected": ledger["rejected_count"],
                 "pending": ledger["pending_count"],
-                "already_imported": True,
-                "adopted_existing": bool(ledger["adopted_existing"]),
-                "dry_run": dry_run,
             }
-            c.rollback()
-            return result
+            if ledger["decision_count"] != len(normalized) or ledger_counts != counts:
+                raise ClientDecisionImportError(
+                    "历史 ledger 的决策数量与当前反馈文件不一致"
+                )
+            existing_events = c.execute(
+                """SELECT * FROM client_feedback_events
+                   WHERE feedback_file_sha256=? ORDER BY rowid""",
+                (file_sha256,),
+            ).fetchall()
+            if existing_events and len(existing_events) != len(normalized):
+                raise ClientDecisionImportError(
+                    "历史反馈只存在部分逐条 events；append-only 迁移整批中止"
+                )
+            if existing_events:
+                expected_by_key = {item["key"]: item for item in normalized}
+                consistent = True
+                seen_event_keys = set()
+                for event in existing_events:
+                    event_key = event["handle"].lower()
+                    item = expected_by_key.get(event_key)
+                    if item is None or event_key in seen_event_keys:
+                        consistent = False
+                        break
+                    seen_event_keys.add(event_key)
+                    try:
+                        event_tags = json.loads(event["reason_tags_json"])
+                    except (TypeError, json.JSONDecodeError):
+                        consistent = False
+                        break
+                    event_source_context = None
+                    if event["source_context_json"] not in (None, ""):
+                        try:
+                            event_source_context = freeze_source_context(
+                                json.loads(event["source_context_json"])
+                            )
+                        except (
+                            TypeError,
+                            json.JSONDecodeError,
+                            ClientDecisionImportError,
+                        ):
+                            consistent = False
+                            break
+                    if (
+                        event["review_batch"] != batch_id
+                        or event["origin_batch"] != item["origin_batch"]
+                        or event["verdict"] != item["action"]
+                        or event["reason_raw"] != item["reason"]
+                        or event_tags != item["reason_tags"]
+                        or event["feedback_scope"] != item["feedback_scope"]
+                        or event["rejection_scope"] != item["rejection_scope"]
+                        or event["target_field"] != item["target_field"]
+                        or event["old_value"] != item["old_value"]
+                        or event["claimed_value"] != item["claimed_value"]
+                        or event["evidence_status"] != item["evidence_status"]
+                        or event["source_decisions_sha256"] != source_sha256
+                        or event["taxonomy_version"] != item["taxonomy_version"]
+                        or (
+                            event_source_context is not None
+                            and event_source_context != item["source_context"]
+                        )
+                    ):
+                        consistent = False
+                        break
+                if not consistent or len(seen_event_keys) != len(normalized):
+                    raise ClientDecisionImportError(
+                        "已有逐条 events 与当前反馈文件不一致"
+                    )
+                c.rollback()
+                return {
+                    "batch_id": batch_id,
+                    "decision_count": len(normalized),
+                    **counts,
+                    "already_imported": True,
+                    "adopted_existing": bool(ledger["adopted_existing"]),
+                    "events_already_present": True,
+                    "events_backfilled": 0,
+                    "dry_run": dry_run,
+                }
+        elif backfill_events:
+            raise ClientDecisionImportError(
+                "--backfill-events 只适用于已有同 SHA ledger 的历史反馈"
+            )
 
         rows_by_key = {}
         for item in normalized:
             rows = c.execute(
                 """SELECT handle, discovery_batch, tier, client_status, approved_at,
-                          rejected_reason, source_batch, client_note
+                          rejected_reason, client_rejection_scope, source_batch, client_note
                    FROM creator_profiles WHERE handle=? COLLATE NOCASE""",
                 (item["handle"],),
             ).fetchall()
@@ -1115,6 +1926,42 @@ def apply_client_decisions(
                     f"{item['origin_batch']}"
                 )
             rows_by_key[item["key"]] = row
+
+        if backfill_events:
+            if dry_run:
+                c.rollback()
+                return {
+                    "batch_id": batch_id,
+                    "decision_count": len(normalized),
+                    **counts,
+                    "already_imported": True,
+                    "adopted_existing": bool(ledger["adopted_existing"]),
+                    "events_already_present": False,
+                    "events_backfilled": 0,
+                    "events_to_backfill": len(normalized),
+                    "dry_run": True,
+                }
+            _insert_client_feedback_events(
+                c,
+                normalized,
+                rows_by_key,
+                batch_id=batch_id,
+                file_sha256=file_sha256,
+                source_sha256=source_sha256,
+                imported_at=ledger["imported_at"],
+                source_mode="historical_backfill",
+            )
+            c.commit()
+            return {
+                "batch_id": batch_id,
+                "decision_count": len(normalized),
+                **counts,
+                "already_imported": True,
+                "adopted_existing": bool(ledger["adopted_existing"]),
+                "events_already_present": False,
+                "events_backfilled": len(normalized),
+                "dry_run": False,
+            }
 
         if adopt_existing:
             inconsistent = []
@@ -1138,6 +1985,10 @@ def apply_client_decisions(
                         row["client_status"] == "rejected"
                         and row["source_batch"] == batch_id
                         and row["rejected_reason"] == expected
+                        and row["client_rejection_scope"] in (
+                            None,
+                            item["rejection_scope"],
+                        )
                     )
                 else:
                     ok = (
@@ -1215,14 +2066,16 @@ def apply_client_decisions(
                 handle = rows_by_key[item["key"]]["handle"]
                 if item["action"] == "approved":
                     c.execute(
-                        "UPDATE creator_profiles SET rejected_reason=NULL WHERE handle=?",
+                        "UPDATE creator_profiles SET rejected_reason=NULL, "
+                        "client_rejection_scope=NULL WHERE handle=?",
                         (handle,),
                     )
                 elif item["action"] == "rejected":
                     c.execute(
                         """UPDATE creator_profiles SET approved_at=NULL,
+                           client_rejection_scope=?,
                            tier=CASE WHEN tier=2 THEN 1 ELSE tier END WHERE handle=?""",
-                        (handle,),
+                        (item["rejection_scope"], handle),
                     )
         else:
             for item in normalized:
@@ -1235,7 +2088,8 @@ def apply_client_decisions(
                         # collaborated 的更强状态，只登记本轮来源并清互斥字段。
                         c.execute(
                             """UPDATE creator_profiles SET tier=2,
-                               rejected_reason=NULL, source_batch=? WHERE handle=?""",
+                               rejected_reason=NULL, client_rejection_scope=NULL,
+                               source_batch=? WHERE handle=?""",
                             (batch_id, handle),
                         )
                     else:
@@ -1244,7 +2098,8 @@ def apply_client_decisions(
                         )
                         c.execute(
                             """UPDATE creator_profiles SET tier=2, client_status='approved',
-                               approved_at=?, rejected_reason=NULL, source_batch=?,
+                               approved_at=?, rejected_reason=NULL,
+                               client_rejection_scope=NULL, source_batch=?,
                                client_note=?
                                WHERE handle=?""",
                             (now, batch_id, note, handle),
@@ -1258,10 +2113,15 @@ def apply_client_decisions(
                     if row["client_status"] == "rejected":
                         c.execute(
                             """UPDATE creator_profiles SET rejected_reason=?,
-                               approved_at=NULL,
+                               client_rejection_scope=?, approved_at=NULL,
                                tier=CASE WHEN tier=2 THEN 1 ELSE tier END,
                                source_batch=? WHERE handle=?""",
-                            (reason or "客户判定不合适", batch_id, handle),
+                            (
+                                reason or "客户判定不合适",
+                                item["rejection_scope"],
+                                batch_id,
+                                handle,
+                            ),
                         )
                     else:
                         note = _client_note_after_transition(
@@ -1269,10 +2129,16 @@ def apply_client_decisions(
                         )
                         c.execute(
                             """UPDATE creator_profiles SET client_status='rejected',
-                               rejected_reason=?, approved_at=NULL,
+                               rejected_reason=?, client_rejection_scope=?, approved_at=NULL,
                                tier=CASE WHEN tier=2 THEN 1 ELSE tier END,
                                source_batch=?, client_note=? WHERE handle=?""",
-                            (reason or "客户判定不合适", batch_id, note, handle),
+                            (
+                                reason or "客户判定不合适",
+                                item["rejection_scope"],
+                                batch_id,
+                                note,
+                                handle,
+                            ),
                         )
                 elif row["client_status"] is not None:
                     # 只有显式 --allow-status-change 才可能走到这里：客户把旧终判
@@ -1280,6 +2146,7 @@ def apply_client_decisions(
                     c.execute(
                         """UPDATE creator_profiles SET client_status=NULL,
                            approved_at=NULL, rejected_reason=NULL,
+                           client_rejection_scope=NULL,
                            tier=CASE WHEN tier=2 THEN 1 ELSE tier END,
                            source_batch=?, client_note=? WHERE handle=?""",
                         (
@@ -1312,6 +2179,16 @@ def apply_client_decisions(
                 counts["pending"],
                 int(adopt_existing),
             ),
+        )
+        _insert_client_feedback_events(
+            c,
+            normalized,
+            rows_by_key,
+            batch_id=batch_id,
+            file_sha256=file_sha256,
+            source_sha256=source_sha256,
+            imported_at=now,
+            source_mode="adopt_existing" if adopt_existing else "import",
         )
         c.commit()
         return {

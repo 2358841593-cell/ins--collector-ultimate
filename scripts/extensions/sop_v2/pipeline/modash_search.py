@@ -228,8 +228,15 @@ def merge_seed_records(*groups: list[dict]) -> list[dict]:
                 continue
             key = h.lower()
             sources = list(raw.get("discovery_sources") or [])
-            if raw.get("discovered_via") and raw["discovered_via"] not in sources:
-                sources.append(raw["discovered_via"])
+            discovered_via = raw.get("discovered_via")
+            # multi_source 是合并后的派生标记，不是真实发现来源；
+            # 重复合并时不得把它污染进 discovery_sources。
+            if (
+                discovered_via
+                and discovered_via != "multi_source"
+                and discovered_via not in sources
+            ):
+                sources.append(discovered_via)
             golden = [_handle(x) for x in (raw.get("golden_seed_handles") or [])]
             golden = [x for x in golden if x]
             if key not in merged:
@@ -260,10 +267,22 @@ def merge_seed_records(*groups: list[dict]) -> list[dict]:
     return [merged[key] for key in order]
 
 
-_SEARCH_JS = """async (body) => {
-  const r = await fetch('/api/search/v2/instagram', {method:'POST',
-    headers:{'content-type':'application/json'}, body: JSON.stringify(body)});
-  return {status: r.status, text: await r.text()};
+_SEARCH_JS = """async (args) => {
+  const controller = new AbortController();
+  const timeoutMs = Math.max(1, Number(args.timeoutMs) || 20000);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const r = await fetch('/api/search/v2/instagram', {method:'POST',
+      headers:{'content-type':'application/json'}, body: JSON.stringify(args.body),
+      signal: controller.signal});
+    return {status: r.status, text: await r.text(), timedOut: false, error: null};
+  } catch (error) {
+    const timedOut = controller.signal.aborted || (error && error.name === 'AbortError');
+    return {status: null, text: '', timedOut,
+      error: timedOut ? 'request_timeout' : ((error && error.name) || 'fetch_error')};
+  } finally {
+    clearTimeout(timer);
+  }
 }"""
 
 
@@ -275,16 +294,36 @@ def _find_modash(b):
     return None
 
 
-def _page(pg, query, filters, skip, limit=6):
+def _page(pg, query, filters, skip, limit=6, request_timeout_ms=20_000):
+    """Fetch one search page and return an explicit result/error envelope."""
     body = {"skip": skip, "limit": limit, "search_origin": "lookalikes",
             "query": query, "filters": filters}
-    r = pg.evaluate(_SEARCH_JS, body)
-    if r.get("status") != 200:
-        return None
+    timeout_ms = max(1, int(request_timeout_ms))
     try:
-        return json.loads(r["text"]).get("results", [])
-    except Exception:  # noqa: BLE001
-        return []
+        r = pg.evaluate(_SEARCH_JS, {"body": body, "timeoutMs": timeout_ms})
+    except Exception as exc:  # noqa: BLE001 - normalize Playwright transport failures
+        return {
+            "results": [],
+            "error": f"playwright_{type(exc).__name__}",
+            "status": None,
+        }
+    if not isinstance(r, dict):
+        return {"results": [], "error": "invalid_response", "status": None}
+    if r.get("timedOut") or r.get("error") == "request_timeout":
+        return {"results": [], "error": "request_timeout", "status": None}
+    if r.get("error"):
+        return {"results": [], "error": "request_failed", "status": None}
+    status = r.get("status")
+    if status != 200:
+        return {"results": [], "error": f"http_{status}", "status": status}
+    try:
+        payload = json.loads(r["text"])
+    except (KeyError, TypeError, json.JSONDecodeError):
+        return {"results": [], "error": "invalid_json", "status": status}
+    results = payload.get("results") if isinstance(payload, dict) else None
+    if not isinstance(results, list):
+        return {"results": [], "error": "invalid_results", "status": status}
+    return {"results": results, "error": None, "status": status}
 
 
 def _seed(x: dict) -> dict:
@@ -314,44 +353,92 @@ def _keep(s: dict, require_amazon_bio: bool) -> bool:
 
 def discover(query: str, filters: dict, target: int = 120, max_pages: int = 80,
              require_amazon_bio: bool = True, page_delay: float = 2.2,
-             cdp_url: str = "http://127.0.0.1:9222") -> dict:
-    """结构化搜索 + skip 分页 + 预过滤 → 高质量 seed 列表。返回 {seeds, raw_scanned, filtered_out}。
-    page_delay：每页基准停顿秒数（拟人，降 Modash 风控），实际取 [0.7x,1.4x] 随机 + 每10页长歇。"""
+             cdp_url: str = "http://127.0.0.1:9222",
+             quota_accept=None, request_timeout_ms: int = 20_000,
+             sleeper=time.sleep) -> dict:
+    """结构化搜索 + skip 分页 + 预过滤 → 高质量 seed 列表。
+
+    ``quota_accept`` 缺省时完全保持旧语义：预过滤后的 ``kept`` 达到
+    ``target`` 即停。给定谓词时，只有谓词接受的候选计入配额，但
+    ``seeds`` 仍返回分页期间实际观察到的全部预过滤候选，供上层保留
+    跨来源归因。返回 ``accepted`` 为实际计入配额数。
+
+    page_delay：每页基准停顿秒数（拟人，降 Modash 风控），实际取 [0.7x,1.4x] 随机 + 每10页长歇。
+    纯节奏等待通过可注入 ``sleeper`` 执行，不调用 Playwright
+    ``wait_for_timeout``，避免 CDP 附着模式下同步等待卡死。
+    """
     import random
     from playwright.sync_api import sync_playwright
     seeds, seen = [], set()
-    scanned = kept = 0
+    scanned = kept = accepted = 0
+
+    def result(error=None):
+        payload = {
+            "seeds": seeds,
+            "raw_scanned": scanned,
+            "kept": kept,
+            "accepted": accepted,
+            "filtered_out": scanned - kept,
+        }
+        if error:
+            payload["error"] = error
+        return payload
+
+    def rhythm_sleep(seconds):
+        if seconds > 0:
+            sleeper(seconds)
+
     with sync_playwright() as pw:
         b = pw.chromium.connect_over_cdp(cdp_url)
-        try:
-            pg = _find_modash(b)
-            if not pg:
-                return {"error": "no_modash_tab", "seeds": []}
-            for _ in range(2):
-                pg.keyboard.press("Escape")
-                pg.wait_for_timeout(300)
-            for i in range(max_pages):
-                res = _page(pg, query, filters, skip=i * 6)
-                if not res:
-                    break
-                for x in res:
-                    s = _seed(x)
-                    h = s["handle"].lower()
-                    if not h or h in seen:
-                        continue
-                    seen.add(h)
-                    scanned += 1
-                    if _keep(s, require_amazon_bio):
-                        seeds.append(s)
-                        kept += 1
-                if kept >= target:
-                    break
-                # 拟人节奏：随机停顿；每 10 页一段更长的歇口，更像手动翻页
-                delay = random.uniform(page_delay * 0.7, page_delay * 1.4)
-                if i and i % 10 == 0:
-                    delay += random.uniform(4, 8)
-                pg.wait_for_timeout(int(delay * 1000))
-                pg.wait_for_timeout(400)   # 拟人节奏
-        finally:
-            b.close()
-    return {"seeds": seeds, "raw_scanned": scanned, "kept": kept, "filtered_out": scanned - kept}
+        # connect_over_cdp 附着的是用户已登录 Chrome。离开
+        # sync_playwright 上下文即断开客户端；不得调用 b.close()。
+        pg = _find_modash(b)
+        if not pg:
+            return result("no_modash_tab")
+        for _ in range(2):
+            pg.keyboard.press("Escape")
+            rhythm_sleep(0.3)
+        for i in range(max_pages):
+            page_result = _page(
+                pg,
+                query,
+                filters,
+                skip=i * 6,
+                request_timeout_ms=request_timeout_ms,
+            )
+            # 兼容旧测试/内部 monkeypatch 直接返回 results list；真实
+            # _page 始终返回带 error/status 的 envelope。
+            if isinstance(page_result, list):
+                rows, page_error = page_result, None
+            elif isinstance(page_result, dict):
+                rows = page_result.get("results")
+                page_error = page_result.get("error")
+                if not isinstance(rows, list):
+                    return result(page_error or "invalid_page_result")
+            else:
+                return result("invalid_page_result")
+            if page_error:
+                return result(page_error)
+            if not rows:
+                break
+            for x in rows:
+                s = _seed(x)
+                h = s["handle"].lower()
+                if not h or h in seen:
+                    continue
+                seen.add(h)
+                scanned += 1
+                if _keep(s, require_amazon_bio):
+                    seeds.append(s)
+                    kept += 1
+                    if quota_accept is None or quota_accept(s):
+                        accepted += 1
+            if accepted >= target:
+                break
+            # 拟人节奏：随机停顿；每 10 页一段更长的歇口，更像手动翻页
+            delay = random.uniform(page_delay * 0.7, page_delay * 1.4)
+            if i and i % 10 == 0:
+                delay += random.uniform(4, 8)
+            rhythm_sleep(delay)
+            rhythm_sleep(0.4)
+    return result()

@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import csv
 
+from ..countries import normalize_country_code
+
 
 def _find_col(col_map, candidates):
     for c in candidates:
@@ -33,7 +35,8 @@ def _f(v):
 
 
 def _country(v):
-    return str(v).strip().upper()[:2] if v and str(v).strip() else None
+    """兼容旧调用；禁止按前两字符猜测国家。"""
+    return normalize_country_code(v)
 
 
 def parse_modash_csv(path: str) -> dict:

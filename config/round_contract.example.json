@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "batch_id": "EXAMPLE-YYYYMMDD",
+  "created_at": "2026-08-10T00:00:00+0800",
+  "campaign_track": "paid",
+  "carryover_mode": "new_only",
+  "sop_version": "Client-Facing V2.0 (2026-07-13)",
+  "config": {
+    "path": "config/sop_v2.toml",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "code": {
+    "scope": "scripts/extensions/sop_v2/**/*.py + browser/export entrypoints",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "git_revision": null
+  },
+  "countries": {
+    "tier1": ["US", "CA", "UK", "DE", "IT", "FR", "ES"],
+    "tier2": ["NL", "BE", "CH", "SE"],
+    "allowed": ["US", "CA", "UK", "DE", "IT", "FR", "ES", "NL", "BE", "CH", "SE"],
+    "require_creator_equals_top_audience": true
+  },
+  "storefront": {
+    "definition": "generic_ecommerce",
+    "amazon_required": false,
+    "accepted_types": ["Amazon", "LTK", "ShopMy", "自营店", "链接聚合"],
+    "confirmed_no_eligible": true,
+    "unknown_routes_to": "Review"
+  },
+  "pricing_estimate": {
+    "metric": "mean_recent_non_pinned_reels_views",
+    "reels_window": 10,
+    "exclude_pinned": true,
+    "default_cpm_usd": 35.0,
+    "cpm_min_usd": 35.0,
+    "cpm_max_usd": 40.0,
+    "short_window_requires_reels_tab_exhaustion": true,
+    "zero_reels_status": "not_applicable_no_reels",
+    "third_party_fallback_allowed": false
+  },
+  "comment_translation": {
+    "all_source_languages": true,
+    "target_language": "zh-CN",
+    "strict_delivery": true
+  },
+  "sources": {
+    "quota_pct": {
+      "golden_lookalike": 50,
+      "generic_commerce": 30,
+      "exploration": 20
+    }
+  },
+  "dedup": {
+    "scope": "global_creator_cache",
+    "case_insensitive_handle": true,
+    "merge_multi_source_provenance": true
+  },
+  "feedback_governance": {
+    "rejection_reason_optional": true,
+    "empty_reason_is_strategy_signal": false,
+    "policy_signal_requires_internal_confirmation": true,
+    "automatic_hard_gate_changes": false
+  }
+}

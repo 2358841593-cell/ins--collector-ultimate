@@ -151,6 +151,7 @@ def test_fetch_reel_metric_passes_decimal_media_id_to_same_origin_script():
     page = _MediaInfoPage(
         {
             "http_status": 200,
+            "code": "DbQlLVNRV3K",
             "ig_play_count": 444,
             "total_play_count": 999,
         }
@@ -165,6 +166,291 @@ def test_fetch_reel_metric_passes_decimal_media_id_to_same_origin_script():
     ]
     assert result["play_count"] == 444
     assert result["play_count_source"] == "ig_media_info.ig_play_count"
+
+
+def test_collaboration_token_uses_page_og_shortcode_and_response_proof():
+    long_code = "Dbsxxpdx8a1AKZQkBUvtz0VaOdErIRRX9Qw1SI0"
+    page = _MediaInfoPage(
+        {
+            "http_status": 200,
+            "code": long_code,
+            "like_count": 3,
+            "comment_count": 23,
+        }
+    )
+
+    result = browser._fetch_reel_metric(  # noqa: SLF001
+        page,
+        f"/_thebmethod/reel/{long_code}/",
+        canonical_url=(
+            "https://www.instagram.com/_thebmethod/reel/Dbsxxpdx8a1/"
+        ),
+        canonical_source="og:url",
+    )
+
+    assert page.calls == [
+        (browser._IG_MEDIA_INFO_JS, "3957757088608274101")
+    ]
+    assert result["like_count"] == 3
+    assert result["comment_count"] == 23
+    assert result["media_identity_provenance"] == {
+        "requested_shortcode": "Dbsxxpdx8a1",
+        "original_shortcode": long_code,
+        "canonical_shortcode": "Dbsxxpdx8a1",
+        "requested_shortcode_source": "og:url",
+        "page_canonical_url": (
+            "https://www.instagram.com/_thebmethod/reel/Dbsxxpdx8a1/"
+        ),
+        "response_code": long_code,
+        "identity_verified": True,
+    }
+
+
+@pytest.mark.parametrize(
+    "canonical_url",
+    [
+        "https://evil.example/_thebmethod/reel/Dbsxxpdx8a1/",
+        "http://www.instagram.com/_thebmethod/reel/Dbsxxpdx8a1/",
+        "https://www.instagram.com/_thebmethod/p/Dbsxxpdx8a1/",
+        "https://www.instagram.com/_thebmethod/reel/UNRELATED/",
+    ],
+)
+def test_invalid_page_canonical_never_truncates_collaboration_token(
+    canonical_url,
+):
+    long_code = "Dbsxxpdx8a1AKZQkBUvtz0VaOdErIRRX9Qw1SI0"
+    page = _MediaInfoPage({"http_status": 400})
+
+    result = browser._fetch_reel_metric(  # noqa: SLF001
+        page,
+        f"/_thebmethod/reel/{long_code}/",
+        canonical_url=canonical_url,
+    )
+
+    assert page.calls == [
+        (
+            browser._IG_MEDIA_INFO_JS,
+            str(browser._shortcode_to_media_id(long_code)),
+        )
+    ]
+    assert result["play_count_status"] == "api_http_400"
+
+
+def test_canonical_media_response_identity_mismatch_fails_closed():
+    long_code = "Dbsxxpdx8a1AKZQkBUvtz0VaOdErIRRX9Qw1SI0"
+    page = _MediaInfoPage(
+        {
+            "http_status": 200,
+            "code": "DIFFERENT",
+            "like_count": 999,
+            "comment_count": 999,
+        }
+    )
+
+    result = browser._fetch_reel_metric(  # noqa: SLF001
+        page,
+        f"/_thebmethod/reel/{long_code}/",
+        canonical_url=(
+            "https://www.instagram.com/_thebmethod/reel/Dbsxxpdx8a1/"
+        ),
+    )
+
+    assert result.get("like_count") is None
+    assert result.get("comment_count") is None
+    assert result["play_count_status"] == "api_identity_mismatch"
+
+
+class _CanonicalDeepPage:
+    def wait_for_timeout(self, _milliseconds):
+        return None
+
+    def evaluate(self, script, _arg=None):
+        if script == browser._DEEP_READ_JS:
+            return {
+                "caption": "collaboration post without exposed metrics",
+                "video": True,
+                "taken_at": None,
+                "text": "",
+                "canonical_url": (
+                    "https://www.instagram.com/_thebmethod/reel/"
+                    "Dbsxxpdx8a1/"
+                ),
+                "canonical_source": "og:url",
+            }
+        raise AssertionError("unexpected page evaluation")
+
+
+def test_deep_canonical_refresh_restores_latest_collaboration_pricing_row(
+    tmp_path, monkeypatch
+):
+    long_code = "Dbsxxpdx8a1AKZQkBUvtz0VaOdErIRRX9Qw1SI0"
+    href = f"/_thebmethod/reel/{long_code}/"
+    pricing_sample = {
+        "code": href,
+        "url": f"https://www.instagram.com{href}",
+        "is_video": True,
+        "is_reel": True,
+        "pinned": None,
+        "pinned_source": None,
+        "grid_rank": 0,
+        "captured_at": "2026-08-11T10:00:00",
+        "play_count": None,
+        "play_count_status": "api_http_400",
+        "play_count_source": None,
+    }
+    monkeypatch.setattr(browser, "ROOT", tmp_path)
+    monkeypatch.setattr(
+        browser,
+        "_collect_profile_grid_refs",
+        lambda *_args, **_kwargs: ([{"url": href, "pinned": None}], None),
+    )
+
+    def fake_pricing(_page, _candidate):
+        return (
+            {
+                "refs": [{"url": href, "pinned": None}],
+                "codes": [href],
+                "pricing_reels": [pricing_sample],
+                "metric_by_href": {href: pricing_sample},
+                "sample_by_href": {href: pricing_sample},
+            },
+            None,
+        )
+
+    monkeypatch.setattr(browser, "collect_pricing_evidence", fake_pricing)
+    monkeypatch.setattr(browser, "_goto", lambda *_args: True)
+    monkeypatch.setattr(browser, "_pause", lambda *_args: None)
+    monkeypatch.setattr(browser, "_cache_save", lambda *_args: None)
+
+    def canonical_metric(_page, metric_href, **kwargs):
+        assert metric_href == href
+        assert kwargs == {
+            "canonical_url": (
+                "https://www.instagram.com/_thebmethod/reel/"
+                "Dbsxxpdx8a1/"
+            ),
+            "canonical_source": "og:url",
+        }
+        return {
+            "play_count": 12_345,
+            "play_count_status": "observed",
+            "play_count_source": "ig_media_info.ig_play_count",
+            "play_count_raw": "ig=12345;total=12345;fb=0",
+            "ig_play_count": 12_345,
+            "total_play_count": 12_345,
+            "fb_play_count": 0,
+            "like_count": 3,
+            "comment_count": 0,
+            "pinned": False,
+            "pinned_source": "ig_media_info_pin_lists",
+            "taken_at": 1_786_000_000,
+            "like_and_view_counts_disabled": True,
+            "media_identity_provenance": {
+                "requested_shortcode": "Dbsxxpdx8a1",
+                "requested_shortcode_source": "og:url",
+                "page_canonical_url": (
+                    "https://www.instagram.com/_thebmethod/reel/"
+                    "Dbsxxpdx8a1/"
+                ),
+                "response_code": long_code,
+                "identity_verified": True,
+            },
+        }
+
+    monkeypatch.setattr(browser, "_fetch_reel_metric", canonical_metric)
+
+    result, _evidence = browser.deep_collect(
+        _CanonicalDeepPage(),
+        {"handle": "diana_wellnessroute"},
+        tmp_path / "data/evidence/BATCH/diana_wellnessroute",
+        n_posts=1,
+    )
+
+    refreshed = result["pricing_reel_samples"][0]
+    assert refreshed["code"] == href
+    assert refreshed["play_count"] == 12_345
+    assert refreshed["play_count_source"] == (
+        "ig_media_info.ig_play_count"
+    )
+    assert refreshed["pinned"] is False
+    assert refreshed["taken_at"] == 1_786_000_000
+    assert refreshed["media_identity_provenance"]["identity_verified"] is True
+    assert result["pricing_estimate"]["sample_count"] == 1
+    assert result["pricing_estimate"]["reels"][0]["play_count"] == 12_345
+
+
+def test_pricing_alias_refresh_rejects_unverified_response_bundle():
+    sample = {
+        "play_count": None,
+        "play_count_status": "api_http_400",
+        "pinned": None,
+    }
+    before = dict(sample)
+
+    refreshed = browser._refresh_pricing_sample_from_verified_alias(  # noqa: SLF001
+        sample,
+        {
+            "play_count": 999_999,
+            "play_count_status": "observed",
+            "pinned": False,
+            "media_identity_provenance": {
+                "page_canonical_url": "https://www.instagram.com/reel/SHORT/",
+                "identity_verified": False,
+            },
+        },
+    )
+
+    assert refreshed is False
+    assert sample == before
+
+
+@pytest.mark.parametrize(
+    "sample",
+    [
+        {
+            "code": "/owner/reel/Dbsxxpdx8a1/",
+            "play_count": None,
+            "play_count_status": "api_http_400",
+            "pinned": None,
+        },
+        {
+            "code": (
+                "/_thebmethod/reel/"
+                "Dbsxxpdx8a1AKZQkBUvtz0VaOdErIRRX9Qw1SI0/"
+            ),
+            "play_count": 111,
+            "play_count_status": "observed",
+            "pinned": False,
+        },
+    ],
+)
+def test_verified_alias_never_overwrites_standard_or_observed_pricing_sample(
+    sample,
+):
+    before = dict(sample)
+    fresh = {
+        "play_count": 999,
+        "play_count_status": "observed",
+        "play_count_source": "ig_media_info.ig_play_count",
+        "pinned": False,
+        "media_identity_provenance": {
+            "requested_shortcode": "Dbsxxpdx8a1",
+            "requested_shortcode_source": "og:url",
+            "page_canonical_url": (
+                "https://www.instagram.com/_thebmethod/reel/"
+                "Dbsxxpdx8a1/"
+            ),
+            "response_code": (
+                "Dbsxxpdx8a1AKZQkBUvtz0VaOdErIRRX9Qw1SI0"
+            ),
+            "identity_verified": True,
+        },
+    }
+
+    assert browser._refresh_pricing_sample_from_verified_alias(  # noqa: SLF001
+        sample, fresh
+    ) is False
+    assert sample == before
 
 
 def test_fetch_reel_metric_exception_stays_missing_instead_of_becoming_zero():
@@ -221,11 +507,34 @@ class _GridPage:
     def wait_for_timeout(self, _ms):
         return None
 
-    def evaluate(self, script):
-        assert script == browser._GRID_JS
+    def evaluate(self, script, *_args):
+        if script == browser._GRID_JS:
+            return {
+                "logged_out": False,
+                "challenge": False,
+                "private_account": False,
+                "error_page": False,
+                "page_identity_verified": True,
+                "reels_tab_route_verified": True,
+                "page_healthy": True,
+                "profile_healthy": True,
+                "redirected_to_profile": False,
+                "reels_tab_link_present": True,
+                "reel_links_seen": sum(
+                    "/reel/" in row["url"] for row in self.refs
+                ),
+                "visible_feed_posts": sum(
+                    "/p/" in row["url"] for row in self.refs
+                ),
+                "post_refs": self.refs,
+            }
+        assert script == browser._REELS_SCROLL_STATE_JS
         return {
-            "logged_out": False,
-            "post_refs": self.refs,
+            "scroll_top": 100,
+            "viewport_height": 100,
+            "scroll_height": 200,
+            "at_bottom": True,
+            "loading_visible": False,
         }
 
 
@@ -241,13 +550,233 @@ def test_pricing_grid_uses_reels_tab_not_profile_main_grid(monkeypatch):
         for i in range(13)
     ]
 
-    result, error = browser._collect_grid_refs(  # noqa: SLF001
+    result, error, evidence = browser._collect_grid_refs(  # noqa: SLF001
         _GridPage(refs), "owner", min_non_pinned_reels=13
     )
 
     assert error is None
     assert len(result) == 13
+    assert evidence["status"] == "target_reached"
+    assert evidence["page_identity_verified"] is True
     assert visited == ["https://www.instagram.com/owner/reels/"]
+
+
+class _ExhaustionMouse:
+    def __init__(self, page):
+        self.page = page
+
+    def wheel(self, _x, _y):
+        self.page.scrolls += 1
+
+
+class _ExhaustionPage:
+    def __init__(self, refs, *, empty_marker=None, **health):
+        self.refs = refs
+        self.empty_marker = empty_marker
+        self.health = health
+        self.scrolls = 0
+        self.mouse = _ExhaustionMouse(self)
+
+    def wait_for_timeout(self, _ms):
+        return None
+
+    def evaluate(self, script, *_args):
+        if script == browser._GRID_JS:
+            result = {
+                "logged_out": False,
+                "challenge": False,
+                "private_account": False,
+                "error_page": False,
+                "page_identity_verified": True,
+                "reels_tab_route_verified": True,
+                "page_healthy": True,
+                "post_refs": self.refs,
+                "empty_state_verified": self.empty_marker is not None,
+                "empty_reels_marker": self.empty_marker,
+                "observed_handle": "owner",
+                "final_pathname": "/owner/reels/",
+            }
+            result.update(self.health)
+            return result
+        assert script == browser._REELS_SCROLL_STATE_JS
+        return {
+            "scroll_top": 900,
+            "viewport_height": 100,
+            "scroll_height": 1_000,
+            "at_bottom": True,
+            "loading_visible": False,
+        }
+
+
+def test_grid_exhaustion_requires_two_real_bottom_no_growth_scrolls(monkeypatch):
+    monkeypatch.setattr(browser, "_goto", lambda *_args: True)
+    refs = [{"url": f"/owner/reel/R{i}/", "pinned": None} for i in range(5)]
+    page = _ExhaustionPage(refs)
+
+    result, error, evidence = browser._collect_grid_refs(  # noqa: SLF001
+        page, "owner", min_non_pinned_reels=13
+    )
+
+    assert error is None
+    assert len(result) == 5
+    assert page.scrolls == 2
+    assert evidence["status"] == "exhausted"
+    assert evidence["reason"] == "stable_bottom_no_growth"
+    assert evidence["stable_bottom_rounds"] == 2
+    assert evidence["scroll_attempts"] == 2
+    assert evidence["page_healthy"] is True
+
+
+def test_empty_grid_records_explicit_healthy_empty_marker(monkeypatch):
+    monkeypatch.setattr(browser, "_goto", lambda *_args: True)
+    page = _ExhaustionPage([], empty_marker="No Reels Yet")
+
+    refs, error, evidence = browser._collect_grid_refs(  # noqa: SLF001
+        page, "owner", min_non_pinned_reels=13
+    )
+
+    assert refs == []
+    assert error is None
+    assert evidence["status"] == "exhausted"
+    assert evidence["empty_state_verified"] is True
+    assert evidence["empty_reels_marker"] == "No Reels Yet"
+
+
+def test_healthy_profile_redirect_without_reels_tab_is_strict_no_reels_proof(
+    monkeypatch,
+):
+    navigations = []
+    monkeypatch.setattr(
+        browser,
+        "_goto",
+        lambda _page, url: navigations.append(url) or True,
+    )
+    page = _ExhaustionPage(
+        [{"url": f"/owner/p/P{i}/", "pinned": None} for i in range(12)],
+        reels_tab_route_verified=False,
+        page_healthy=False,
+        profile_healthy=True,
+        redirected_to_profile=True,
+        final_pathname="/owner/",
+        reels_tab_link_present=False,
+        reel_links_seen=0,
+        visible_feed_posts=12,
+    )
+
+    refs, error, evidence = browser._collect_grid_refs(  # noqa: SLF001
+        page, "owner", min_non_pinned_reels=13
+    )
+
+    assert refs == []
+    assert error is None
+    assert page.scrolls == 0
+    assert navigations == [
+        "https://www.instagram.com/owner/reels/",
+        "https://www.instagram.com/owner/reels/",
+    ]
+    assert evidence["status"] == "reels_surface_absent"
+    assert evidence["profile_probe_rounds"] == 2
+    assert evidence["reels_surface_probe_navigations"] == 2
+    assert evidence["unique_feed_posts_seen"] == 12
+    assert evidence["reels_tab_link_present"] is False
+    assert evidence["reel_links_seen"] == 0
+    snapshots = evidence["reels_surface_probe_snapshots"]
+    assert [row["navigation_index"] for row in snapshots] == [1, 2]
+    assert [row["feed_post_count"] for row in snapshots] == [12, 12]
+    assert all(row["feed_post_identities"] for row in snapshots)
+    assert all(row["feed_post_identity_sha256"] for row in snapshots)
+
+
+def test_surface_absent_does_not_reuse_first_navigation_feed_posts(
+    monkeypatch,
+):
+    monkeypatch.setattr(browser, "_goto", lambda *_args: True)
+
+    class FirstGoodSecondEmpty(_ExhaustionPage):
+        def __init__(self):
+            super().__init__(
+                [{"url": f"/owner/p/P{i}/", "pinned": None} for i in range(12)],
+                reels_tab_route_verified=False,
+                page_healthy=False,
+                profile_healthy=True,
+                redirected_to_profile=True,
+                final_pathname="/owner/",
+                reels_tab_link_present=False,
+                reel_links_seen=0,
+                visible_feed_posts=12,
+            )
+            self.grid_reads = 0
+
+        def evaluate(self, script, *_args):
+            if script == browser._GRID_JS:
+                self.grid_reads += 1
+                if self.grid_reads == 2:
+                    self.refs = []
+                    self.health["visible_feed_posts"] = 0
+            return super().evaluate(script, *_args)
+
+    _, error, evidence = browser._collect_grid_refs(  # noqa: SLF001
+        FirstGoodSecondEmpty(), "owner", min_non_pinned_reels=13
+    )
+
+    assert error == "profile_redirect_without_no_reels_proof"
+    assert evidence["status"] == "failed"
+    assert evidence["profile_probe_rounds"] == 0
+    assert [
+        row["feed_post_count"]
+        for row in evidence["reels_surface_probe_snapshots"]
+    ] == [12, 0]
+
+
+def test_profile_redirect_with_reels_tab_link_is_not_no_reels_proof(monkeypatch):
+    monkeypatch.setattr(browser, "_goto", lambda *_args: True)
+    page = _ExhaustionPage(
+        [{"url": "/owner/p/P0/", "pinned": None}],
+        reels_tab_route_verified=False,
+        page_healthy=False,
+        profile_healthy=True,
+        redirected_to_profile=True,
+        final_pathname="/owner/",
+        reels_tab_link_present=True,
+        reel_links_seen=0,
+        visible_feed_posts=1,
+    )
+
+    _, error, evidence = browser._collect_grid_refs(  # noqa: SLF001
+        page, "owner", min_non_pinned_reels=13
+    )
+
+    assert error == "profile_redirect_without_no_reels_proof"
+    assert evidence["status"] == "failed"
+
+
+@pytest.mark.parametrize(
+    ("health", "error"),
+    [
+        ({"challenge": True, "page_healthy": False}, "challenge"),
+        ({"logged_out": True, "page_healthy": False}, "logged_out"),
+        ({"private_account": True, "page_healthy": False}, "private_account"),
+        ({"error_page": True, "page_healthy": False}, "error_page"),
+        (
+            {"page_identity_verified": False, "page_healthy": False},
+            "profile_identity_mismatch",
+        ),
+        ({"page_healthy": False}, "reels_tab_unhealthy"),
+    ],
+)
+def test_error_or_wrong_profile_page_never_emits_exhaustion(
+    monkeypatch, health, error
+):
+    monkeypatch.setattr(browser, "_goto", lambda *_args: True)
+    page = _ExhaustionPage([], **health)
+
+    _, actual_error, evidence = browser._collect_grid_refs(  # noqa: SLF001
+        page, "owner", min_non_pinned_reels=13
+    )
+
+    assert actual_error == error
+    assert evidence["status"] == "failed"
+    assert evidence["reason"] == error
 
 
 def test_relative_and_absolute_reel_urls_dedupe_to_one_identity():
@@ -285,6 +814,12 @@ def test_pricing_collection_does_not_replace_core_post_window(monkeypatch):
         lambda *_args, **_kwargs: (
             [{"url": "/owner/reel/PRICE_REEL/", "pinned": None}],
             None,
+            {
+                "schema_version": 1,
+                "source": "instagram_reels_tab_grid",
+                "status": "target_reached",
+                "reason": "requested_window_reached",
+            },
         ),
     )
     monkeypatch.setattr(
@@ -310,6 +845,57 @@ def test_pricing_collection_does_not_replace_core_post_window(monkeypatch):
     assert cand["pricing_estimate"]["status"] == "partial"
 
 
+def test_pricing_collection_fetches_media_info_for_pinned_reel(monkeypatch):
+    cand = {"handle": "owner"}
+    pinned_href = "/owner/reel/PINNED_REEL/"
+    monkeypatch.setattr(
+        browser,
+        "_collect_grid_refs",
+        lambda *_args, **_kwargs: (
+            [{"url": pinned_href, "pinned": True}],
+            None,
+            {
+                "schema_version": 1,
+                "source": "instagram_reels_tab_grid",
+                "status": "target_reached",
+                "reason": "requested_window_reached",
+            },
+        ),
+    )
+    calls = []
+
+    def pinned_metric(_page, href, **_kwargs):
+        calls.append(href)
+        return {
+            "play_count": None,
+            "play_count_status": "ig_not_exposed",
+            "play_count_source": None,
+            "pinned": True,
+            "pinned_source": "ig_media_info_pin_lists",
+            "taken_at": 123,
+            "media_identity_provenance": {
+                "requested_shortcode": "PINNED_REEL",
+                "original_shortcode": "PINNED_REEL",
+                "canonical_shortcode": None,
+                "response_code": "PINNED_REEL",
+                "identity_verified": True,
+            },
+        }
+
+    monkeypatch.setattr(browser, "_fetch_reel_metric", pinned_metric)
+    monkeypatch.setattr(browser, "_pause", lambda *_args: None)
+
+    state, error = browser.collect_pricing_evidence(object(), cand)
+
+    assert error is None
+    assert calls == [pinned_href]
+    assert state["pricing_reels"][0]["pinned"] is True
+    assert state["pricing_reels"][0]["pinned_source"] == (
+        "ig_media_info_pin_lists"
+    )
+    assert state["pricing_reels"][0]["play_count"] is None
+
+
 def test_pricing_evidence_rank_prevents_deep_recollect_regression():
     assert browser._pricing_evidence_rank(  # noqa: SLF001
         {"status": "complete", "sample_count": 10}
@@ -322,3 +908,26 @@ def test_pricing_evidence_rank_prevents_deep_recollect_regression():
         {"status": "fallback_modash", "sample_count": 0}
     )
     assert browser._pricing_evidence_rank(None) == (0, 0)  # noqa: SLF001
+
+
+def test_forged_empty_grid_terminal_cannot_outrank_existing_partial_five():
+    partial = {"status": "partial", "sample_count": 5}
+    forged_no_reels = {
+        "status": "not_applicable_no_reels",
+        "sample_count": 0,
+        "quote_usd": {"default": None, "min": None, "max": None},
+    }
+    forged_candidate = {
+        "pricing_estimate": forged_no_reels,
+        "pricing_reel_samples": [],
+        "pricing_reels_tab_evidence": {
+            "status": "exhausted",
+            "at_bottom": True,
+            # Deliberately lacks identity/page-health/explicit-empty proof.
+        },
+    }
+
+    assert browser._pricing_evidence_rank(  # noqa: SLF001
+        forged_no_reels, forged_candidate
+    ) == (0, 0)
+    assert browser._pricing_evidence_rank(partial) > (0, 0)  # noqa: SLF001
