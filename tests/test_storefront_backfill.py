@@ -114,6 +114,29 @@ def _account_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
     return shallow, deep, profiles
 
 
+def _account_fixture_many(
+    tmp_path: Path, count: int = 6
+) -> tuple[Path, Path, Path, tuple[str, ...]]:
+    usernames = tuple(f"shallow_{index}" for index in range(count))
+    shallow = tmp_path / "accounts-shallow-many.txt"
+    deep = tmp_path / "accounts-deep-many.txt"
+    shallow.write_text(
+        "".join(
+            f"{username}|pw|totp|sessionid=session-{index}; ds_user_id={1000 + index}\n"
+            for index, username in enumerate(usernames)
+        ),
+        encoding="utf-8",
+    )
+    deep.write_text(
+        "deep_many|pw|totp|sessionid=deep-session; ds_user_id=9000\n",
+        encoding="utf-8",
+    )
+    profiles = tmp_path / "profiles-many"
+    for username in (*usernames, "deep_many"):
+        (profiles / username).mkdir(parents=True, exist_ok=True)
+    return shallow, deep, profiles, usernames
+
+
 def _proxy(*, session: str, ttl: int) -> dict[str, str]:
     assert session
     assert ttl > 0
@@ -290,6 +313,101 @@ def _collect(
         lease_api=lease_api,
     )
     return plan, plan_path, lease_db
+
+
+def _unknown(handle: str, *_args) -> dict:
+    result = _no(handle)
+    result["evidence"]["failures"] = ["external_target_incomplete"]
+    result["evidence"]["target_checks_complete"] = False
+    return result
+
+
+def _legacy_plan(plan: dict, path: Path) -> dict:
+    legacy = copy.deepcopy(plan)
+    legacy["schema"] = backfill.LEGACY_PLAN_SCHEMA
+    legacy["collection_contract"].pop("shallow_account_count", None)
+    legacy.pop("resume", None)
+    for row in legacy["rows"]:
+        row.pop("provenance", None)
+    legacy["plan_sha256"] = backfill.plan_sha256(legacy)
+    path.write_text(
+        json.dumps(legacy, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return legacy
+
+
+def _collect_many(
+    tmp_path: Path,
+    db: Path,
+    *,
+    handles: tuple[str, ...],
+    plan_name: str,
+    probe,
+    prior_plan: Path | None = None,
+    expected_prior_sha: str | None = None,
+    per_account: int = 6,
+) -> tuple[dict, Path, tuple[str, ...]]:
+    shallow, deep, profiles, usernames = _account_fixture_many(tmp_path)
+    plan_path = tmp_path / plan_name
+    plan = backfill.collect_plan(
+        db_path=db,
+        batch_id=BATCH,
+        expected_status="decided",
+        expected_count=len(handles),
+        expected_handle_set_sha256=backfill.handle_set_sha256(handles),
+        plan_path=plan_path,
+        accounts_file=shallow,
+        deep_accounts_file=deep,
+        profile_root=profiles,
+        lease_db=tmp_path / "resource-leases-many.db",
+        per_account=per_account,
+        lease_ttl_seconds=3,
+        heartbeat_seconds=1,
+        probe_candidate=probe,
+        proxy_loader=_proxy,
+        prior_plan_path=prior_plan,
+        expected_prior_plan_sha256=expected_prior_sha,
+    )
+    return plan, plan_path, usernames
+
+
+def _resolved_resume_fixture(tmp_path: Path) -> tuple[Path, tuple[str, ...], dict, Path]:
+    handles = tuple(f"resume_{index:02d}" for index in range(8))
+    unresolved = frozenset(handles[-2:])
+    db = tmp_path / "resume-creators.db"
+    _create_db(db, handles=handles)
+
+    def initial_probe(handle, *_args):
+        return _unknown(handle) if handle in unresolved else _yes(handle)
+
+    initial, _, _ = _collect_many(
+        tmp_path,
+        db,
+        handles=handles,
+        plan_name="resume-source-v2.plan.json",
+        probe=initial_probe,
+    )
+    prior_path = tmp_path / "resume-source-v1.plan.json"
+    prior = _legacy_plan(initial, prior_path)
+    resolved, resolved_path, _ = _collect_many(
+        tmp_path,
+        db,
+        handles=handles,
+        plan_name="resume-resolved-v2.plan.json",
+        probe=_yes,
+        prior_plan=prior_path,
+        expected_prior_sha=prior["plan_sha256"],
+    )
+    return db, handles, resolved, resolved_path
+
+
+def _write_rehashed_plan(path: Path, plan: dict) -> None:
+    plan["plan_sha256"] = backfill.plan_sha256(plan)
+    path.write_text(
+        json.dumps(plan, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _db_digest(path: Path) -> str:
@@ -789,6 +907,8 @@ def test_multilingual_more_count_and_unfiltered_popup_links():
                     "text": "example.com und 2 weitere Links",
                     "popup": "dialog",
                     "expanded": "false",
+                    "interactive": True,
+                    "trusted_surface": True,
                 }
             ]
 
@@ -813,6 +933,7 @@ def test_plain_domain_and_number_text_is_not_hidden_link_evidence():
                     "popup": "",
                     "expanded": "",
                     "interactive": False,
+                    "trusted_surface": False,
                 }
             ]
 
@@ -839,6 +960,7 @@ def test_unknown_locale_domain_and_number_requires_a_real_control():
                     "popup": "",
                     "expanded": "",
                     "interactive": True,
+                    "trusted_surface": True,
                 }
             ]
 
@@ -864,7 +986,8 @@ def test_known_locale_declared_count_remains_authoritative_without_dom_control()
                     "text": "creator.example and 2 more",
                     "popup": "",
                     "expanded": "",
-                    "interactive": False,
+                    "interactive": True,
+                    "trusted_surface": True,
                 }
             ]
 
@@ -877,6 +1000,250 @@ def test_known_locale_declared_count_remains_authoritative_without_dom_control()
     assert has_more is True
     assert declared == 2
     assert evidence["ambiguous"] is False
+
+
+@pytest.mark.parametrize(
+    ("profile", "dom_items"),
+    [
+        (
+            {
+                "_bio_link_label": "youtube.com/@blondiemoustache",
+                "_bio_has_more": False,
+                "_bio_more_count": None,
+            },
+            [
+                {
+                    "text": "mi trucco tanto (+350k) un nuovo video... more youtube.com/@blondiemoustache",
+                    "popup": "",
+                    "expanded": "",
+                    "interactive": False,
+                    "trusted_surface": False,
+                },
+                {
+                    "text": "LINK Bambi Vol 3 Bambi vol. 2 Bambi Vol 1",
+                    "popup": "",
+                    "expanded": "",
+                    "interactive": False,
+                    "trusted_surface": False,
+                },
+            ],
+        ),
+        (
+            {"_bio_has_more": False, "_bio_more_count": None},
+            [
+                {
+                    "text": "more glow-up: TikTok csilla.zs 93k CSILLA4000 CSILLA10... more",
+                    "popup": "",
+                    "expanded": "",
+                    "interactive": True,
+                    "trusted_surface": False,
+                }
+            ],
+        ),
+        (
+            {"_bio_has_more": False, "_bio_more_count": None},
+            [
+                {
+                    "text": "TikTok pesukarhukissa 160k essileppanen@gmail... more",
+                    "popup": "",
+                    "expanded": "",
+                    "interactive": False,
+                    "trusted_surface": False,
+                }
+            ],
+        ),
+        (
+            {
+                "_bio_link_label": "skin-constructor.sitepulse.com.ua",
+                "_bio_has_more": False,
+                "_bio_more_count": None,
+            },
+            [
+                {
+                    "text": "Pravik10 korean_story_official... more skin-constructor.sitepulse.com.ua",
+                    "popup": "",
+                    "expanded": "",
+                    "interactive": False,
+                    "trusted_surface": False,
+                }
+            ],
+        ),
+        (
+            {"_bio_has_more": False, "_bio_more_count": None},
+            [
+                {
+                    "text": "Avis 100% honnêtes vallymary@hotmail.fr... more",
+                    "popup": "",
+                    "expanded": "",
+                    "interactive": True,
+                    "trusted_surface": False,
+                },
+                {
+                    "text": "hellofresh.fr florame.com 2025 nouveauté",
+                    "popup": "",
+                    "expanded": "",
+                    "interactive": False,
+                    "trusted_surface": False,
+                },
+            ],
+        ),
+    ],
+    ids=[
+        "blondiemoustache",
+        "csilla-zs",
+        "pesukarhukissa",
+        "pravik-kateryna",
+        "vallymary00",
+    ],
+)
+def test_real_biography_show_more_and_highlight_shapes_are_not_link_declarations(
+    profile, dom_items
+):
+    import browser_collect_v2 as browser_collect
+
+    class CapturedDomPage:
+        def evaluate(self, _script):
+            return dom_items
+
+    has_more, declared, evidence = backfill._bio_more_declaration(
+        CapturedDomPage(),
+        profile,
+        parse_count=browser_collect._bio_more_count,
+    )
+
+    assert has_more is False
+    assert declared is None
+    assert evidence["ambiguous"] is False
+    assert evidence["popup_signal"] is False
+    assert evidence["interactive_label_count"] == 0
+    assert evidence["interactive_generic_signal"] is False
+
+
+def test_bykusum_domain_leading_and_n_more_control_remains_authoritative():
+    import browser_collect_v2 as browser_collect
+
+    label = "www.tiktok.com/@kusumghising5 and 3 more"
+
+    class ByKusumBioLinkPage:
+        def evaluate(self, _script):
+            return [
+                {
+                    "text": label,
+                    "popup": "",
+                    "expanded": "",
+                    "interactive": True,
+                    "trusted_surface": True,
+                }
+            ]
+
+    has_more, declared, evidence = backfill._bio_more_declaration(
+        ByKusumBioLinkPage(),
+        {
+            "_bio_link_label": label,
+            "_bio_has_more": True,
+            "_bio_more_count": 3,
+        },
+        parse_count=browser_collect._bio_more_count,
+    )
+
+    assert has_more is True
+    assert declared == 3
+    assert evidence["ambiguous"] is False
+    assert evidence["interactive_label_count"] == 1
+
+
+def test_real_dom_bio_link_boundary_rejects_show_more_and_story_surfaces():
+    import browser_collect_v2 as browser_collect
+    from playwright.sync_api import sync_playwright
+
+    negative_cases = [
+        (
+            {
+                "_bio_link_label": "youtube.com/@blondiemoustache",
+                "_bio_has_more": False,
+                "_bio_more_count": None,
+            },
+            """
+            <div>mi trucco tanto (+350k) un nuovo video... more</div>
+            <div role="menu"><button>LINK Bambi Vol 3 Bambi vol. 2</button></div>
+            """,
+        ),
+        (
+            {"_bio_has_more": False, "_bio_more_count": None},
+            '<div role="button">more glow-up: csilla.zs 93k CSILLA4000... more</div>',
+        ),
+        (
+            {"_bio_has_more": False, "_bio_more_count": None},
+            '<div>TikTok pesukarhukissa 160k essileppanen@gmail... more</div>',
+        ),
+        (
+            {
+                "_bio_link_label": "skin-constructor.sitepulse.com.ua",
+                "_bio_has_more": False,
+                "_bio_more_count": None,
+            },
+            '<div>Pravik10 korean_story_official... more</div>',
+        ),
+        (
+            {"_bio_has_more": False, "_bio_more_count": None},
+            """
+            <div role="button">Avis 100% honnêtes vallymary@hotmail.fr... more</div>
+            <div role="presentation"><button>hellofresh.fr links 2025</button></div>
+            """,
+        ),
+        (
+            {"_bio_has_more": False, "_bio_more_count": None},
+            '<button aria-expanded="false">Creator links 2025... more</button>',
+        ),
+        (
+            {"_bio_has_more": False, "_bio_more_count": None},
+            '<button aria-expanded="false">creator.example</button>',
+        ),
+    ]
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(channel="chrome", headless=True)
+        page = browser.new_page()
+        try:
+            for profile, surface in negative_cases:
+                page.set_content(f"<main><section>{surface}</section></main>")
+                has_more, declared, evidence = backfill._bio_more_declaration(
+                    page,
+                    profile,
+                    parse_count=browser_collect._bio_more_count,
+                )
+                assert has_more is False
+                assert declared is None
+                assert evidence["popup_signal"] is False
+
+            page.set_content(
+                "<main><header><button>"
+                "www.tiktok.com/@kusumghising5 and 3 more"
+                "</button></header></main>"
+            )
+            has_more, declared, evidence = backfill._bio_more_declaration(
+                page,
+                {"_bio_has_more": False, "_bio_more_count": None},
+                parse_count=browser_collect._bio_more_count,
+            )
+            assert has_more is True
+            assert declared == 3
+            assert evidence["popup_signal"] is False
+
+            page.set_content(
+                '<main><section><button aria-haspopup="dialog">'
+                "Links</button></section></main>"
+            )
+            has_more, declared, evidence = backfill._bio_more_declaration(
+                page,
+                {"_bio_has_more": False, "_bio_more_count": None},
+                parse_count=browser_collect._bio_more_count,
+            )
+            assert has_more is True
+            assert declared is None
+            assert evidence["popup_signal"] is True
+        finally:
+            browser.close()
 
 
 def test_probe_result_rejects_schema_and_internal_verdict_evidence_conflicts():
@@ -1193,6 +1560,85 @@ class _NeutralOnlyPage:
         self.neutral_navigation_calls += 1
         self.url = "about:blank"
         return _FakeResponse(200)
+
+
+@pytest.mark.parametrize(
+    ("direct_url", "kind"),
+    [
+        ("https://www.myyshop.com/p/d5397b5b", "链接聚合"),
+        ("https://creator.myyfinds.io/skin-picks", "链接聚合"),
+        ("https://angies.sumupstore.com/", "自营店"),
+    ],
+)
+def test_verified_direct_storefront_is_existential_without_target_navigation(
+    direct_url, kind
+):
+    runtime = backfill._BrowserProbeRuntime(
+        credentials={},
+        proxy_loader=_proxy,
+        headless=True,
+        resolver=lambda _host: ["8.8.8.8"],
+    )
+    page = _NeutralOnlyPage()
+    _activate_proxy_runtime(runtime, pages=(page,))
+
+    direct = runtime._target_check(page, direct_url)
+
+    assert direct == {
+        "source_url": direct_url,
+        "status": "succeeded",
+        "final_url": direct_url,
+        "commerce_links": [{"url": direct_url, "type": kind}],
+        "note": "recognized_direct_url",
+        "page_health": {
+            "healthy": True,
+            "reason": "navigation_not_required_recognized_url",
+        },
+    }
+    assert page.external_navigation_calls == 0
+
+    failed_other = "https://example.com/access-controlled"
+    resolved = backfill.resolve_observation(
+        handle="alpha",
+        profile={
+            "handle": "alpha",
+            "external_url": failed_other,
+            "_bio_has_more": True,
+            "_bio_more_count": 1,
+            **_verified_flags(),
+        },
+        profile_url="https://instagram.com/alpha/",
+        expanded_links=[direct_url],
+        expansion_succeeded=True,
+        observed_links=[failed_other, direct_url],
+        raw_observed_link_count=2,
+        terminal_observed_link_count=2,
+        target_checks=[
+            {
+                "source_url": failed_other,
+                "status": "failed",
+                "http_status": 403,
+                "commerce_links": [],
+                "note": "external_http_error",
+                "page_health": {
+                    "healthy": False,
+                    "reason": "external_http_error",
+                },
+            },
+            direct,
+        ],
+    )
+
+    assert resolved["status"] == "confirmed_yes"
+    assert resolved["storefront_url"] == direct_url
+    assert resolved["storefront_type"] == kind
+    assert resolved["evidence"]["failures"] == []
+    assert resolved["evidence"]["partial_failures"] == [
+        "external_target_incomplete"
+    ]
+    assert backfill._validate_probe_result(resolved, handle="alpha")["status"] == (
+        "confirmed_yes"
+    )
 
 
 class _OrdinaryPage:
@@ -2191,6 +2637,369 @@ def test_unresolved_collect_writes_non_applicable_plan_and_apply_refuses(tmp_pat
             expected_count=2,
             plan_path=plan_path,
             expected_plan_sha256=plan["plan_sha256"],
+        )
+    assert _db_digest(db) == before
+
+
+def test_resume_reuses_61_reprobes_only_7_on_unused_accounts_and_applies_all(
+    tmp_path,
+):
+    handles = tuple(f"creator_{index:02d}" for index in range(68))
+    unresolved = frozenset(handles[-7:])
+    db = tmp_path / "creators.db"
+    _create_db(db, handles=handles)
+
+    def initial_probe(handle, *_args):
+        if handle in unresolved:
+            return _unknown(handle)
+        return _yes(handle) if int(handle[-2:]) % 2 == 0 else _no(handle)
+
+    initial, _, usernames = _collect_many(
+        tmp_path,
+        db,
+        handles=handles,
+        plan_name="partial-v2.plan.json",
+        probe=initial_probe,
+    )
+    assert initial["unresolved_count"] == 7
+    legacy_path = tmp_path / "partial-v1.plan.json"
+    legacy = _legacy_plan(initial, legacy_path)
+    prior_by_handle = {row["handle"]: row for row in legacy["rows"]}
+    calls: list[tuple[str, str]] = []
+
+    def resumed_probe(handle, account, _heartbeat):
+        calls.append((handle, account.username))
+        return _yes(handle)
+
+    resumed, resumed_path, _ = _collect_many(
+        tmp_path,
+        db,
+        handles=handles,
+        plan_name="resumed-v2.plan.json",
+        probe=resumed_probe,
+        prior_plan=legacy_path,
+        expected_prior_sha=legacy["plan_sha256"],
+    )
+
+    assert len(calls) == 7
+    assert {handle for handle, _ in calls} == unresolved
+    assert not ({handle for handle, _ in calls} & set(handles[:-7]))
+    username_to_slot = {username: slot for slot, username in enumerate(usernames)}
+    for handle, username in calls:
+        old_slots = {
+            item["account_slot"]
+            for item in prior_by_handle[handle]["result"]["evidence"]["attempts"]
+        }
+        assert username_to_slot[username] not in old_slots
+    assert len(resumed["rows"]) == 68
+    assert resumed["unresolved_count"] == 0
+    assert resumed["apply_allowed"] is True
+    assert resumed["resume"]["reused_count"] == 61
+    assert resumed["resume"]["recollected_count"] == 7
+    assert resumed["plan_sha256"] == backfill.plan_sha256(resumed_path)
+    for row in resumed["rows"]:
+        provenance = row["provenance"]
+        if row["handle"] in unresolved:
+            assert provenance["decision_source"] == "current_run"
+            assert provenance["result_attempt_origin"] == "current_run"
+            assert provenance["prior_status"] == "unknown"
+            assert provenance["prior_attempts"]
+            assert provenance["current_attempts"]
+        else:
+            assert provenance["decision_source"] == "prior_plan"
+            assert provenance["result_attempt_origin"] == "prior_plan"
+            assert provenance["current_attempts"] == []
+
+    applied = backfill.apply_plan(
+        db_path=db,
+        batch_id=BATCH,
+        expected_count=68,
+        plan_path=resumed_path,
+        expected_plan_sha256=resumed["plan_sha256"],
+    )
+    assert applied["applied_count"] == 68
+    assert {
+        row["storefront_status"] for row in _rows(db).values()
+    } <= {"confirmed_yes", "confirmed_no"}
+
+
+def test_resume_requires_prior_path_and_external_sha_as_a_pair(tmp_path):
+    db = tmp_path / "creators.db"
+    _create_db(db)
+    shallow, deep, profiles = _account_fixture(tmp_path)
+    common = dict(
+        db_path=db,
+        batch_id=BATCH,
+        expected_count=2,
+        expected_handle_set_sha256=backfill.handle_set_sha256(("alpha", "beta")),
+        accounts_file=shallow,
+        deep_accounts_file=deep,
+        profile_root=profiles,
+        lease_db=tmp_path / "lease.db",
+        probe_candidate=_mixed_probe,
+        proxy_loader=_proxy,
+    )
+    with pytest.raises(backfill.StorefrontBackfillError, match="supplied together"):
+        backfill.collect_plan(
+            **common,
+            plan_path=tmp_path / "missing-sha.plan.json",
+            prior_plan_path=tmp_path / "prior.plan.json",
+        )
+    with pytest.raises(backfill.StorefrontBackfillError, match="supplied together"):
+        backfill.collect_plan(
+            **common,
+            plan_path=tmp_path / "missing-path.plan.json",
+            expected_prior_plan_sha256="0" * 64,
+        )
+    assert not (tmp_path / "missing-sha.plan.json").exists()
+    assert not (tmp_path / "missing-path.plan.json").exists()
+
+
+def test_resume_refuses_external_sha_snapshot_result_and_per_account_drift(tmp_path):
+    handles = tuple(f"guard_{index:02d}" for index in range(8))
+    unresolved = frozenset(handles[-2:])
+    db = tmp_path / "creators.db"
+    _create_db(db, handles=handles)
+
+    def initial_probe(handle, *_args):
+        return _unknown(handle) if handle in unresolved else _yes(handle)
+
+    initial, initial_path, _ = _collect_many(
+        tmp_path,
+        db,
+        handles=handles,
+        plan_name="guard-source.plan.json",
+        probe=initial_probe,
+    )
+    calls: list[str] = []
+
+    def forbidden_probe(handle, *_args):
+        calls.append(handle)
+        return _yes(handle)
+
+    with pytest.raises(backfill.StorefrontBackfillError, match="plan SHA-256 mismatch"):
+        _collect_many(
+            tmp_path,
+            db,
+            handles=handles,
+            plan_name="wrong-sha.plan.json",
+            probe=forbidden_probe,
+            prior_plan=initial_path,
+            expected_prior_sha="0" * 64,
+        )
+    assert calls == []
+
+    with sqlite3.connect(db) as connection:
+        connection.execute(
+            "UPDATE creator_profiles SET stage_updated_at=? WHERE handle=?",
+            ("2026-08-11T10:00:00Z", handles[0]),
+        )
+        connection.commit()
+    with pytest.raises(backfill.StorefrontBackfillError, match="snapshot differs"):
+        _collect_many(
+            tmp_path,
+            db,
+            handles=handles,
+            plan_name="stale-snapshot.plan.json",
+            probe=forbidden_probe,
+            prior_plan=initial_path,
+            expected_prior_sha=initial["plan_sha256"],
+        )
+    assert calls == []
+    with sqlite3.connect(db) as connection:
+        connection.execute(
+            "UPDATE creator_profiles SET stage_updated_at=? WHERE handle=?",
+            ("2026-08-11T08:00:00Z", handles[0]),
+        )
+        connection.commit()
+
+    tampered = copy.deepcopy(initial)
+    tampered_row = next(
+        row for row in tampered["rows"] if row["result"]["status"] == "confirmed_yes"
+    )
+    tampered_row["result"]["evidence"]["profile_healthy"] = False
+    tampered_path = tmp_path / "invalid-result.plan.json"
+    _write_rehashed_plan(tampered_path, tampered)
+    with pytest.raises(backfill.StorefrontBackfillError, match="current validator"):
+        _collect_many(
+            tmp_path,
+            db,
+            handles=handles,
+            plan_name="invalid-result-output.plan.json",
+            probe=forbidden_probe,
+            prior_plan=tampered_path,
+            expected_prior_sha=tampered["plan_sha256"],
+        )
+    assert calls == []
+
+    with pytest.raises(backfill.StorefrontBackfillError, match="per-account contract changed"):
+        _collect_many(
+            tmp_path,
+            db,
+            handles=handles,
+            plan_name="per-account-drift.plan.json",
+            probe=forbidden_probe,
+            prior_plan=initial_path,
+            expected_prior_sha=initial["plan_sha256"],
+            per_account=5,
+        )
+    assert calls == []
+
+
+def test_apply_rejects_reused_slot_and_incomplete_resume_source_coverage(tmp_path):
+    db, handles, plan, _ = _resolved_resume_fixture(tmp_path)
+    before = _db_digest(db)
+
+    duplicate_slot = copy.deepcopy(plan)
+    recollected = next(
+        row
+        for row in duplicate_slot["rows"]
+        if row["provenance"]["decision_source"] == "current_run"
+        and row["provenance"]["prior_plan"] is not None
+    )
+    old_slot = recollected["provenance"]["prior_attempts"][0]["account_slot"]
+    recollected["provenance"]["scheduled_current_slots"][0] = old_slot
+    recollected["provenance"]["current_attempts"][0]["account_slot"] = old_slot
+    recollected["result"]["evidence"]["attempts"][0]["account_slot"] = old_slot
+    assignment = {
+        row["handle"].casefold(): row["provenance"]["scheduled_current_slots"]
+        for row in duplicate_slot["rows"]
+        if row["provenance"]["prior_plan"] is not None
+        and row["provenance"]["decision_source"] == "current_run"
+    }
+    duplicate_slot["resume"]["account_assignment_sha256"] = backfill._sha_json(
+        assignment
+    )
+    duplicate_path = tmp_path / "duplicate-slot.plan.json"
+    _write_rehashed_plan(duplicate_path, duplicate_slot)
+    with pytest.raises(backfill.StorefrontBackfillError, match="reused a prior account slot"):
+        backfill.apply_plan(
+            db_path=db,
+            batch_id=BATCH,
+            expected_count=len(handles),
+            plan_path=duplicate_path,
+            expected_plan_sha256=duplicate_slot["plan_sha256"],
+        )
+    assert _db_digest(db) == before
+    incomplete_source = copy.deepcopy(plan)
+    reused = next(
+        row
+        for row in incomplete_source["rows"]
+        if row["provenance"]["decision_source"] == "prior_plan"
+    )
+    provenance = reused["provenance"]
+    result_attempts = reused["result"]["evidence"]["attempts"]
+    summaries = [
+        {
+            "attempt": item["attempt"],
+            "account_slot": item["account_slot"],
+            "status": item["status"],
+            "evidence_sha256": backfill._sha_json(item["evidence"]),
+        }
+        for item in result_attempts
+    ]
+    scheduled = [item["account_slot"] for item in result_attempts]
+    if len(scheduled) == 1:
+        scheduled.append((scheduled[0] + 1) % 6)
+    provenance.update(
+        {
+            "decision_source": "current_run",
+            "result_attempt_origin": "current_run",
+            "prior_plan": None,
+            "prior_status": None,
+            "prior_attempts": [],
+            "current_attempts": summaries,
+            "scheduled_current_slots": scheduled,
+        }
+    )
+    incomplete_path = tmp_path / "incomplete-source.plan.json"
+    _write_rehashed_plan(incomplete_path, incomplete_source)
+    with pytest.raises(backfill.StorefrontBackfillError, match="complete cohort"):
+        backfill.apply_plan(
+            db_path=db,
+            batch_id=BATCH,
+            expected_count=len(handles),
+            plan_path=incomplete_path,
+            expected_plan_sha256=incomplete_source["plan_sha256"],
+        )
+    assert _db_digest(db) == before
+
+
+def test_resume_rejects_incompatible_schema_and_source_bytes_changed_midrun(tmp_path):
+    handles = tuple(f"freeze_{index:02d}" for index in range(8))
+    unresolved = frozenset(handles[-2:])
+    db = tmp_path / "creators.db"
+    _create_db(db, handles=handles)
+
+    def initial_probe(handle, *_args):
+        return _unknown(handle) if handle in unresolved else _yes(handle)
+
+    initial, initial_path, _ = _collect_many(
+        tmp_path,
+        db,
+        handles=handles,
+        plan_name="freeze-source.plan.json",
+        probe=initial_probe,
+    )
+    incompatible = copy.deepcopy(initial)
+    incompatible["schema"] = "sop-v2-storefront-backfill-plan-v999"
+    incompatible_path = tmp_path / "incompatible.plan.json"
+    _write_rehashed_plan(incompatible_path, incompatible)
+    with pytest.raises(backfill.StorefrontBackfillError, match="unsupported plan schema"):
+        _collect_many(
+            tmp_path,
+            db,
+            handles=handles,
+            plan_name="incompatible-output.plan.json",
+            probe=_yes,
+            prior_plan=incompatible_path,
+            expected_prior_sha=incompatible["plan_sha256"],
+        )
+
+    changed = False
+
+    def mutating_probe(handle, *_args):
+        nonlocal changed
+        if not changed:
+            initial_path.write_bytes(initial_path.read_bytes() + b"\n")
+            changed = True
+        return _yes(handle)
+
+    output = tmp_path / "changed-source-output.plan.json"
+    with pytest.raises(backfill.StorefrontBackfillError, match="bytes changed"):
+        _collect_many(
+            tmp_path,
+            db,
+            handles=handles,
+            plan_name=output.name,
+            probe=mutating_probe,
+            prior_plan=initial_path,
+            expected_prior_sha=initial["plan_sha256"],
+        )
+    assert changed is True
+    assert not output.exists()
+
+
+def test_apply_rejects_rehashed_plan_with_weakened_collection_contract(tmp_path):
+    db = tmp_path / "creators.db"
+    _create_db(db)
+    plan, _, _ = _collect(tmp_path, db)
+    before = _db_digest(db)
+    weakened = copy.deepcopy(plan)
+    weakened["collection_contract"]["proxy_required"] = False
+    weakened_path = tmp_path / "weakened-contract.plan.json"
+    _write_rehashed_plan(weakened_path, weakened)
+
+    with pytest.raises(
+        backfill.StorefrontBackfillError,
+        match="collection contract is incompatible: proxy_required",
+    ):
+        backfill.apply_plan(
+            db_path=db,
+            batch_id=BATCH,
+            expected_count=2,
+            plan_path=weakened_path,
+            expected_plan_sha256=weakened["plan_sha256"],
         )
     assert _db_digest(db) == before
 

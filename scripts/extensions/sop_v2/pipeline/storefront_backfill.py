@@ -22,6 +22,7 @@ import os
 import re
 import socket
 import sqlite3
+import stat
 import sys
 import tempfile
 import threading
@@ -39,8 +40,11 @@ from extensions.sop_v2.pipeline import graph_runner  # noqa: E402
 from extensions.sop_v2.pipeline import resource_leases  # noqa: E402
 
 
-PLAN_SCHEMA = "sop-v2-storefront-backfill-plan-v1"
+LEGACY_PLAN_SCHEMA = "sop-v2-storefront-backfill-plan-v1"
+PLAN_SCHEMA = "sop-v2-storefront-backfill-plan-v2"
+SUPPORTED_PRIOR_PLAN_SCHEMAS = frozenset({LEGACY_PLAN_SCHEMA, PLAN_SCHEMA})
 EVIDENCE_SCHEMA = "sop-v2-storefront-backfill-evidence-v1"
+RESUME_PROVENANCE_SCHEMA = "sop-v2-storefront-resume-provenance-v1"
 _HANDLE_RE = re.compile(r"[A-Za-z0-9._]{1,30}\Z")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _PROXY_SYNTHETIC_DNS_NETWORK = ipaddress.ip_network("198.18.0.0/15")
@@ -166,6 +170,10 @@ def _canonical_json(value: Any) -> str:
 
 def _sha_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _sha_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
 
 
 def _sha_json(value: Any) -> str:
@@ -318,6 +326,14 @@ def _snapshot_row(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def _plan_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "stage_json_sha256": snapshot["stage_json_sha256"],
+        "protected_stage_sha256": snapshot["protected_stage_sha256"],
+        **snapshot["cas"],
+    }
+
+
 def _load_unknown_cohort(
     connection: sqlite3.Connection,
     *,
@@ -417,6 +433,75 @@ def _read_plan(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise StorefrontBackfillError("plan must be a JSON object")
     return value
+
+
+def _read_frozen_prior_plan(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Read one immutable prior artifact once and bind its bytes and real path."""
+
+    requested = path.expanduser()
+    try:
+        resolved = requested.resolve(strict=True)
+        descriptor = os.open(
+            resolved,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            file_stat = os.fstat(descriptor)
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise StorefrontBackfillError("prior plan must be a regular file")
+            with os.fdopen(descriptor, "rb", closefd=False) as stream:
+                raw = stream.read()
+        finally:
+            os.close(descriptor)
+        text = raw.decode("utf-8")
+        value = json.loads(text, parse_constant=_reject_json_constant)
+    except StorefrontBackfillError:
+        raise
+    except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+        raise StorefrontBackfillError(f"cannot read prior plan: {exc}") from exc
+    if not isinstance(value, dict):
+        raise StorefrontBackfillError("prior plan must be a JSON object")
+    return value, {
+        "requested_path": requested,
+        "resolved_path": resolved,
+        "resolved_path_sha256": _sha_text(str(resolved)),
+        "file_sha256": _sha_bytes(raw),
+        "device": file_stat.st_dev,
+        "inode": file_stat.st_ino,
+    }
+
+
+def _assert_frozen_prior_plan_unchanged(frozen: Mapping[str, Any]) -> None:
+    """Fail if the source path or exact bytes changed during collection."""
+
+    try:
+        resolved = Path(frozen["requested_path"]).resolve(strict=True)
+        if resolved != frozen["resolved_path"]:
+            raise StorefrontBackfillError("prior plan resolved path changed during collect")
+        descriptor = os.open(
+            resolved,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            file_stat = os.fstat(descriptor)
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise StorefrontBackfillError("prior plan is no longer a regular file")
+            with os.fdopen(descriptor, "rb", closefd=False) as stream:
+                raw = stream.read()
+        finally:
+            os.close(descriptor)
+    except StorefrontBackfillError:
+        raise
+    except OSError as exc:
+        raise StorefrontBackfillError(
+            f"prior plan changed or disappeared during collect: {exc}"
+        ) from exc
+    if (
+        file_stat.st_dev != frozen["device"]
+        or file_stat.st_ino != frozen["inode"]
+        or _sha_bytes(raw) != frozen["file_sha256"]
+    ):
+        raise StorefrontBackfillError("prior plan bytes changed during collect")
 
 
 def _public_proxy_check(proxy: object) -> None:
@@ -1365,29 +1450,54 @@ def _bio_more_declaration(
         labels.append(str(profile["_bio_link_label"]))
     try:
         dom_labels = page.evaluate(
-            r"""() => [...document.querySelectorAll('main header button,main header div,main header span,main section button,main section div,main section span')]
-              .map(e=>{
-                const control=e.closest('button,[role="button"],[aria-haspopup="dialog"],[aria-expanded]');
-                const popup=(control?.getAttribute('aria-haspopup')||e.getAttribute('aria-haspopup')||'').toLowerCase();
-                const expanded=(control?.getAttribute('aria-expanded')||e.getAttribute('aria-expanded')||'').toLowerCase();
-                return {
-                  text:(e.innerText||e.textContent||'').replace(/\s+/g,' ').trim(),
-                  popup,
-                  expanded,
-                  interactive:!!control
-                };
-              })
-              .filter(x=>x.text && x.text.length<240 && (
-                (/\d/.test(x.text) && /(?:more|m[aá]s|autres?|mais|ещ[её]|더|还有|另有|另外|链接|links?|enlaces?|liens?)/i.test(x.text)) ||
-                (x.interactive && /\d/.test(x.text) && /(?:[a-z0-9-]+\.)+[a-z]{2,}/i.test(x.text)) ||
-                (x.popup==='dialog' && /(?:links?|链接|enlaces?|liens?)/i.test(x.text))
-              ));"""
+            r"""() => {
+              const controlSelector='button,[role="button"],[aria-haspopup="dialog"],[aria-expanded]';
+              const domainStart=/^[\s\p{Emoji}\p{So}👉➡🔗•·|]*(?:(?:https?:\/\/)?(?:[a-z0-9-]+\.)+[a-z]{2,})(?:\/|\s|$)/iu;
+              const linkWords=/(?:links?|链接|enlaces?|liens?)/i;
+              const controls=[];
+              const seen=new Set();
+              for(const root of document.querySelectorAll('main header,main section')){
+                for(const control of root.querySelectorAll(controlSelector)){
+                  if(seen.has(control)) continue;
+                  seen.add(control);
+                  // Story/highlight menus and presentation surfaces can contain
+                  // domains, years and words such as "LINK" but are not the
+                  // profile bio-link disclosure control.
+                  if(control.closest('[role="menu"],[role="presentation"]')) continue;
+                  const text=(control.innerText||control.textContent||'')
+                    .replace(/\s+/g,' ').trim();
+                  if(!text || text.length>=240) continue;
+                  const popup=(control.getAttribute('aria-haspopup')||'').toLowerCase();
+                  const expanded=(control.getAttribute('aria-expanded')||'').toLowerCase();
+                  const explicitLinksPopup=popup==='dialog' && linkWords.test(text);
+                  // A trusted fallback is either the actual domain-leading bio
+                  // link control (Instagram's "domain and N more" button) or
+                  // an explicitly declared links dialog.  Generic biography
+                  // show-more buttons never satisfy this boundary.
+                  const trustedSurface=domainStart.test(text) || explicitLinksPopup;
+                  if(!trustedSurface) continue;
+                  controls.push({
+                    text,
+                    popup,
+                    expanded,
+                    interactive:true,
+                    trusted_surface:true
+                  });
+                }
+              }
+              return controls;
+            }"""
         )
     except Exception:  # noqa: BLE001
         dom_labels = []
     popup_signal = False
     for item in dom_labels or []:
         if not isinstance(item, Mapping):
+            continue
+        # ``page.evaluate`` returns only controls selected by the trusted DOM
+        # boundary above.  Require its explicit marker here as well so callers,
+        # tests, or future adapters cannot reintroduce arbitrary page text.
+        if item.get("trusted_surface") is not True:
             continue
         text = str(item.get("text") or "").strip()
         if text:
@@ -1398,7 +1508,10 @@ def _bio_more_declaration(
                 or item.get("expanded") in {"true", "false"}
             ):
                 interactive_labels.add(text)
-        if item.get("popup") == "dialog" or item.get("expanded") in {"true", "false"}:
+        # ``aria-expanded`` is common on Instagram's ordinary biography
+        # show-more control and is therefore only descriptive.  Only an
+        # explicit links dialog can independently prove a popup surface.
+        if item.get("popup") == "dialog":
             popup_signal = True
     labels = list(dict.fromkeys(labels))
     parsed = [parse_count(label) for label in labels]
@@ -1407,27 +1520,22 @@ def _bio_more_declaration(
         isinstance(profile, Mapping)
         and (profile.get("_bio_has_more") or profile.get("_bio_more_count") is not None)
     )
-    known_language_signal = any(
-        re.search(
-            r"(?:\d.*(?:more|m[aá]s|autres?|mais|ещ[её]|더|还有|另有|另外|链接|links?|enlaces?|liens?))",
-            label,
-            re.I,
-        )
-        for label in labels
-    )
-    # The domain+number fallback exists for unknown locales, but ordinary bio
-    # text often contains a domain next to a follower/year count.  Treat that
-    # shape as hidden-link evidence only when the DOM ties it to a real control.
+    # The domain+number fallback exists only for an unknown-locale declaration
+    # on the trusted domain-leading bio-link control.  It must not inspect
+    # arbitrary biography/highlight text: those surfaces commonly contain a
+    # follower count or year followed by Instagram's unrelated ``... more``.
     interactive_generic_signal = any(
         re.search(
-            r"(?:[a-z0-9-]+\.)+[a-z]{2,}(?:/\S+)?\s+\D{0,40}\d+",
+            r"^\W{0,12}(?:(?:https?://)?(?:[a-z0-9-]+\.)+[a-z]{2,})"
+            r"(?:/\S+)?\s+\D{0,40}\d+(?:\D|$)",
             label,
             re.I,
         )
         for label in interactive_labels
     )
-    generic_signal = bool(known_language_signal or interactive_generic_signal)
-    has_more_signal = bool(counts or profile_signal or popup_signal or generic_signal)
+    has_more_signal = bool(
+        counts or profile_signal or popup_signal or interactive_generic_signal
+    )
     declared = next(iter(counts)) if len(counts) == 1 else None
     ambiguous = bool(has_more_signal and declared is None)
     return has_more_signal, declared, {
@@ -2002,6 +2110,312 @@ def _with_attempt_evidence(
     return output
 
 
+def _validate_attempt_ledger(
+    result: Mapping[str, Any],
+    *,
+    handle: str,
+    account_count: int,
+) -> tuple[dict[str, Any], ...]:
+    evidence = result.get("evidence")
+    attempts = evidence.get("attempts") if isinstance(evidence, Mapping) else None
+    if not isinstance(attempts, list) or len(attempts) not in {1, 2}:
+        raise StorefrontBackfillError(f"@{handle}: invalid probe attempt ledger")
+    normalized: list[dict[str, Any]] = []
+    for expected_number, raw in enumerate(attempts, start=1):
+        if not isinstance(raw, Mapping):
+            raise StorefrontBackfillError(f"@{handle}: invalid probe attempt ledger")
+        if raw.get("attempt") != expected_number:
+            raise StorefrontBackfillError(f"@{handle}: invalid probe attempt number")
+        slot = raw.get("account_slot")
+        if (
+            isinstance(slot, bool)
+            or not isinstance(slot, int)
+            or slot < 0
+            or slot >= int(account_count)
+        ):
+            raise StorefrontBackfillError(f"@{handle}: invalid probe account slot")
+        status = raw.get("status")
+        if status not in {"confirmed_yes", "confirmed_no", "unknown"}:
+            raise StorefrontBackfillError(f"@{handle}: invalid probe attempt status")
+        attempt_evidence = raw.get("evidence")
+        if not isinstance(attempt_evidence, Mapping) or (
+            attempt_evidence.get("schema") != EVIDENCE_SCHEMA
+        ):
+            raise StorefrontBackfillError(
+                f"@{handle}: invalid probe attempt evidence"
+            )
+        normalized.append(
+            {
+                "attempt": expected_number,
+                "account_slot": slot,
+                "status": status,
+                "evidence": dict(attempt_evidence),
+            }
+        )
+    if normalized[-1]["status"] != result.get("status"):
+        raise StorefrontBackfillError(
+            f"@{handle}: final result disagrees with probe attempt ledger"
+        )
+    if len(normalized) == 2:
+        if normalized[0]["status"] != "unknown":
+            raise StorefrontBackfillError(
+                f"@{handle}: retry occurred after a conclusive attempt"
+            )
+        if normalized[0]["account_slot"] == normalized[1]["account_slot"]:
+            raise StorefrontBackfillError(
+                f"@{handle}: retry did not switch shallow accounts"
+            )
+    final_evidence = dict(evidence)
+    final_evidence.pop("attempts", None)
+    if final_evidence != normalized[-1]["evidence"]:
+        raise StorefrontBackfillError(
+            f"@{handle}: final evidence disagrees with probe attempt ledger"
+        )
+    return tuple(normalized)
+
+
+def _attempt_summaries(
+    attempts: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "attempt": item["attempt"],
+            "account_slot": item["account_slot"],
+            "status": item["status"],
+            "evidence_sha256": _sha_json(item["evidence"]),
+        }
+        for item in attempts
+    ]
+
+
+def _validate_attempt_summaries(
+    value: object,
+    *,
+    handle: str,
+    account_count: int,
+    label: str,
+) -> tuple[dict[str, Any], ...]:
+    if not isinstance(value, list):
+        raise StorefrontBackfillError(f"@{handle}: invalid {label}")
+    output: list[dict[str, Any]] = []
+    for raw in value:
+        if not isinstance(raw, Mapping):
+            raise StorefrontBackfillError(f"@{handle}: invalid {label}")
+        attempt = raw.get("attempt")
+        slot = raw.get("account_slot")
+        status = raw.get("status")
+        evidence_sha = str(raw.get("evidence_sha256") or "")
+        if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+            raise StorefrontBackfillError(f"@{handle}: invalid {label} attempt")
+        if (
+            isinstance(slot, bool)
+            or not isinstance(slot, int)
+            or slot < 0
+            or slot >= int(account_count)
+        ):
+            raise StorefrontBackfillError(f"@{handle}: invalid {label} account slot")
+        if status not in {"confirmed_yes", "confirmed_no", "unknown"}:
+            raise StorefrontBackfillError(f"@{handle}: invalid {label} status")
+        if not _SHA256_RE.fullmatch(evidence_sha):
+            raise StorefrontBackfillError(f"@{handle}: invalid {label} evidence SHA")
+        output.append(
+            {
+                "attempt": attempt,
+                "account_slot": slot,
+                "status": status,
+                "evidence_sha256": evidence_sha,
+            }
+        )
+    return tuple(output)
+
+
+def _validate_attempt_summary_groups(
+    attempts: Sequence[Mapping[str, Any]],
+    *,
+    handle: str,
+    label: str,
+    allow_empty: bool,
+) -> None:
+    if not attempts:
+        if allow_empty:
+            return
+        raise StorefrontBackfillError(f"@{handle}: missing {label}")
+    index = 0
+    groups: list[Sequence[Mapping[str, Any]]] = []
+    while index < len(attempts):
+        if attempts[index]["attempt"] != 1:
+            raise StorefrontBackfillError(f"@{handle}: invalid {label} ordering")
+        end = index + 1
+        if end < len(attempts) and attempts[end]["attempt"] == 2:
+            end += 1
+        group = attempts[index:end]
+        if len(group) == 2 and (
+            group[0]["status"] != "unknown"
+            or group[0]["account_slot"] == group[1]["account_slot"]
+        ):
+            raise StorefrontBackfillError(f"@{handle}: invalid {label} retry")
+        groups.append(group)
+        index = end
+    if any(group[-1]["status"] != "unknown" for group in groups[:-1]):
+        raise StorefrontBackfillError(
+            f"@{handle}: {label} continued after a conclusive attempt"
+        )
+
+
+def _validate_resume_provenance(
+    value: object,
+    *,
+    handle: str,
+    result: Mapping[str, Any],
+    attempts: Sequence[Mapping[str, Any]],
+    account_count: int,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or value.get("schema") != RESUME_PROVENANCE_SCHEMA:
+        raise StorefrontBackfillError(f"@{handle}: invalid resume provenance")
+    decision_source = value.get("decision_source")
+    result_attempt_origin = value.get("result_attempt_origin")
+    if decision_source not in {"current_run", "prior_plan"} or (
+        result_attempt_origin not in {"current_run", "prior_plan"}
+    ):
+        raise StorefrontBackfillError(f"@{handle}: invalid resume provenance source")
+    prior_plan = value.get("prior_plan")
+    prior_status = value.get("prior_status")
+    prior_attempts = _validate_attempt_summaries(
+        value.get("prior_attempts"),
+        handle=handle,
+        account_count=account_count,
+        label="prior attempt history",
+    )
+    current_attempts = _validate_attempt_summaries(
+        value.get("current_attempts"),
+        handle=handle,
+        account_count=account_count,
+        label="current attempt history",
+    )
+    _validate_attempt_summary_groups(
+        prior_attempts,
+        handle=handle,
+        label="prior attempt history",
+        allow_empty=True,
+    )
+    _validate_attempt_summary_groups(
+        current_attempts,
+        handle=handle,
+        label="current attempt history",
+        allow_empty=True,
+    )
+    scheduled_value = value.get("scheduled_current_slots")
+    if not isinstance(scheduled_value, list) or any(
+        isinstance(slot, bool)
+        or not isinstance(slot, int)
+        or slot < 0
+        or slot >= int(account_count)
+        for slot in scheduled_value
+    ):
+        raise StorefrontBackfillError(f"@{handle}: invalid scheduled account slots")
+    scheduled_slots = tuple(scheduled_value)
+    if len(scheduled_slots) != len(set(scheduled_slots)) or len(scheduled_slots) > 2:
+        raise StorefrontBackfillError(f"@{handle}: invalid scheduled account slots")
+    result_summaries = tuple(_attempt_summaries(attempts))
+    if prior_plan is None:
+        if (
+            prior_status is not None
+            or prior_attempts
+            or decision_source != "current_run"
+            or result_attempt_origin != "current_run"
+            or current_attempts != result_summaries
+            or tuple(item["account_slot"] for item in current_attempts)
+            != scheduled_slots[: len(current_attempts)]
+            or len(scheduled_slots) != 2
+        ):
+            raise StorefrontBackfillError(
+                f"@{handle}: inconsistent fresh-run provenance"
+            )
+    else:
+        if not isinstance(prior_plan, Mapping):
+            raise StorefrontBackfillError(f"@{handle}: invalid prior plan provenance")
+        if prior_plan.get("schema") not in SUPPORTED_PRIOR_PLAN_SCHEMAS:
+            raise StorefrontBackfillError(f"@{handle}: incompatible prior plan schema")
+        for key in (
+            "plan_sha256",
+            "file_sha256",
+            "resolved_path_sha256",
+            "row_sha256",
+        ):
+            if not _SHA256_RE.fullmatch(str(prior_plan.get(key) or "")):
+                raise StorefrontBackfillError(
+                    f"@{handle}: invalid prior plan provenance {key}"
+                )
+        if prior_status not in {"confirmed_yes", "confirmed_no", "unknown"}:
+            raise StorefrontBackfillError(f"@{handle}: invalid prior status provenance")
+        if not prior_attempts:
+            raise StorefrontBackfillError(f"@{handle}: missing prior attempt history")
+        prior_slots = [item["account_slot"] for item in prior_attempts]
+        if len(prior_slots) != len(set(prior_slots)):
+            raise StorefrontBackfillError(
+                f"@{handle}: prior attempt history reused an account slot"
+            )
+        if prior_attempts[-1]["status"] != prior_status:
+            raise StorefrontBackfillError(
+                f"@{handle}: prior status disagrees with prior attempt history"
+            )
+        if set(prior_slots) & set(scheduled_slots):
+            raise StorefrontBackfillError(
+                f"@{handle}: resumed collection reused a prior account slot"
+            )
+        if decision_source == "prior_plan":
+            if (
+                result_attempt_origin != "prior_plan"
+                or prior_status not in {"confirmed_yes", "confirmed_no"}
+                or result.get("status") != prior_status
+                or current_attempts
+                or scheduled_slots
+                or tuple(prior_attempts[-len(result_summaries) :])
+                != result_summaries
+            ):
+                raise StorefrontBackfillError(
+                    f"@{handle}: inconsistent reused-result provenance"
+                )
+        elif (
+            result_attempt_origin != "current_run"
+            or prior_status != "unknown"
+            or current_attempts != result_summaries
+            or len(scheduled_slots) != 2
+            or tuple(item["account_slot"] for item in current_attempts)
+            != scheduled_slots[: len(current_attempts)]
+        ):
+            raise StorefrontBackfillError(
+                f"@{handle}: inconsistent resumed-probe provenance"
+            )
+    return {
+        "schema": RESUME_PROVENANCE_SCHEMA,
+        "decision_source": decision_source,
+        "result_attempt_origin": result_attempt_origin,
+        "prior_plan": None if prior_plan is None else dict(prior_plan),
+        "prior_status": prior_status,
+        "prior_attempts": [dict(item) for item in prior_attempts],
+        "current_attempts": [dict(item) for item in current_attempts],
+        "scheduled_current_slots": list(scheduled_slots),
+    }
+
+
+def _fresh_provenance(
+    attempts: Sequence[Mapping[str, Any]],
+    *,
+    scheduled_slots: Sequence[int],
+) -> dict[str, Any]:
+    return {
+        "schema": RESUME_PROVENANCE_SCHEMA,
+        "decision_source": "current_run",
+        "result_attempt_origin": "current_run",
+        "prior_plan": None,
+        "prior_status": None,
+        "prior_attempts": [],
+        "current_attempts": _attempt_summaries(attempts),
+        "scheduled_current_slots": list(scheduled_slots),
+    }
+
+
 def collect_plan(
     *,
     db_path: str | os.PathLike[str],
@@ -2024,6 +2438,8 @@ def collect_plan(
     proxy_loader: Callable[..., object] | None = None,
     lease_api: Any = resource_leases,
     resolver: Callable[[str], Iterable[str]] | None = None,
+    prior_plan_path: str | os.PathLike[str] | None = None,
+    expected_prior_plan_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Collect a complete review plan without ever opening the creator DB writable."""
 
@@ -2039,6 +2455,24 @@ def collect_plan(
     if os.path.lexists(requested_destination):
         raise StorefrontBackfillError(f"plan already exists: {requested_destination}")
     destination = requested_destination.resolve()
+    has_prior_path = prior_plan_path is not None
+    has_prior_sha = expected_prior_plan_sha256 is not None
+    if has_prior_path != has_prior_sha:
+        raise StorefrontBackfillError(
+            "prior_plan_path and expected_prior_plan_sha256 must be supplied together"
+        )
+    prior_plan: dict[str, Any] | None = None
+    frozen_prior: dict[str, Any] | None = None
+    expected_prior_sha: str | None = None
+    if has_prior_path:
+        expected_prior_sha = str(expected_prior_plan_sha256 or "").strip().casefold()
+        if not _SHA256_RE.fullmatch(expected_prior_sha):
+            raise StorefrontBackfillError(
+                "expected_prior_plan_sha256 must be 64 lowercase hex"
+            )
+        prior_plan, frozen_prior = _read_frozen_prior_plan(Path(prior_plan_path))
+        if frozen_prior["resolved_path"] == destination:
+            raise StorefrontBackfillError("prior plan and plan output must differ")
 
     db = Path(db_path).expanduser().resolve()
     lease_database = _separate_lease_database(db, lease_db)
@@ -2083,6 +2517,65 @@ def collect_plan(
         )
     credentials = _account_credentials(Path(accounts_file), accounts)
 
+    keys = lease_api.build_resource_keys(
+        accounts=[item.username for item in accounts],
+        chrome_profiles=[item.profile_path for item in accounts],
+    )
+    singleton = f"pipeline:storefront-backfill:{str(batch_id).casefold()}"
+    keys = tuple(sorted((*keys, singleton)))
+    prior_rows_by_handle: dict[str, dict[str, Any]] = {}
+    if prior_plan is not None:
+        assert frozen_prior is not None and expected_prior_sha is not None
+        validated_prior, prior_rows = _validated_prior_plan(
+            prior_plan,
+            expected_plan_sha256=expected_prior_sha,
+            batch_id=batch_id,
+            expected_status=expected_status,
+            expected_count=expected_count,
+            account_count=len(accounts),
+        )
+        contract = validated_prior.get("collection_contract")
+        if not isinstance(contract, Mapping):
+            raise StorefrontBackfillError("prior plan collection contract is missing")
+        required_contract = {
+            "creator_db_mode": "read_only",
+            "proxy_required": True,
+            "fresh_profile_required": True,
+            "all_bio_links_required": True,
+            "all_targets_must_succeed_for_confirmed_no": True,
+        }
+        for key, expected in required_contract.items():
+            if contract.get(key) != expected:
+                raise StorefrontBackfillError(
+                    f"prior plan collection contract is incompatible: {key}"
+                )
+        if contract.get("account_schedule_sha256") != pools.combined_order_sha256:
+            raise StorefrontBackfillError("prior plan account schedule changed")
+        if contract.get("resource_key_set_sha256") != _sha_json(keys):
+            raise StorefrontBackfillError("prior plan resource key set changed")
+        prior_per_account = contract.get("per_account")
+        if (
+            isinstance(prior_per_account, bool)
+            or not isinstance(prior_per_account, int)
+            or prior_per_account <= 0
+        ):
+            raise StorefrontBackfillError("prior plan per-account contract is invalid")
+        if prior_per_account != int(per_account):
+            raise StorefrontBackfillError("prior plan per-account contract changed")
+        if validated_prior.get("schema") == PLAN_SCHEMA and (
+            contract.get("shallow_account_count") != len(accounts)
+        ):
+            raise StorefrontBackfillError("prior plan shallow account count changed")
+        current_by_handle = {item["handle"].casefold(): item for item in snapshots}
+        for item in prior_rows:
+            handle = item["handle"]
+            current = current_by_handle.get(handle.casefold())
+            if current is None or item["snapshot"] != _plan_snapshot(current):
+                raise StorefrontBackfillError(
+                    f"@{handle}: prior plan snapshot differs from current database"
+                )
+            prior_rows_by_handle[handle.casefold()] = item
+
     if proxy_loader is None:
         import browser_collect_v2 as browser_collect
 
@@ -2091,13 +2584,6 @@ def collect_plan(
         session=f"sfbpre{uuid.uuid4().hex[:8]}", ttl=900
     )
     _public_proxy_check(preflight_proxy)
-
-    keys = lease_api.build_resource_keys(
-        accounts=[item.username for item in accounts],
-        chrome_profiles=[item.profile_path for item in accounts],
-    )
-    singleton = f"pipeline:storefront-backfill:{str(batch_id).casefold()}"
-    keys = tuple(sorted((*keys, singleton)))
     run_id = f"storefront-backfill-{uuid.uuid4().hex[:12]}"
     bundle = lease_api.acquire_resources(
         lease_database,
@@ -2115,7 +2601,87 @@ def collect_plan(
         ttl_seconds=lease_ttl_seconds,
         interval_seconds=heartbeat_seconds,
     )
-    results: list[dict[str, Any]] = []
+    results_by_handle: dict[str, dict[str, Any]] = {}
+    probe_snapshots: list[dict[str, Any]] = []
+    resume_slots: dict[str, tuple[int, int]] = {}
+    resume_primary_load = [0] * len(accounts)
+    resume_retry_load = [0] * len(accounts)
+    if prior_rows_by_handle:
+        for snapshot in snapshots:
+            folded = snapshot["handle"].casefold()
+            prior_row = prior_rows_by_handle[folded]
+            prior_result = prior_row["result"]
+            prior_history = prior_row["attempt_history"]
+            source_ref = {
+                "schema": prior_plan["schema"],
+                "plan_sha256": expected_prior_sha,
+                "file_sha256": frozen_prior["file_sha256"],
+                "resolved_path_sha256": frozen_prior["resolved_path_sha256"],
+                "row_sha256": prior_row["row_sha256"],
+            }
+            if prior_result["status"] in {"confirmed_yes", "confirmed_no"}:
+                results_by_handle[folded] = {
+                    "handle": snapshot["handle"],
+                    "snapshot": _plan_snapshot(snapshot),
+                    "result": prior_result,
+                    "provenance": {
+                        "schema": RESUME_PROVENANCE_SCHEMA,
+                        "decision_source": "prior_plan",
+                        "result_attempt_origin": "prior_plan",
+                        "prior_plan": source_ref,
+                        "prior_status": prior_result["status"],
+                        "prior_attempts": prior_history,
+                        "current_attempts": [],
+                        "scheduled_current_slots": [],
+                    },
+                }
+                continue
+            used_slots = {
+                item["account_slot"] for item in prior_history
+            }
+            if len(used_slots) >= len(accounts) - 1:
+                raise StorefrontBackfillError(
+                    f"@{snapshot['handle']}: fewer than two unused shallow accounts remain"
+                )
+            last_slot = prior_history[-1]["account_slot"]
+            available = tuple(
+                slot
+                for offset in range(1, len(accounts) + 1)
+                for slot in ((last_slot + offset) % len(accounts),)
+                if slot not in used_slots
+            )
+            if len(available) < 2:
+                raise StorefrontBackfillError(
+                    f"@{snapshot['handle']}: fewer than two unused shallow accounts remain"
+                )
+            primary = next(
+                (
+                    slot
+                    for slot in available
+                    if resume_primary_load[slot] < int(per_account)
+                ),
+                None,
+            )
+            retry = next(
+                (
+                    slot
+                    for slot in available
+                    if slot != primary
+                    and resume_retry_load[slot] < int(per_account)
+                ),
+                None,
+            )
+            if primary is None or retry is None:
+                raise StorefrontBackfillError(
+                    f"@{snapshot['handle']}: resume account capacity exhausted"
+                )
+            resume_primary_load[primary] += 1
+            resume_retry_load[retry] += 1
+            resume_slots[folded] = (primary, retry)
+            probe_snapshots.append(snapshot)
+    else:
+        probe_snapshots.extend(snapshots)
+
     completed = False
     try:
         guard.start()
@@ -2129,24 +2695,38 @@ def collect_plan(
             )
             runtime.__enter__()
         try:
-            for index, snapshot in enumerate(snapshots):
+            for index, snapshot in enumerate(probe_snapshots):
                 guard.check()
                 block = index // int(per_account)
                 account_index = block % len(accounts)
+                scheduled_slots = (
+                    resume_slots[snapshot["handle"].casefold()]
+                    if prior_rows_by_handle
+                    else (account_index, (account_index + 1) % len(accounts))
+                )
                 attempt_records: list[dict[str, Any]] = []
                 result: dict[str, Any] | None = None
                 for attempt_index in range(2):
-                    selected_index = (
-                        account_index if attempt_index == 0 else (account_index + 1) % len(accounts)
-                    )
+                    if prior_rows_by_handle:
+                        selected_index = scheduled_slots[attempt_index]
+                    else:
+                        selected_index = (
+                            account_index
+                            if attempt_index == 0
+                            else (account_index + 1) % len(accounts)
+                        )
                     account = accounts[selected_index]
                     # Retry slots are disjoint from primary block slots, forcing
                     # the browser adapter to close the old Profile and open the
                     # different preflighted account/Profile pair.
                     runtime_slot = (
-                        block
-                        if attempt_index == 0
-                        else len(snapshots) + index + 1
+                        len(snapshots) * 3 + index * 2 + attempt_index
+                        if prior_rows_by_handle
+                        else (
+                            block
+                            if attempt_index == 0
+                            else len(snapshots) + index + 1
+                        )
                     )
                     try:
                         if probe_candidate is not None:
@@ -2181,19 +2761,42 @@ def collect_plan(
                         break
                 assert result is not None
                 result = _with_attempt_evidence(result, attempt_records)
-                results.append(
-                    {
-                        "handle": snapshot["handle"],
-                        "snapshot": {
-                            "stage_json_sha256": snapshot["stage_json_sha256"],
-                            "protected_stage_sha256": snapshot[
-                                "protected_stage_sha256"
-                            ],
-                            **snapshot["cas"],
-                        },
-                        "result": result,
-                    }
+                attempts = _validate_attempt_ledger(
+                    result,
+                    handle=snapshot["handle"],
+                    account_count=len(accounts),
                 )
+                if prior_rows_by_handle:
+                    prior_row = prior_rows_by_handle[snapshot["handle"].casefold()]
+                    provenance = {
+                        "schema": RESUME_PROVENANCE_SCHEMA,
+                        "decision_source": "current_run",
+                        "result_attempt_origin": "current_run",
+                        "prior_plan": {
+                            "schema": prior_plan["schema"],
+                            "plan_sha256": expected_prior_sha,
+                            "file_sha256": frozen_prior["file_sha256"],
+                            "resolved_path_sha256": frozen_prior[
+                                "resolved_path_sha256"
+                            ],
+                            "row_sha256": prior_row["row_sha256"],
+                        },
+                        "prior_status": "unknown",
+                        "prior_attempts": prior_row["attempt_history"],
+                        "current_attempts": _attempt_summaries(attempts),
+                        "scheduled_current_slots": list(scheduled_slots),
+                    }
+                else:
+                    provenance = _fresh_provenance(
+                        attempts,
+                        scheduled_slots=scheduled_slots,
+                    )
+                results_by_handle[snapshot["handle"].casefold()] = {
+                    "handle": snapshot["handle"],
+                    "snapshot": _plan_snapshot(snapshot),
+                    "result": result,
+                    "provenance": provenance,
+                }
             guard.check()
             completed = True
         finally:
@@ -2202,6 +2805,7 @@ def collect_plan(
     finally:
         guard.close(reason="collection_complete" if completed else "collection_failed")
 
+    results = [results_by_handle[item["handle"].casefold()] for item in snapshots]
     unresolved = [item["handle"] for item in results if item["result"]["status"] == "unknown"]
     plan: dict[str, Any] = {
         "schema": PLAN_SCHEMA,
@@ -2221,21 +2825,54 @@ def collect_plan(
             "all_targets_must_succeed_for_confirmed_no": True,
             "resource_key_set_sha256": _sha_json(keys),
             "account_schedule_sha256": pools.combined_order_sha256,
+            "shallow_account_count": len(accounts),
             "per_account": int(per_account),
         },
         "rows": results,
     }
+    if prior_rows_by_handle:
+        recollected_handles = [item["handle"] for item in probe_snapshots]
+        plan["resume"] = {
+            "prior_schema": prior_plan["schema"],
+            "prior_plan_sha256": expected_prior_sha,
+            "prior_plan_file_sha256": frozen_prior["file_sha256"],
+            "prior_plan_resolved_path_sha256": frozen_prior[
+                "resolved_path_sha256"
+            ],
+            "reused_count": len(results) - len(recollected_handles),
+            "recollected_count": len(recollected_handles),
+            "recollected_handle_set_sha256": (
+                handle_set_sha256(recollected_handles)
+                if recollected_handles
+                else None
+            ),
+            "per_account": int(per_account),
+            "account_assignment_sha256": _sha_json(
+                {
+                    item["handle"].casefold(): list(
+                        resume_slots[item["handle"].casefold()]
+                    )
+                    for item in probe_snapshots
+                }
+            ),
+        }
     plan["plan_sha256"] = _plan_sha(plan)
+    if frozen_prior is not None:
+        _assert_frozen_prior_plan_unchanged(frozen_prior)
     _write_plan(destination, plan)
     return plan
 
 
-def _validated_plan(
+def _validated_plan_rows(
     plan: Mapping[str, Any],
     *,
     expected_plan_sha256: str,
     batch_id: str,
     expected_count: int,
+    supported_schemas: frozenset[str],
+    require_resolved: bool,
+    expected_status: str | None = None,
+    account_count: int | None = None,
 ) -> tuple[dict[str, Any], tuple[dict[str, Any], ...]]:
     expected_sha = str(expected_plan_sha256 or "").strip().casefold()
     if not _SHA256_RE.fullmatch(expected_sha):
@@ -2244,15 +2881,61 @@ def _validated_plan(
     embedded_sha = str(plan.get("plan_sha256") or "").casefold()
     if actual_sha != expected_sha or embedded_sha != expected_sha:
         raise StorefrontBackfillError("plan SHA-256 mismatch")
-    if plan.get("schema") != PLAN_SCHEMA:
+    schema = plan.get("schema")
+    if schema not in supported_schemas:
         raise StorefrontBackfillError("unsupported plan schema")
     if plan.get("batch_id") != batch_id:
         raise StorefrontBackfillError("plan batch_id mismatch")
     if plan.get("expected_count") != int(expected_count):
         raise StorefrontBackfillError("plan expected_count mismatch")
-    expected_status = plan.get("expected_status")
-    if not isinstance(expected_status, str) or not expected_status.strip():
+    plan_status = plan.get("expected_status")
+    if not isinstance(plan_status, str) or not plan_status.strip():
         raise StorefrontBackfillError("plan expected_status is missing")
+    if expected_status is not None and plan_status != expected_status:
+        raise StorefrontBackfillError("plan expected_status mismatch")
+    contract = plan.get("collection_contract")
+    if not isinstance(contract, Mapping):
+        raise StorefrontBackfillError("plan collection contract is missing")
+    if schema == PLAN_SCHEMA:
+        required_contract = {
+            "creator_db_mode": "read_only",
+            "proxy_required": True,
+            "fresh_profile_required": True,
+            "all_bio_links_required": True,
+            "all_targets_must_succeed_for_confirmed_no": True,
+        }
+        for key, expected in required_contract.items():
+            if contract.get(key) != expected:
+                raise StorefrontBackfillError(
+                    f"plan collection contract is incompatible: {key}"
+                )
+        for key in ("resource_key_set_sha256", "account_schedule_sha256"):
+            if not _SHA256_RE.fullmatch(str(contract.get(key) or "")):
+                raise StorefrontBackfillError(
+                    f"plan collection contract has invalid {key}"
+                )
+        contract_per_account = contract.get("per_account")
+        if (
+            isinstance(contract_per_account, bool)
+            or not isinstance(contract_per_account, int)
+            or contract_per_account <= 0
+        ):
+            raise StorefrontBackfillError("plan per-account contract is invalid")
+        declared_account_count = contract.get("shallow_account_count")
+        if (
+            isinstance(declared_account_count, bool)
+            or not isinstance(declared_account_count, int)
+            or declared_account_count < 2
+        ):
+            raise StorefrontBackfillError("plan shallow account count is invalid")
+        if account_count is not None and declared_account_count != int(account_count):
+            raise StorefrontBackfillError("plan shallow account count mismatch")
+        account_count = declared_account_count
+    elif account_count is None:
+        raise StorefrontBackfillError(
+            "legacy plan validation requires the current shallow account count"
+        )
+    assert account_count is not None
     rows_value = plan.get("rows")
     if not isinstance(rows_value, list) or len(rows_value) != int(expected_count):
         raise StorefrontBackfillError("plan does not contain the exact expected cohort")
@@ -2271,38 +2954,48 @@ def _validated_plan(
         for field in _CAS_FIELDS:
             if field not in snapshot:
                 raise StorefrontBackfillError(f"@{handle}: missing CAS field {field}")
-        result = _validate_probe_result(raw.get("result"), handle=handle)
-        attempts = result["evidence"].get("attempts")
-        if not isinstance(attempts, list) or len(attempts) not in {1, 2}:
-            raise StorefrontBackfillError(f"@{handle}: invalid probe attempt ledger")
-        if any(not isinstance(attempt, Mapping) for attempt in attempts):
-            raise StorefrontBackfillError(f"@{handle}: invalid probe attempt ledger")
-        if attempts[-1].get("status") != result["status"]:
+        raw_result = raw.get("result")
+        raw_status = raw_result.get("status") if isinstance(raw_result, Mapping) else None
+        result = _validate_probe_result(raw_result, handle=handle)
+        if result["status"] != raw_status:
             raise StorefrontBackfillError(
-                f"@{handle}: final result disagrees with probe attempt ledger"
+                f"@{handle}: probe result changes under the current validator"
             )
-        if len(attempts) == 2:
-            if attempts[0].get("status") != "unknown":
-                raise StorefrontBackfillError(
-                    f"@{handle}: retry occurred after a conclusive attempt"
-                )
-            if attempts[0].get("account_slot") == attempts[1].get("account_slot"):
-                raise StorefrontBackfillError(
-                    f"@{handle}: retry did not switch shallow accounts"
-                )
-        for attempt in attempts:
-            attempt_evidence = attempt.get("evidence")
-            if not isinstance(attempt_evidence, Mapping) or (
-                attempt_evidence.get("schema") != EVIDENCE_SCHEMA
-            ):
-                raise StorefrontBackfillError(
-                    f"@{handle}: invalid probe attempt evidence"
-                )
-        if result["status"] == "unknown":
+        attempts = _validate_attempt_ledger(
+            result,
+            handle=handle,
+            account_count=account_count,
+        )
+        provenance: dict[str, Any] | None = None
+        if schema == PLAN_SCHEMA:
+            provenance = _validate_resume_provenance(
+                raw.get("provenance"),
+                handle=handle,
+                result=result,
+                attempts=attempts,
+                account_count=account_count,
+            )
+            attempt_history = [
+                *provenance["prior_attempts"],
+                *provenance["current_attempts"],
+            ]
+        else:
+            attempt_history = _attempt_summaries(attempts)
+        if require_resolved and result["status"] == "unknown":
             raise StorefrontBackfillError(
                 f"@{handle}: unresolved plan cannot be applied"
             )
-        rows.append({"handle": handle, "snapshot": dict(snapshot), "result": result})
+        rows.append(
+            {
+                "handle": handle,
+                "snapshot": dict(snapshot),
+                "result": result,
+                "attempts": attempts,
+                "attempt_history": attempt_history,
+                "provenance": provenance,
+                "row_sha256": _sha_json(raw),
+            }
+        )
         handles.append(handle)
     folded = [handle.casefold() for handle in handles]
     if len(folded) != len(set(folded)):
@@ -2312,9 +3005,133 @@ def _validated_plan(
         raise StorefrontBackfillError("plan handle-set SHA-256 mismatch")
     if plan.get("expected_handle_set_sha256") != handles_sha:
         raise StorefrontBackfillError("plan expected handle-set SHA-256 mismatch")
-    if plan.get("apply_allowed") is not True or plan.get("unresolved_count") != 0:
+    unresolved = sum(item["result"]["status"] == "unknown" for item in rows)
+    if plan.get("unresolved_count") != unresolved:
+        raise StorefrontBackfillError("plan unresolved count is inconsistent")
+    if plan.get("apply_allowed") is not (unresolved == 0):
+        raise StorefrontBackfillError("plan apply flag is inconsistent")
+    if require_resolved and unresolved:
         raise StorefrontBackfillError("plan is not marked fully resolved")
+    if schema == PLAN_SCHEMA:
+        reused = [
+            item
+            for item in rows
+            if item["provenance"]["decision_source"] == "prior_plan"
+        ]
+        recollected = [
+            item
+            for item in rows
+            if item["provenance"]["prior_plan"] is not None
+            and item["provenance"]["decision_source"] == "current_run"
+        ]
+        sourced = [
+            item for item in rows if item["provenance"]["prior_plan"] is not None
+        ]
+        resume = plan.get("resume")
+        if sourced:
+            if not isinstance(resume, Mapping):
+                raise StorefrontBackfillError("plan resume envelope is missing")
+            if len(sourced) != len(rows):
+                raise StorefrontBackfillError(
+                    "plan resume provenance does not cover the complete cohort"
+                )
+            source_refs = [item["provenance"]["prior_plan"] for item in sourced]
+            first = source_refs[0]
+            for key, envelope_key in (
+                ("schema", "prior_schema"),
+                ("plan_sha256", "prior_plan_sha256"),
+                ("file_sha256", "prior_plan_file_sha256"),
+                ("resolved_path_sha256", "prior_plan_resolved_path_sha256"),
+            ):
+                if resume.get(envelope_key) != first[key] or any(
+                    item[key] != first[key] for item in source_refs
+                ):
+                    raise StorefrontBackfillError(
+                        f"plan resume envelope disagrees on {envelope_key}"
+                    )
+            if resume.get("reused_count") != len(reused) or resume.get(
+                "recollected_count"
+            ) != len(recollected):
+                raise StorefrontBackfillError("plan resume counts are inconsistent")
+            if len(reused) + len(recollected) != int(expected_count):
+                raise StorefrontBackfillError(
+                    "plan resume counts do not cover the complete cohort"
+                )
+            recollected_sha = (
+                handle_set_sha256(item["handle"] for item in recollected)
+                if recollected
+                else None
+            )
+            if resume.get("recollected_handle_set_sha256") != recollected_sha:
+                raise StorefrontBackfillError(
+                    "plan recollected handle-set SHA-256 mismatch"
+                )
+            per_account = contract.get("per_account")
+            if (
+                isinstance(per_account, bool)
+                or not isinstance(per_account, int)
+                or per_account <= 0
+                or resume.get("per_account") != per_account
+            ):
+                raise StorefrontBackfillError("plan resume per-account contract mismatch")
+            assignment = {
+                item["handle"].casefold(): item["provenance"][
+                    "scheduled_current_slots"
+                ]
+                for item in recollected
+            }
+            if resume.get("account_assignment_sha256") != _sha_json(assignment):
+                raise StorefrontBackfillError(
+                    "plan resume account assignment SHA-256 mismatch"
+                )
+            primary_load = [0] * int(account_count)
+            retry_load = [0] * int(account_count)
+            for slots in assignment.values():
+                primary_load[slots[0]] += 1
+                retry_load[slots[1]] += 1
+            if max((*primary_load, *retry_load), default=0) > per_account:
+                raise StorefrontBackfillError("plan resume account capacity exceeded")
+        elif resume is not None:
+            raise StorefrontBackfillError("fresh plan contains a resume envelope")
     return dict(plan), tuple(rows)
+
+
+def _validated_prior_plan(
+    plan: Mapping[str, Any],
+    *,
+    expected_plan_sha256: str,
+    batch_id: str,
+    expected_status: str,
+    expected_count: int,
+    account_count: int,
+) -> tuple[dict[str, Any], tuple[dict[str, Any], ...]]:
+    return _validated_plan_rows(
+        plan,
+        expected_plan_sha256=expected_plan_sha256,
+        batch_id=batch_id,
+        expected_count=expected_count,
+        supported_schemas=SUPPORTED_PRIOR_PLAN_SCHEMAS,
+        require_resolved=False,
+        expected_status=expected_status,
+        account_count=account_count,
+    )
+
+
+def _validated_plan(
+    plan: Mapping[str, Any],
+    *,
+    expected_plan_sha256: str,
+    batch_id: str,
+    expected_count: int,
+) -> tuple[dict[str, Any], tuple[dict[str, Any], ...]]:
+    return _validated_plan_rows(
+        plan,
+        expected_plan_sha256=expected_plan_sha256,
+        batch_id=batch_id,
+        expected_count=expected_count,
+        supported_schemas=frozenset({PLAN_SCHEMA}),
+        require_resolved=True,
+    )
 
 
 def _changed_top_level_keys(
@@ -2554,6 +3371,8 @@ def _build_parser() -> argparse.ArgumentParser:
     collect.add_argument("--lease-ttl-seconds", type=float, default=120.0)
     collect.add_argument("--heartbeat-seconds", type=float, default=30.0)
     collect.add_argument("--headful", action="store_true")
+    collect.add_argument("--prior-plan", type=Path)
+    collect.add_argument("--expected-prior-plan-sha256")
 
     apply = subparsers.add_parser(
         "apply", help="atomically apply an exact reviewed and fully resolved plan"
@@ -2585,6 +3404,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 lease_ttl_seconds=args.lease_ttl_seconds,
                 heartbeat_seconds=args.heartbeat_seconds,
                 headless=not args.headful,
+                prior_plan_path=args.prior_plan,
+                expected_prior_plan_sha256=args.expected_prior_plan_sha256,
             )
             print(
                 _canonical_json(

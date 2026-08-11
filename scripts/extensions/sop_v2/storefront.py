@@ -32,11 +32,13 @@ _AGGREGATOR_HOSTS = (
     "wonderlink.io", "linkme.bio", "link.me", "later.com", "lnk.to", "linkr.bio",
     "flowcode.com", "gravatar.com", "atom.bio", "bio.site", "komi.io",
     "linkbio.co", "linktw.in", "paa.ge", "taplink.cc", "vana.ly", "zez.am",
+    "myyshop.com", "myyfinds.io",
 )
 _SELF_STORE_HOSTS = (
     "myshopify.com", "shopify.com", "bigcartel.com", "gumroad.com", "etsy.com",
     "shop.app", "fourthwall.com", "spring.com", "teespring.com", "depop.com",
     "poshmark.com", "ebay.com", "mercari.com", "ko-fi.com", "stan.store",
+    "sumupstore.com",
 )
 _SHOP_PATH = re.compile(r"/(?:shop|store|storefront|collections?|products?|cart)(?:/|$)", re.I)
 
