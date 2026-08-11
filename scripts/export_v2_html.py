@@ -632,12 +632,16 @@ def _storefront_cell(c):
     stype = storefront_mod.storefront_type(c)
     if st == "confirmed_yes" and su:
         return f'<a href="{esc(su)}" target="_blank">{esc(stype or "打开橱窗")} ↗</a>'
-    # 仍给未归类的 bio 链作人工核验入口，但不把普通网页冒充成已确认橱窗。
-    bl = c.get("bio_links") or []
-    if bl:
-        return f'<a href="{esc(bl[0])}" target="_blank">Bio 链接（橱窗未确认）↗</a>'
-    return {"confirmed_no": '<span class="muted">确认无橱窗</span>',
-            "unknown": '<span class="muted">未确认</span>'}.get(st, '<span class="muted">—</span>')
+    if st == "confirmed_no":
+        return '<span class="muted">确认无橱窗</span>'
+    if st == "unknown":
+        # 仅证据不足时给未归类的 bio 链作人工核验入口；
+        # 已确认无橱窗的普通网页不得回退成“橱窗未确认”。
+        bl = c.get("bio_links") or []
+        if bl:
+            return f'<a href="{esc(bl[0])}" target="_blank">Bio 链接（橱窗未确认）↗</a>'
+        return '<span class="muted">未确认</span>'
+    return '<span class="muted">—</span>'
 
 
 def _typical_er(c):
