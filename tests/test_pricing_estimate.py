@@ -565,8 +565,8 @@ def test_row_media_kind_host_and_shortcode_must_match_provenance(row_mutation):
 
 
 def _canonical_alias_reel():
-    original = "Dbsxxpdx8a1AKZQkBUvtz0VaOdErIRRX9Qw1SI0"
-    canonical = "Dbsxxpdx8a1"
+    original = "AbCdeFGhI12LongFixtureToken9876543210XYZ"
+    canonical = "AbCdeFGhI12"
     row = _reel(original, 10_000, 1)
     row["media_identity_provenance"].update(
         requested_shortcode=canonical,
@@ -601,13 +601,13 @@ def test_https_instagram_same_kind_bound_canonical_alias_can_close_population():
             ),
         ),
         lambda p: p.update(
-            page_canonical_url="http://www.instagram.com/owner/reel/Dbsxxpdx8a1/"
+            page_canonical_url="http://www.instagram.com/owner/reel/AbCdeFGhI12/"
         ),
         lambda p: p.update(
-            page_canonical_url="https://evil.example/owner/reel/Dbsxxpdx8a1/"
+            page_canonical_url="https://evil.example/owner/reel/AbCdeFGhI12/"
         ),
         lambda p: p.update(
-            page_canonical_url="https://www.instagram.com/owner/p/Dbsxxpdx8a1/"
+            page_canonical_url="https://www.instagram.com/owner/p/AbCdeFGhI12/"
         ),
         lambda p: p.update(
             page_canonical_url="https://www.instagram.com/owner/reel/OTHER/"

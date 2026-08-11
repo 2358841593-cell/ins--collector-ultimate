@@ -169,7 +169,7 @@ def test_fetch_reel_metric_passes_decimal_media_id_to_same_origin_script():
 
 
 def test_collaboration_token_uses_page_og_shortcode_and_response_proof():
-    long_code = "Dbsxxpdx8a1AKZQkBUvtz0VaOdErIRRX9Qw1SI0"
+    long_code = "AbCdeFGhI12LongFixtureToken9876543210XYZ"
     page = _MediaInfoPage(
         {
             "http_status": 200,
@@ -181,25 +181,25 @@ def test_collaboration_token_uses_page_og_shortcode_and_response_proof():
 
     result = browser._fetch_reel_metric(  # noqa: SLF001
         page,
-        f"/_thebmethod/reel/{long_code}/",
+        f"/_fixturepartner/reel/{long_code}/",
         canonical_url=(
-            "https://www.instagram.com/_thebmethod/reel/Dbsxxpdx8a1/"
+            "https://www.instagram.com/_fixturepartner/reel/AbCdeFGhI12/"
         ),
         canonical_source="og:url",
     )
 
     assert page.calls == [
-        (browser._IG_MEDIA_INFO_JS, "3957757088608274101")
+        (browser._IG_MEDIA_INFO_JS, "487081320120618358")
     ]
     assert result["like_count"] == 3
     assert result["comment_count"] == 23
     assert result["media_identity_provenance"] == {
-        "requested_shortcode": "Dbsxxpdx8a1",
+        "requested_shortcode": "AbCdeFGhI12",
         "original_shortcode": long_code,
-        "canonical_shortcode": "Dbsxxpdx8a1",
+        "canonical_shortcode": "AbCdeFGhI12",
         "requested_shortcode_source": "og:url",
         "page_canonical_url": (
-            "https://www.instagram.com/_thebmethod/reel/Dbsxxpdx8a1/"
+            "https://www.instagram.com/_fixturepartner/reel/AbCdeFGhI12/"
         ),
         "response_code": long_code,
         "identity_verified": True,
@@ -209,21 +209,21 @@ def test_collaboration_token_uses_page_og_shortcode_and_response_proof():
 @pytest.mark.parametrize(
     "canonical_url",
     [
-        "https://evil.example/_thebmethod/reel/Dbsxxpdx8a1/",
-        "http://www.instagram.com/_thebmethod/reel/Dbsxxpdx8a1/",
-        "https://www.instagram.com/_thebmethod/p/Dbsxxpdx8a1/",
-        "https://www.instagram.com/_thebmethod/reel/UNRELATED/",
+        "https://evil.example/_fixturepartner/reel/AbCdeFGhI12/",
+        "http://www.instagram.com/_fixturepartner/reel/AbCdeFGhI12/",
+        "https://www.instagram.com/_fixturepartner/p/AbCdeFGhI12/",
+        "https://www.instagram.com/_fixturepartner/reel/UNRELATED/",
     ],
 )
 def test_invalid_page_canonical_never_truncates_collaboration_token(
     canonical_url,
 ):
-    long_code = "Dbsxxpdx8a1AKZQkBUvtz0VaOdErIRRX9Qw1SI0"
+    long_code = "AbCdeFGhI12LongFixtureToken9876543210XYZ"
     page = _MediaInfoPage({"http_status": 400})
 
     result = browser._fetch_reel_metric(  # noqa: SLF001
         page,
-        f"/_thebmethod/reel/{long_code}/",
+        f"/_fixturepartner/reel/{long_code}/",
         canonical_url=canonical_url,
     )
 
@@ -237,7 +237,7 @@ def test_invalid_page_canonical_never_truncates_collaboration_token(
 
 
 def test_canonical_media_response_identity_mismatch_fails_closed():
-    long_code = "Dbsxxpdx8a1AKZQkBUvtz0VaOdErIRRX9Qw1SI0"
+    long_code = "AbCdeFGhI12LongFixtureToken9876543210XYZ"
     page = _MediaInfoPage(
         {
             "http_status": 200,
@@ -249,9 +249,9 @@ def test_canonical_media_response_identity_mismatch_fails_closed():
 
     result = browser._fetch_reel_metric(  # noqa: SLF001
         page,
-        f"/_thebmethod/reel/{long_code}/",
+        f"/_fixturepartner/reel/{long_code}/",
         canonical_url=(
-            "https://www.instagram.com/_thebmethod/reel/Dbsxxpdx8a1/"
+            "https://www.instagram.com/_fixturepartner/reel/AbCdeFGhI12/"
         ),
     )
 
@@ -272,8 +272,8 @@ class _CanonicalDeepPage:
                 "taken_at": None,
                 "text": "",
                 "canonical_url": (
-                    "https://www.instagram.com/_thebmethod/reel/"
-                    "Dbsxxpdx8a1/"
+                    "https://www.instagram.com/_fixturepartner/reel/"
+                    "AbCdeFGhI12/"
                 ),
                 "canonical_source": "og:url",
             }
@@ -283,8 +283,8 @@ class _CanonicalDeepPage:
 def test_deep_canonical_refresh_restores_latest_collaboration_pricing_row(
     tmp_path, monkeypatch
 ):
-    long_code = "Dbsxxpdx8a1AKZQkBUvtz0VaOdErIRRX9Qw1SI0"
-    href = f"/_thebmethod/reel/{long_code}/"
+    long_code = "AbCdeFGhI12LongFixtureToken9876543210XYZ"
+    href = f"/_fixturepartner/reel/{long_code}/"
     pricing_sample = {
         "code": href,
         "url": f"https://www.instagram.com{href}",
@@ -326,8 +326,8 @@ def test_deep_canonical_refresh_restores_latest_collaboration_pricing_row(
         assert metric_href == href
         assert kwargs == {
             "canonical_url": (
-                "https://www.instagram.com/_thebmethod/reel/"
-                "Dbsxxpdx8a1/"
+                "https://www.instagram.com/_fixturepartner/reel/"
+                "AbCdeFGhI12/"
             ),
             "canonical_source": "og:url",
         }
@@ -346,11 +346,11 @@ def test_deep_canonical_refresh_restores_latest_collaboration_pricing_row(
             "taken_at": 1_786_000_000,
             "like_and_view_counts_disabled": True,
             "media_identity_provenance": {
-                "requested_shortcode": "Dbsxxpdx8a1",
+                "requested_shortcode": "AbCdeFGhI12",
                 "requested_shortcode_source": "og:url",
                 "page_canonical_url": (
-                    "https://www.instagram.com/_thebmethod/reel/"
-                    "Dbsxxpdx8a1/"
+                    "https://www.instagram.com/_fixturepartner/reel/"
+                    "AbCdeFGhI12/"
                 ),
                 "response_code": long_code,
                 "identity_verified": True,
@@ -361,8 +361,8 @@ def test_deep_canonical_refresh_restores_latest_collaboration_pricing_row(
 
     result, _evidence = browser.deep_collect(
         _CanonicalDeepPage(),
-        {"handle": "diana_wellnessroute"},
-        tmp_path / "data/evidence/BATCH/diana_wellnessroute",
+        {"handle": "fixture_wellness_creator"},
+        tmp_path / "data/evidence/BATCH/fixture_wellness_creator",
         n_posts=1,
     )
 
@@ -408,15 +408,15 @@ def test_pricing_alias_refresh_rejects_unverified_response_bundle():
     "sample",
     [
         {
-            "code": "/owner/reel/Dbsxxpdx8a1/",
+            "code": "/owner/reel/AbCdeFGhI12/",
             "play_count": None,
             "play_count_status": "api_http_400",
             "pinned": None,
         },
         {
             "code": (
-                "/_thebmethod/reel/"
-                "Dbsxxpdx8a1AKZQkBUvtz0VaOdErIRRX9Qw1SI0/"
+                "/_fixturepartner/reel/"
+                "AbCdeFGhI12LongFixtureToken9876543210XYZ/"
             ),
             "play_count": 111,
             "play_count_status": "observed",
@@ -434,14 +434,14 @@ def test_verified_alias_never_overwrites_standard_or_observed_pricing_sample(
         "play_count_source": "ig_media_info.ig_play_count",
         "pinned": False,
         "media_identity_provenance": {
-            "requested_shortcode": "Dbsxxpdx8a1",
+            "requested_shortcode": "AbCdeFGhI12",
             "requested_shortcode_source": "og:url",
             "page_canonical_url": (
-                "https://www.instagram.com/_thebmethod/reel/"
-                "Dbsxxpdx8a1/"
+                "https://www.instagram.com/_fixturepartner/reel/"
+                "AbCdeFGhI12/"
             ),
             "response_code": (
-                "Dbsxxpdx8a1AKZQkBUvtz0VaOdErIRRX9Qw1SI0"
+                "AbCdeFGhI12LongFixtureToken9876543210XYZ"
             ),
             "identity_verified": True,
         },
