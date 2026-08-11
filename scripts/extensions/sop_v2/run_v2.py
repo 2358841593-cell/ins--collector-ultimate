@@ -75,6 +75,7 @@ _INTERNAL_RUNTIME_FIELDS = {
     "stage3_comment_retry_state",
     "stage3_comment_retry_history",
     "deep_evidence_merge_provenance",
+    "evidence_dir",
 }
 
 

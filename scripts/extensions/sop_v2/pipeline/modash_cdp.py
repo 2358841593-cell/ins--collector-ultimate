@@ -12,6 +12,9 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
+from pathlib import Path
 
 from ..countries import normalize_country_code
 
@@ -257,9 +260,48 @@ def parse_report(data: dict, handle: str) -> dict | None:
 
 def _cache_path(cache_dir, handle):
     import re
-    from pathlib import Path
     safe = re.sub(r"[^a-z0-9_.-]", "_", handle.lower())
     return Path(cache_dir) / f"{safe}.json"
+
+
+def _atomic_write_cache(path: Path, data: dict) -> None:
+    """Durably replace one identity-verified raw report in the same directory."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    fd, raw_tmp = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    tmp = Path(raw_tmp)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            fd = -1
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+        directory_fd = os.open(
+            path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except Exception:
+        if fd >= 0:
+            os.close(fd)
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _validated_report(data, handle: str) -> dict | None:
+    """Treat malformed or cross-account raw payloads as cache misses."""
+    if not isinstance(data, dict):
+        return None
+    try:
+        return parse_report(data, handle)
+    except (AttributeError, TypeError, ValueError):
+        return None
 
 
 def enrich_via_cdp(cands: list[dict], query: str, filters: dict,
@@ -269,16 +311,12 @@ def enrich_via_cdp(cands: list[dict], query: str, filters: dict,
     cache_dir：原始报告落盘目录。命中缓存则**免 credit 重解**（改进解析器后无需重付费）；
     未命中才 fetch（耗 1 credit）并存盘。一次 credit 榨干、且只付一次。
     """
-    from pathlib import Path
     from playwright.sync_api import sync_playwright
     if cache_dir:
         Path(cache_dir).mkdir(parents=True, exist_ok=True)
     matched = from_cache = 0
 
-    def _apply(cand, data, h):
-        d = parse_report(data, h) if data else None
-        if not d:
-            return False
+    def _apply(cand, d, h):
         for k, v in d.items():
             if v is not None and cand.get(k) is None:
                 cand[k] = v
@@ -298,7 +336,9 @@ def enrich_via_cdp(cands: list[dict], query: str, filters: dict,
                 data = json.loads(cp.read_text())
             except Exception:  # noqa: BLE001
                 data = None
-            if data and _apply(cand, data, h):
+            parsed = _validated_report(data, h)
+            if parsed:
+                _apply(cand, parsed, h)
                 matched += 1
                 from_cache += 1
                 continue
@@ -322,12 +362,15 @@ def enrich_via_cdp(cands: list[dict], query: str, filters: dict,
                 h = (cand.get("handle") or "").lstrip("@")
                 spid = idmap.get(h.lower())
                 data = fetch_report(pg, spid) if spid else None
-                if data and cache_dir:
-                    try:
-                        _cache_path(cache_dir, h).write_text(json.dumps(data, ensure_ascii=False))
-                    except Exception:  # noqa: BLE001
-                        pass
-                if _apply(cand, data, h):
+                parsed = _validated_report(data, h)
+                if parsed and cache_dir:
+                    # A paid report without durable raw evidence is not a
+                    # successful formal enrichment.  Propagate storage errors
+                    # before mutating the in-memory candidate so Stage 4 cannot
+                    # silently publish an unauditable result.
+                    _atomic_write_cache(_cache_path(cache_dir, h), data)
+                if parsed:
+                    _apply(cand, parsed, h)
                     matched += 1
                 else:
                     print(f"  Modash ✗ @{h}（spid={'有' if spid else '无'}，报告未拿到 → 标待补数）")

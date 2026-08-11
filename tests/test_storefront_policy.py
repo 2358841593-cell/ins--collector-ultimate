@@ -28,6 +28,10 @@ from extensions.sop_v2.pipeline.stage2_qualify import qualify_one  # noqa: E402
         ("https://brand.myshopify.com/", "自营店"),
         ("https://linktr.ee/example", "链接聚合"),
         ("https://wonderl.ink/example", "链接聚合"),
+        ("https://bio.site/example", "链接聚合"),
+        ("https://taplink.cc/example", "链接聚合"),
+        ("https://zez.am/example", "链接聚合"),
+        ("https://stan.store/example", "自营店"),
         ("https://calendly.com/example", None),
         ("https://instagram.com/example", None),
     ],
@@ -38,6 +42,13 @@ def test_classify_storefront_url(url, kind):
 
 def test_non_amazon_shop_path_is_not_mislabeled_amazon():
     assert bc._shop_type("https://brand.example/shop/skin") == "自营店"
+
+
+@pytest.mark.parametrize("host", ["atom.bio", "taplink.cc", "zez.am"])
+def test_profile_html_fallback_recovers_supported_link_in_bio_hosts(host):
+    assert bc._extract_bio_link(f'{{"bio":"{host}/creator"}}') == (
+        f"https://{host}/creator"
+    )
 
 
 def test_aggregator_remains_a_storefront_when_penetration_fails(monkeypatch):

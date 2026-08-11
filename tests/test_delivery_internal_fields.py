@@ -29,6 +29,7 @@ def test_delivery_candidate_strips_attempt_and_retry_metadata():
         "stage3_comment_retry_state": [{"identity": "MEDIA"}],
         "stage3_comment_retry_history": [{"identity": "LEGACY"}],
         "deep_evidence_merge_provenance": {"internal": True},
+        "evidence_dir": "data/evidence/ROUND-1/creator",
     }
 
     delivered = run_v2._delivery_candidate(source)  # noqa: SLF001
@@ -54,6 +55,7 @@ def test_delivery_denylist_covers_creator_cache_runtime_fields():
         "_queue_lock_token",
         "_queue_from_status",
         "_cache_hit",
+        "evidence_dir",
     } <= run_v2._INTERNAL_RUNTIME_FIELDS  # noqa: SLF001
 
 

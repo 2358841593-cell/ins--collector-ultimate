@@ -153,3 +153,33 @@ def test_explicit_zero_cap_keeps_every_actionable_candidate():
     assert len(selected) == 25
     assert stats["selected"] == 25
     assert stats["non_actionable_skipped"] == 0
+
+
+def test_all_missing_mode_skips_existing_reports_and_zero_cap_is_unlimited():
+    missing = [
+        clean_full(handle=f"missing_{index}", modash_report=False)
+        for index in range(25)
+    ]
+    report_with_source_gaps = clean_full(
+        handle="report_present",
+        modash_report=True,
+        fake_pct=None,
+        creator_country=None,
+        top_audience_country=None,
+    )
+
+    selected, stats = (
+        stage4_decide._build_modash_all_missing_shortlist(  # noqa: SLF001
+            [*missing, report_with_source_gaps], cap=0
+        )
+    )
+
+    assert [candidate["handle"] for candidate in selected] == [
+        f"missing_{index}" for index in range(25)
+    ]
+    assert stats == {
+        "candidate_count": 26,
+        "report_present": 1,
+        "report_missing": 25,
+        "selected": 25,
+    }

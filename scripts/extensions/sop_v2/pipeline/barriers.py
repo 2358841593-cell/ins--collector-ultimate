@@ -41,6 +41,14 @@ from typing import Any, Mapping
 
 SOURCE_KEYS = ("golden_lookalike", "generic_commerce", "exploration")
 REQUIRED_B3_FAILURE_KEYS = ("pricing", "translation", "audit")
+REQUIRED_B4_FAILURE_KEYS = (
+    "pricing",
+    "translation",
+    "audit",
+    "modash",
+    "storefront",
+    "sponsorship",
+)
 _REQUIRED_COLUMNS = {
     "handle",
     "status",
@@ -268,6 +276,30 @@ def handle_set_sha256(handles: list[str] | tuple[str, ...] | set[str]) -> str:
     return hashlib.sha256("\n".join(normalized).encode("utf-8")).hexdigest()
 
 
+def delivery_state_sha256(rows: list[Mapping[str, Any]]) -> str:
+    """Bind an external delivery audit to the exact database row contents.
+
+    B4 consumes expensive validators that live outside this module.  A plain set
+    of failure counters is not sufficient because the underlying ``stage_json``
+    could change between validation and the barrier call.  This digest covers
+    every field that controls the immutable delivery state and is recomputed by
+    :func:`evaluate_b4` from a fresh read-only transaction.
+    """
+    normalized: list[dict[str, Any]] = []
+    for row in rows:
+        normalized.append(
+            {
+                "handle": normalize_handle(row.get("handle")),
+                "status": row.get("status"),
+                "stage_error": row.get("stage_error"),
+                "locked_at": row.get("locked_at"),
+                "stage_json": row.get("stage_json"),
+            }
+        )
+    normalized.sort(key=lambda row: (row["handle"], str(row.get("status") or "")))
+    return hashlib.sha256(_canonical_json_bytes({"rows": normalized})).hexdigest()
+
+
 def _source_bucket(stage: Mapping[str, Any]) -> str | None:
     for key in (
         "discovery_quota_bucket",
@@ -382,14 +414,19 @@ def _read_batch_snapshot(db_path: str | Path, batch_id: str) -> dict[str, Any]:
         "empty_handles": total - len(nonempty_handles),
         "duplicate_handles_case_insensitive": len(nonempty_handles) - unique_handles,
         "handle_set_sha256": handle_set_sha256(nonempty_handles),
+        "delivery_state_sha256": delivery_state_sha256(
+            [dict(row) for row in rows]
+        ),
         "status_counts": dict(sorted(status_counts.items())),
         "seed_count": status_counts.get("seed", 0),
         "qualified_count": status_counts.get("qualified", 0),
         "collected_count": status_counts.get("collected", 0),
+        "decided_count": status_counts.get("decided", 0),
         "rejected_count": status_counts.get("rejected", 0),
         "stage2_output_count": known_stage2_statuses,
         "stage2_other_status_count": total - known_stage2_statuses,
         "b3_other_status_count": total - status_counts.get("collected", 0),
+        "b4_other_status_count": total - status_counts.get("decided", 0),
         "error_count": errors,
         "lock_count": locks,
         "seed_error_count": seed_errors,
@@ -650,6 +687,33 @@ def _normalize_b3_failure_counts(
     return dict(sorted(normalized.items()))
 
 
+def _normalize_b4_failure_counts(
+    failure_counts: Mapping[str, int | None] | None,
+) -> dict[str, int | None]:
+    """Normalize the post-enrichment delivery counters.
+
+    B4 is deliberately stricter than B3: Modash report coverage, Storefront
+    resolution and sponsorship derivation are first-class delivery evidence.
+    Missing counters are unknown and therefore fail closed.
+    """
+    if failure_counts is None:
+        return {key: None for key in REQUIRED_B4_FAILURE_KEYS}
+    if not isinstance(failure_counts, Mapping):
+        raise BarrierInputError("failure_counts must be a mapping")
+    normalized: dict[str, int | None] = {}
+    for key, value in failure_counts.items():
+        if not isinstance(key, str) or not key.strip():
+            raise BarrierInputError("failure_counts keys must be non-empty strings")
+        normalized[key.strip()] = _nonnegative_count(
+            value,
+            f"failure_counts.{key}",
+            allow_unknown=True,
+        )
+    for key in REQUIRED_B4_FAILURE_KEYS:
+        normalized.setdefault(key, None)
+    return dict(sorted(normalized.items()))
+
+
 def evaluate_b3(
     db_path: str | Path,
     *,
@@ -719,6 +783,91 @@ def evaluate_b3(
     return _result("B3", selected_batch, checks, observed)
 
 
+def evaluate_b4(
+    db_path: str | Path,
+    *,
+    stage1_artifact: Mapping[str, Any] | str | Path,
+    batch_id: str | None = None,
+    failure_counts: Mapping[str, int | None] | None = None,
+    validated_delivery_state_sha256: str | None = None,
+) -> BarrierResult:
+    """Evaluate the immutable post-enrichment delivery barrier.
+
+    B3 proves that collection is complete *before* Profile credits are spent.
+    B4 proves that the subsequently enriched and routed cohort is still the
+    exact Stage 1 cohort, is fully ``decided``, has no errors or locks, and has
+    fresh zero-failure counters for deep audit, pricing, translations, Modash,
+    Storefront and sponsorship evidence.  This avoids rewinding ``decided`` rows
+    merely to replay B3 after a delivery-only remediation.
+    """
+    loaded_artifact = _load_json_object(stage1_artifact, label="stage1_artifact")
+    expected = _stage1_expectation(loaded_artifact)
+    selected_batch = batch_id or expected.batch_id
+    snapshot = _read_batch_snapshot(db_path, selected_batch)
+    external = _normalize_b4_failure_counts(failure_counts)
+    validated_state = _sha_or_none(
+        validated_delivery_state_sha256,
+        "validated_delivery_state_sha256",
+    )
+    observed = {
+        **snapshot,
+        "stage1_artifact_sha256": expected.artifact_sha256,
+        "stage1_expected_total": expected.target_total,
+        "failure_counts": external,
+        "validated_delivery_state_sha256": validated_state,
+    }
+    checks = [
+        _check("artifact_batch_matches_request", expected.batch_id, selected_batch),
+        _check("cohort_total_matches_target", snapshot["total"], expected.target_total),
+        _check(
+            "cohort_unique_handles_match_target",
+            snapshot["unique_handles"],
+            expected.target_total,
+        ),
+        _check("cohort_empty_handles_zero", snapshot["empty_handles"], 0),
+        _check(
+            "cohort_case_insensitive_duplicates_zero",
+            snapshot["duplicate_handles_case_insensitive"],
+            0,
+        ),
+        _check(
+            "cohort_handle_fingerprint_matches_artifact",
+            snapshot["handle_set_sha256"],
+            expected.handle_set_sha256,
+            detail=(
+                "missing Stage 1 fingerprint blocks B4"
+                if expected.handle_set_sha256 is None
+                else None
+            ),
+        ),
+        _check("all_candidates_decided", snapshot["decided_count"], expected.target_total),
+        _check("non_decided_statuses_zero", snapshot["b4_other_status_count"], 0),
+        _check("batch_stage_errors_zero", snapshot["error_count"], 0),
+        _check("batch_locks_zero", snapshot["lock_count"], 0),
+        _check("stage_json_invalid_zero", snapshot["invalid_stage_json_count"], 0),
+        _check(
+            "validated_delivery_state_matches_current",
+            snapshot["delivery_state_sha256"],
+            validated_state,
+            detail=(
+                "missing validated delivery-state fingerprint blocks B4"
+                if validated_state is None
+                else None
+            ),
+        ),
+    ]
+    for name, count in external.items():
+        checks.append(
+            _check(
+                f"external_{name}_failures_zero",
+                count,
+                0,
+                detail="unknown external result blocks B4" if count is None else None,
+            )
+        )
+    return _result("B4", selected_batch, checks, observed)
+
+
 __all__ = [
     "BarrierCheck",
     "BarrierInputError",
@@ -727,6 +876,8 @@ __all__ = [
     "evaluate_b1",
     "evaluate_b2",
     "evaluate_b3",
+    "evaluate_b4",
+    "delivery_state_sha256",
     "handle_set_sha256",
     "normalize_handle",
 ]

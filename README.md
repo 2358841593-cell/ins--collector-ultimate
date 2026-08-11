@@ -11,7 +11,9 @@
 Stage 1 原子完成 → graph_runner 校验 B1
                   → 1 个 Stage 2 浅采 producer ∥ Stage 3 深采 consumer group（W1…Wn）
                   → B2 + drain → reject deep tail → graph_runner Stage 3 resume
-                  → B3 全量证据 Barrier → Modash enrich → Stage 4 交付
+                  → B3 全量证据 Barrier
+                  → Storefront / Modash enrichment → strict Stage 4
+                  → B4 post-enrichment → 版本化客户导出
 ```
 
 Instagram 侧只使用 Playwright 驱动的登录态 Chrome profile。`discover.py`、
@@ -52,7 +54,10 @@ flowchart TB
     GRAPH["graph_runner<br/>固定 DAG / Barrier / 波次监督"]
     S2["阶段 2 · 主页浅扫<br/>主页资料 / 个人简介 / 类目 / 电商橱窗 / 赛道"]
     S3["阶段 3 · 深采 consumer group<br/>W1…Wn / 互斥切片片内轮换<br/>每波动态均分 claim cap / 单调证据"]
-    S4["阶段 4 · 决策与导出<br/>可行动 Modash 补数 → 展示估价 → 门禁 → 评分 → 路由 → 导出"]
+    SF["Storefront 独立补证<br/>collect-plan → review → CAS apply"]
+    MENRICH["Modash enrichment<br/>草稿 route_actionable / 正式 all-missing"]
+    S4["阶段 4 · strict 决策<br/>展示估价 → 门禁 → 评分 → 路由"]
+    B4["B4 post-enrichment<br/>exact state hash / 六项失败为 0"]
 
     DB[("creator_cache.db<br/>状态投影 / attempt ledger / canonical 证据<br/>原子 claim + heartbeat + token/CAS")]
     LEASE[("resource_leases.db<br/>账号 + Chrome Profile<br/>bundle lease / heartbeat / CAS")]
@@ -83,10 +88,19 @@ flowchart TB
     PROXY --> S3
     S3 -->|"collected"| DB
     S3 --> EVIDENCE
-    DB --> S4
-    MODASH -->|"CDP 或 CSV"| S4
+    DB --> SF
+    SHALLOW_ACCOUNTS --> SF
+    DEEP_ACCOUNTS --> SF
+    PROXY --> SF
+    SF --> LEASE
+    SF -->|"Storefront allowlist CAS"| DB
+    DB --> MENRICH
+    MODASH -->|"CDP 或 CSV"| MENRICH
+    MENRICH --> S4
     S4 -->|"decided + final_pool"| DB
-    S4 --> OUT
+    DB --> B4
+    S4 --> B4
+    B4 --> OUT
     S2 -. "账号、代理或导航错误" .-> ERR
     S3 -. "账号、代理或导航错误" .-> ERR
     ERR --> DB
@@ -124,9 +138,10 @@ flowchart LR
     S3 --> B3{"Barrier 3<br/>全量深采 / 报价 / 翻译<br/>失败项清零并完成总数对账"}
     B2 --> B3
     PRIVATE -. "若存在则当前正式流阻断；<br/>合同支持例外后方可汇合" .-> B3
-    B3 --> ENRICH["Modash enrich<br/>只处理可实际改变路由的候选<br/>cap 仅为上限、不凑数"]
-    ENRICH --> S4["Stage 4 严格决策与五池交付"]
-    S4 --> DELIVERY["版本化 JSON / XLSX / HTML"]
+    B3 --> ENRICH["Storefront collect-plan/apply<br/>+ Modash all-missing enrichment"]
+    ENRICH --> S4["strict Stage 4<br/>内部 decisions 基线"]
+    S4 --> B4{"Barrier 4 · post-enrichment<br/>exact state hash / 全 decided<br/>六项失败为 0"}
+    B4 --> DELIVERY["版本化 JSON / XLSX / HTML"]
     DELIVERY --> FEEDBACK["客户反馈安全回流"]
     FEEDBACK --> CONTRACT
 ```
@@ -153,7 +168,7 @@ worker 解释为无限量的危险值已禁用。
 | 阶段 1（发现） | 客户批准/已合作金种子结果、Modash CDP、SOP 配置 | 在内存完成全部来源、分页、全局去重、配额与指纹对账；全部满足后一次性写入，失败不留部分 seed | `seed` + Barrier 1 | 否 |
 | 阶段 2（浅扫 producer） | `seed`、浅扫账号池 | 持续产出主页资料、品牌/私密、个人简介、通用电商橱窗和赛道；每个成功项解锁后立即可交给 Stage 3 | `qualified` / `rejected` | 是 |
 | 阶段 3（深采 consumer group） | 已 `qualified` 且 unlocked 的候选、按 worker 互斥切分的隔离深采账号池；Stage 2 完成后再接公开 reject tail | 刷新主页最近 N 帖、逐帖核验评论；把最多 120 条已存原文交给本机 LLM 统一译成中文并重算意图/低质指标；计算真实互动率与内容信号；另取最近 10 条非置顶短视频播放证据 | `collected`；错误保持原态 | 是 |
-| 阶段 4（决策） | 已通过全量证据 Barrier 且完成 Modash/人工补数的 cohort | 展示型报价派生、硬门禁、A-F 评分、不适用项归一化、固定待复核、五池、导出 | `decided + final_pool` | 否 |
+| 阶段 4（决策） | 已通过 B3 且完成 Storefront/Modash/人工补数的 cohort | 严格 enrichment 门禁、展示型报价派生、硬门禁、A-F 评分、不适用项归一化、固定待复核、五池；先生成内部决策基线 | `decided + final_pool`；再过 B4 才客户导出 | 否 |
 
 阶段 1 有两条明确区分的来源：经客户 approved/collaborated 金种子驱动的 Modash
 Lookalike，以及默认调用 `/api/search/v2/instagram` 的通用结构化搜索。2026-08-10 已在
@@ -164,23 +179,33 @@ marketer UI 真机确认同源 Lookalike 请求
 品牌/私密和赛道做本地预过滤。旧 AI Search DOM 抽取只作为 `--ai-search` 兜底；
 普通结构化搜索仍不能冒充 Golden Lookalike 来源。
 
-阶段 4 支持 Modash CSV 或 CDP 报告补数；缺少第三方核心字段时，候选诚实进入待复核池，
-不视为流水线故障。CDP 模式在消耗 Profile credit 前，只用 Modash 负责的缺失字段构造乐观
-投影，并分别执行当前路由与补数后路由；只有最终池级别确实可以提升的候选才进入 shortlist。
-已有非空值不会被乐观值覆盖，评论、Storefront、实算 ER 等 Instagram 侧固定阻断也不能靠
-Modash 修复。`--modash-cap` 是最多可买的报告数，不是必须凑满的配额；可行动候选少于 cap
-时只处理实际人数，`0` 才表示不设上限。
+Modash 有两种明确分离的补数模式。默认 `route_actionable` 与 `--modash-cap 20` 只为内部预算
+草稿购买“乐观补齐后可能改变路由”的报告；它不补非 Modash blocker，也不等于正式字段完整。
+正式交付必须同时使用
+`--modash-all-missing --modash-cap 0 --strict-enrichment-completeness`，补齐全部
+`modash_report is not True` 的候选。已有报告即使 `fake_pct`、国家、语言等个别源字段为空，
+交付也应显示“Modash无”，不能重复购买。完整新批 120 人约需 120 个 Profile credit；当前
+SKIN6 已有 4 份身份校验缓存，正式增量为 116。结构化搜索与 Golden Lookalike 列表不消耗
+Profile Report credit。
 
 当前 CDP 兼容契约以 `https://marketer.modash.io/discovery/instagram` 的登录态页面为准。
 Profile 补数先用 Creator 模式的 `filters.username` 做精确 Handle 查询，并校验精确用户名；
 当前响应主键为 `serviceSdId`，同时兼容历史 `servicePlatformId`。瞬时空响应会做有限重试，
-旧 bulk discovery 只作为 fallback，不能把模糊结果误配给候选。
+旧 bulk discovery 只作为 fallback，不能把模糊结果误配给候选。raw report 只有通过
+`parse_report(data, handle)` 身份校验后才原子缓存；合法缓存命中不连接 CDP，坏缓存可由新的
+合法报告替换，错身份响应不得落盘。
 
 电商橱窗是通用购物入口，不是 Amazon 专属白名单。Amazon、LTK、ShopMy、明确
 自营店和已识别的购物聚合入口都可以构成 `confirmed_yes`；确认没有任何电商橱窗的
 `confirmed_no` 也继续深采，并可进入 `Include-Without-Storefront`；只有证据不足的
 `unknown` 进入待复核池。阶段 2 不得再以 `no_amazon_storefront` 或
 `confirmed_no` 提前淘汰。
+
+B3 后若仍有 Storefront `unknown`，使用独立的 `storefront_backfill collect/apply` 双阶段补证，
+不重跑 Stage 3。collect 只读锁定 expected-count 与 Handle SHA，强制代理、浅/深账号池/Profile
+预检和 resource lease，并对 unknown 换浅扫账号重试；apply 只接受人工核对且
+`unresolved_count=0` 的不可覆盖 plan，以 plan SHA 和逐行 CAS 在单事务内更新 Storefront
+allowlist，任一行漂移则全批回滚。
 
 ### 状态机
 
@@ -315,7 +340,8 @@ reports/deliveries/<batch_id>/formal-<YYYYMMDD>-r<N>/
 `--full-deep-all-candidates` 的正式模式会直接拒绝它。历史文档中的评论截图不是当前主流程的稳定承诺。
 
 正式交付采用不可覆盖的版本目录：发给客户后的 `formal-...-rN` 视为冻结，新修订必须递增
-`rN`，并保留对应 `decisions.json` 基线和 SHA-256。当前审计基线是
+`rN`，并保留对应 `decisions.json` 基线和 SHA-256。正式 r1 即使发现错误也不能原地替换；
+修复后创建新的 r2。当前审计基线是
 `SKIN4-20260723/formal-20260729-r2`：157 人，严格等于 89 个上一轮未终判账号加 68 个
 本轮新账号，`retry_pending_count=0`；上一版 `formal-20260728-r1` 保持冻结。r2 当时的历史定价
 状态为 156 个 `complete`、1 个 `fallback_modash`；后者按当前合同属于 B3 未闭合，历史目录
@@ -323,10 +349,13 @@ reports/deliveries/<batch_id>/formal-<YYYYMMDD>-r<N>/
 
 正式发布顺序固定为：严格深采审计、只读报价审计和翻译覆盖复核分别得到新鲜失败计数，
 再调用 `barriers.evaluate_b3` 对同一 Stage 1 cohort 做总数、Handle 指纹、状态、错误、锁和
-`audit/pricing/translation` 全量对账。B3 结果应保存为本地 `b3_barrier.json` 并记录 SHA-256；
-只有 `passed=true` 才能启动可能消耗 credit 的 Modash CDP 补数和 Stage 4。最终 JSON、XLSX、
-HTML 必须来自同一 `decisions.json` 基线，一起复制到新的 `formal-<YYYYMMDD>-r<N>`，生成
-`SHA256SUMS` 后再交付；任何代码、配置、合同或导出修复都使用新 revision，不覆盖旧目录。
+`audit/pricing/translation` 全量对账。B3 通过后依次执行独立 Storefront collect-plan/apply、
+Modash all-missing、strict Stage 4；随后由 `delivery_audit` 对当前 exact delivery-state SHA
+执行 B4，要求全体 `decided`，且 `audit/pricing/translation/modash/storefront/sponsorship`
+六项失败为 0。只有 B4 `passed=true` 才生成/打包 XLSX 与 HTML。最终 JSON、XLSX、HTML 必须
+来自同一 `decisions.json` 基线，一起复制到新的 `formal-<YYYYMMDD>-r<N>` 并生成
+`SHA256SUMS`。B3/B4、Storefront plan 和 raw cache 只作内部审计，不交客户；任何代码、配置、
+合同、enrichment 或导出修复都使用新 revision，不覆盖旧目录。
 
 ## V2 账号、会话、租约与代理
 
@@ -647,36 +676,42 @@ pricing-only 回填不是裸覆盖四个字段：每次尝试都追加独立 ful
 单调选择报价 owner，并原子更新 pricing canonical pointer/quality。瞬时 `missing`、伪造空态
 或更差样本不能覆盖已有 `partial5`；deep canonical 窗口与评论 retry state 保持不变。
 
-翻译已在 Stage 3 和 B3 前完成。通过 B3 后，下面的正式 Stage 4 先对已存翻译执行纯只读
-验收，再运行 Modash enrich 和决策：
+翻译已在 Stage 3 和 B3 前完成。通过 B3 后，先按
+[`RUNBOOK.md`](docs/sop_v2/RUNBOOK.md) 第 2.4 节对
+Storefront unknown 执行 collect-plan/review/apply；不得重跑 Stage 3。Storefront 全部明确后，
+正式 Stage 4 使用 all-missing、cap 0 与 strict enrichment，只生成内部决策基线：
 
 ```bash
 cd scripts
 BID=SKIN-YYYYMMDD
 ROUND_CONTRACT="../data/batches/$BID/round_contract.json"
+STAGE1_ARTIFACT="../data/runs/$BID/stage1_barrier_artifact.json"
+DB="../data/creator_cache.db"
 
-# 4A. 使用 Modash CDP 补数并交付
 PYTHONPATH=. ../.venv/bin/python -m extensions.sop_v2.pipeline.stage4_decide \
   --batch-id "$BID" --track paid \
   --round-contract "$ROUND_CONTRACT" --require-round-contract \
   --strict-completeness --full-deep-all-candidates --deep-target-posts 10 \
-  --strict-comment-translations \
-  --out "../data/runs/$BID/decisions.json" \
-  --xlsx "../data/runs/$BID/deliverable.xlsx" \
-  --modash-cdp --modash-cap 20
+  --strict-comment-translations --strict-enrichment-completeness \
+  --modash-all-missing --modash-cap 0 --cdp http://127.0.0.1:9222 \
+  --out "../data/runs/$BID/decisions.json" --no-xlsx
 
-# 4B. 或使用已导出的 CSV
-PYTHONPATH=. ../.venv/bin/python -m extensions.sop_v2.pipeline.stage4_decide \
-  --batch-id "$BID" --track paid \
-  --round-contract "$ROUND_CONTRACT" --require-round-contract \
-  --strict-completeness --full-deep-all-candidates --deep-target-posts 10 \
-  --strict-comment-translations \
-  --out "../data/runs/$BID/decisions.json" \
-  --modash-csv "../data/source/$BID-modash.csv"
+PYTHONPATH=. ../.venv/bin/python -m extensions.sop_v2.pipeline.delivery_audit \
+  --db "$DB" --batch-id "$BID" --stage1-artifact "$STAGE1_ARTIFACT" \
+  --target-posts 10 --out "../data/runs/$BID/b4_barrier.formal-r2.json"
+
+# 只有 B4 PASS 后才生成客户文件。
+PYTHONPATH=. ../.venv/bin/python ../scripts/export_v2_xlsx.py \
+  --decisions "../data/runs/$BID/decisions.json" \
+  --out "../data/runs/$BID/deliverable.xlsx"
+PYTHONPATH=. ../.venv/bin/python ../scripts/export_v2_html.py \
+  --decisions "../data/runs/$BID/decisions.json" \
+  --out "../data/runs/$BID/deliverable.html"
 ```
 
-只有人工补数文件真实存在时，才在 4A/4B 额外添加
+只有人工补数文件真实存在时，才额外添加
 `--manual-csv "../data/source/$BID-manual.csv"`；不要为了满足示例传入不存在的占位路径。
+`b4_barrier*.json`、B3、Storefront plan 和 Modash raw cache 只供内部审计，不进入客户目录。
 
 正式 Stage 4 不传 `--translation-provider/model/api-url/batch-size/source-limit`：这些参数只对
 显式 `--translate-comments` 生效，而后者仅允许草稿/补译模式。若只读验收失败，应回到
@@ -936,7 +971,8 @@ approved/collaborated 金种子。默认总目标按 50% 金种子 Lookalike、3
 
 ### 4. 按合同模式生成下一轮交付
 
-`new_only` 完成新批 Stage 1–3 后直接交付当前批，不传 carryover 文件：
+`new_only` 完成新批 Stage 1–3 和 B3 后，不传 carryover 文件。先按 Runbook 补齐 Storefront，
+再运行正式 all-missing Stage 4；B4 通过后才生成客户 XLSX/HTML：
 
 ```bash
 PYTHONPATH=scripts .venv/bin/python \
@@ -945,14 +981,9 @@ PYTHONPATH=scripts .venv/bin/python \
   --track paid \
   --round-contract "$ROUND_CONTRACT" --require-round-contract \
   --strict-completeness --full-deep-all-candidates --deep-target-posts 10 \
-  --strict-comment-translations \
-  --modash-cdp --cdp http://127.0.0.1:9222 --modash-cap 20 \
-  --out "data/runs/${NEXT_BID}/decisions.json" \
-  --xlsx "data/runs/${NEXT_BID}/deliverable.xlsx"
-
-.venv/bin/python scripts/export_v2_html.py \
-  --decisions "data/runs/${NEXT_BID}/decisions.json" \
-  --out "data/runs/${NEXT_BID}/deliverable.html"
+  --strict-comment-translations --strict-enrichment-completeness \
+  --modash-all-missing --cdp http://127.0.0.1:9222 --modash-cap 0 \
+  --out "data/runs/${NEXT_BID}/decisions.json" --no-xlsx
 ```
 
 `unresolved` / `retry_only` 在完成旧批补采以及新批 Stage 1–3 后，使用同一条
@@ -962,10 +993,10 @@ Stage 4 命令，但必须额外传入 `--carryover-manifest "$CARRYOVER"`，以
 Stage 4 会严格核对清单 SHA、来源批次、人数和 handle 集合，只纳入清单旧账号与当前新批账号；
 输出仍保留每人的 `_discovery_batch`。清单中还有待补采账号时，正式交付默认中止。
 `--allow-incomplete-carryover` 只用于显式生成内部草稿，产物 manifest 会记录该状态。
-使用 `--modash-cdp` 时，只有“仍缺 Modash 报告字段，且乐观补齐缺失字段后最终池级别会提升”
-的候选进入 shortlist；已有完整报告、已有值不会被覆盖，或仍受评论/Storefront/实算 ER 等
-非 Modash 条件阻断的账号不会消耗额度。`--modash-cap 20` 只允许最多 20 份，不会为凑配额
-抓取无效报告。
+默认 `--modash-cdp --modash-cap 20` 的 route-actionable shortlist 仍可用于内部预算草稿：只有
+乐观补齐后可能晋级的候选进入，不会为凑配额抓取无效报告。但它不满足正式交付；正式命令
+必须保持 `--modash-all-missing --modash-cap 0 --strict-enrichment-completeness`，随后重新生成
+B4 工件并从同一 decisions 基线导出。
 
 Carryover 复跑是幂等的：`needs_pipeline_retry=true` 的历史 `collected/rejected` 可以继续处理；
 已经是 `decided` 的记录，仅在当前 `_stage_error` 为空且 `strict_deep_reasons` 通过时才可复用。
@@ -993,13 +1024,15 @@ scripts/
       stage1_discover.py
       modash_golden_lookalikes.py       金种子 Lookalike 断点采集
       graph_runner.py                   正式 Stage 2/3 DAG 编排入口
-      barriers.py                       B1/B2/B3 只读断言
+      barriers.py                       B1/B2/B3/B4 只读断言
+      delivery_audit.py                 B4 exact-state 六项交付审计
       resource_leases.py                账号/Profile bundle lease
       stage2_qualify.py
       stage3_collect.py
       deep_attempts.py                   Stage 3 attempt ledger 与 canonical 选择
       deep_evidence_merge.py             同窗口 media identity 合并策略
       recover_deep_evidence.py           dry-run + CAS 离线证据恢复
+      storefront_backfill.py             Storefront collect-plan / CAS apply
       stage4_decide.py
       audit_collect.py
       ingest_client_decisions.py

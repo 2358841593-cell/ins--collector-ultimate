@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import sys
 import time
 from collections import Counter
@@ -145,6 +146,103 @@ def _build_modash_shortlist(
         "non_actionable_skipped": len(missing_report) - len(actionable),
         "selected": len(selected),
     }
+
+
+def _build_modash_all_missing_shortlist(
+    candidates: list[dict], cap: int
+) -> tuple[list[dict], dict[str, int]]:
+    """Select every candidate without a proven Profile Report.
+
+    This is the formal-delivery complement to the budget-aware actionable
+    shortlist.  ``modash_report is True`` is the sole report-presence signal:
+    reports are not re-fetched merely because an individual source field is
+    unavailable.  Input order is preserved so a capped retry is deterministic.
+    """
+    missing = [
+        cand for cand in candidates if cand.get("modash_report") is not True
+    ]
+    selected = missing if cap == 0 else missing[:cap]
+    return selected, {
+        "candidate_count": len(candidates),
+        "report_present": len(candidates) - len(missing),
+        "report_missing": len(missing),
+        "selected": len(selected),
+    }
+
+
+def _sponsorship_window_is_consistent(cand: dict) -> bool:
+    """Recompute sponsorship saturation from the stored caption window."""
+    from extensions.sop_v2 import content
+
+    saturation = cand.get("sponsorship_saturation")
+    if (
+        isinstance(saturation, bool)
+        or not isinstance(saturation, (int, float))
+        or not math.isfinite(float(saturation))
+        or not 0 <= float(saturation) <= 100
+    ):
+        return False
+    sampled_posts = cand.get("sampled_posts")
+    if not isinstance(sampled_posts, list) or not sampled_posts:
+        return False
+    captions: list[str] = []
+    for post in sampled_posts[:15]:
+        if not isinstance(post, dict):
+            return False
+        caption = post.get("caption")
+        if caption is None:
+            caption = post.get("caption_text")
+        if caption is None:
+            caption = ""
+        if not isinstance(caption, str):
+            return False
+        captions.append(caption.lower())
+    sponsored = sum(
+        any(term in caption for term in content.SPONSOR)
+        for caption in captions
+    )
+    expected = round(sponsored / len(captions) * 100, 1)
+    return math.isclose(float(saturation), expected, abs_tol=0.05)
+
+
+def _enrichment_completeness(
+    candidates: list[dict],
+) -> tuple[dict[str, int], list[tuple[str, list[str]]]]:
+    """Return manifest-safe coverage statistics and per-handle failures."""
+    from extensions.sop_v2 import storefront
+
+    failures: list[tuple[str, list[str]]] = []
+    modash_complete = storefront_complete = sponsorship_complete = 0
+    for cand in candidates:
+        reasons: list[str] = []
+        if cand.get("modash_report") is True:
+            modash_complete += 1
+        else:
+            reasons.append("modash_report未完成")
+        status = storefront.effective_status(cand)
+        if status in {"confirmed_yes", "confirmed_no"}:
+            storefront_complete += 1
+        else:
+            reasons.append(f"storefront未确认(effective_status={status})")
+        if _sponsorship_window_is_consistent(cand):
+            sponsorship_complete += 1
+        else:
+            reasons.append("赞助饱和度/赞助帖目标窗口不自洽")
+        if reasons:
+            failures.append((str(cand.get("handle") or "<missing>"), reasons))
+    total = len(candidates)
+    stats = {
+        "candidate_count": total,
+        "complete_count": total - len(failures),
+        "incomplete_count": len(failures),
+        "modash_report_complete_count": modash_complete,
+        "modash_report_missing_count": total - modash_complete,
+        "storefront_complete_count": storefront_complete,
+        "storefront_incomplete_count": total - storefront_complete,
+        "sponsorship_complete_count": sponsorship_complete,
+        "sponsorship_incomplete_count": total - sponsorship_complete,
+    }
+    return stats, failures
 
 
 def _carryover_retry_is_ready(
@@ -405,6 +503,14 @@ def main() -> int:
         help="正式交付前严格复核帖子覆盖、互动指标及评论零样本证据",
     )
     ap.add_argument(
+        "--strict-enrichment-completeness",
+        action="store_true",
+        help=(
+            "正式交付补数门禁：全部候选须有 Modash 报告、Storefront "
+            "yes/no 结论及自洽的赞助目标窗口"
+        ),
+    )
+    ap.add_argument(
         "--full-deep-all-candidates",
         action="store_true",
         help="严格模式同时要求 Stage 2 机器淘汰候选也完成深采",
@@ -474,6 +580,14 @@ def main() -> int:
     ap.add_argument("--modash-cdp", action="store_true",
                     help="驱动已登录 Modash Chrome(9222)读 show-profile 补假粉/受众/国家(每个约1 credit)")
     ap.add_argument(
+        "--modash-all-missing",
+        action="store_true",
+        help=(
+            "正式补数模式：启用 CDP，选取所有 modash_report 不为 true 的候选；"
+            "已有报告不重抓"
+        ),
+    )
+    ap.add_argument(
         "--modash-cap",
         type=int,
         default=None,
@@ -491,6 +605,21 @@ def main() -> int:
         ap.error("--translation-batch-size 必须为正整数")
     if args.translation_source_limit <= 0:
         ap.error("--translation-source-limit 必须为正整数")
+    if (
+        args.modash_all_missing
+        and not args.strict_enrichment_completeness
+    ):
+        print(
+            "✗ --modash-all-missing 仅允许正式补数，必须同时提供 "
+            "--strict-enrichment-completeness"
+        )
+        return 1
+    if args.modash_all_missing and args.modash_cap != 0:
+        print(
+            "✗ --modash-all-missing 必须显式提供 --modash-cap 0："
+            "完整补数不能使用会反复停在同一前缀的预算截断"
+        )
+        return 1
     if args.translate_comments and args.strict_comment_translations:
         print(
             "✗ --translate-comments 与 --strict-comment-translations 无条件互斥："
@@ -501,6 +630,8 @@ def main() -> int:
         args.round_contract
         or args.require_round_contract
         or args.strict_completeness
+        or args.strict_enrichment_completeness
+        or args.modash_all_missing
         or args.full_deep_all_candidates
     )
     if args.translate_comments and formal_requested:
@@ -688,17 +819,31 @@ def main() -> int:
                 )
             return 1
 
-    if args.modash_cdp:
+    modash_enrichment_summary = None
+    if args.modash_cdp or args.modash_all_missing:
         from extensions.sop_v2.pipeline.modash_cdp import enrich_via_cdp
-        # 省 credit：只补 active 里缺核心字段、且最优 Modash 报告仍有机会解除
-        # Review 的候选。已有完整报告或存在评论/橱窗/实算ER等非 Modash 固定
-        # blocker 的账号不重抓、不花 credit。
         cap = (
             int(cfg.get("modash_budget", {}).get("profile_per_round", 20))
             if args.modash_cap is None
             else args.modash_cap
         )
-        shortlist, shortlist_stats = _build_modash_shortlist(active, cfg, cap)
+        if args.modash_all_missing:
+            # 正式交付模式覆盖 active + rejected；只认报告存在标记，报告内
+            # 个别源字段为空不代表需要再次消耗 Profile credit。
+            shortlist, shortlist_stats = _build_modash_all_missing_shortlist(
+                cands, cap
+            )
+            # CDP apply 只填充 None，历史显式 False 同样表示“未取得报告”。
+            for candidate in shortlist:
+                candidate["modash_report"] = None
+            shortlist_mode = "all_missing_reports"
+        else:
+            # 省 credit：只补 active 里缺核心字段、且最优报告仍有机会解除
+            # Review 的候选。非 Modash 固定 blocker 不花 credit。
+            shortlist, shortlist_stats = _build_modash_shortlist(
+                active, cfg, cap
+            )
+            shortlist_mode = "route_actionable"
         disc = cfg.get("discovery", {})
         t = cfg["track"][args.track]
         lo, hi = ((t["min_followers"], t["max_followers"]) if args.track == "paid"
@@ -713,18 +858,52 @@ def main() -> int:
         cred_min = disc.get("search_audience_credibility_min")
         if cred_min:
             filt["audience"] = {"credibility": float(cred_min)}
-        print(
-            "Modash 补数(CDP)："
-            f"缺核心字段 {shortlist_stats['missing_core']} · "
-            f"报告字段缺口 {shortlist_stats['missing_report_fields']} · "
-            f"可改变结论 {shortlist_stats['actionable']} · "
-            f"非可晋级跳过 {shortlist_stats['non_actionable_skipped']} · "
-            f"本次 {len(shortlist)}/{len(active)}"
-            f"（完整旧数据不重抓，"
-            f"{'不设上限' if cap == 0 else f'上限 {cap}'}）…"
-        )
+        if args.modash_all_missing:
+            print(
+                "Modash 全量缺报告补数(CDP)："
+                f"已有报告 {shortlist_stats['report_present']} · "
+                f"缺报告 {shortlist_stats['report_missing']} · "
+                f"本次 {len(shortlist)}/{len(cands)}"
+                f"（已有报告不重抓，"
+                f"{'不设上限' if cap == 0 else f'上限 {cap}'}）…"
+            )
+        else:
+            print(
+                "Modash 补数(CDP)："
+                f"缺核心字段 {shortlist_stats['missing_core']} · "
+                f"报告字段缺口 {shortlist_stats['missing_report_fields']} · "
+                f"可改变结论 {shortlist_stats['actionable']} · "
+                f"非可晋级跳过 {shortlist_stats['non_actionable_skipped']} · "
+                f"本次 {len(shortlist)}/{len(active)}"
+                f"（完整旧数据不重抓，"
+                f"{'不设上限' if cap == 0 else f'上限 {cap}'}）…"
+            )
         cache_dir = str(Path(args.out).with_name("modash_raw"))  # 原始报告落盘→改解析器免重付费
-        r = enrich_via_cdp(shortlist, disc.get("search_query", ""), filt, args.cdp, cache_dir=cache_dir)
+        try:
+            r = enrich_via_cdp(
+                shortlist,
+                disc.get("search_query", ""),
+                filt,
+                args.cdp,
+                cache_dir=cache_dir,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(
+                "✗ Modash 补数运行失败："
+                f"{type(exc).__name__}；未写入候选库或正式交付文件",
+                flush=True,
+            )
+            return 1
+        modash_enrichment_summary = {
+            "mode": shortlist_mode,
+            "cap": cap,
+            "shortlist": shortlist_stats,
+            "result": {
+                key: r.get(key)
+                for key in ("matched", "total", "from_cache", "error")
+                if key in r
+            },
+        }
         print(f"Modash 补数(CDP): 命中 {r.get('matched')}/{r.get('total')}"
               + (f"  ⚠ {r['error']}" if r.get("error") else ""))
     elif args.modash_csv:
@@ -737,6 +916,18 @@ def main() -> int:
         from extensions.sop_v2.pipeline.modash_enrich import enrich_manual
         r = enrich_manual(active, args.manual_csv)
         print(f"人工核验回填(Raw Skin/VO/报价): 匹配 {r.get('matched')}/{r.get('total')}")
+
+    enrichment_stats, enrichment_failures = _enrichment_completeness(cands)
+    if args.strict_enrichment_completeness and enrichment_failures:
+        print(
+            "✗ enrichment 完整性门禁失败："
+            f"{len(enrichment_failures)}/{len(cands)} 个候选仍有补数缺口；"
+            "未写入候选库或正式交付文件",
+            flush=True,
+        )
+        for handle, reasons in enrichment_failures:
+            print(f"  @{handle} {'；'.join(reasons)}", flush=True)
+        return 1
 
     # 活跃号走完整 decide；机器淘汰号直接归 Exclude 写原因（客户铁律：淘汰也要体现）
     decisions = [run_v2.decide(c, cfg) for c in active] + [run_v2.decide_rejected(c, cfg) for c in rejected]
@@ -759,9 +950,15 @@ def main() -> int:
         "candidate_count": len(decisions),
         "strict_completeness": strict_mode,
         "strict_pricing": strict_mode,
+        "strict_enrichment_completeness": (
+            args.strict_enrichment_completeness
+        ),
+        "enrichment_completeness": enrichment_stats,
         "full_deep_all_candidates": args.full_deep_all_candidates,
         "deep_target_posts": args.deep_target_posts,
     }
+    if modash_enrichment_summary is not None:
+        decision_manifest["modash_enrichment"] = modash_enrichment_summary
     if contract is not None:
         decision_manifest["round_contract"] = {
             "file": _delivery_file_reference(Path(args.round_contract)),

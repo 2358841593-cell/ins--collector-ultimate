@@ -287,6 +287,95 @@ def test_b3_checks_queue_errors_locks_statuses_and_external_failures(tmp_path):
     }.issubset(result.failures)
 
 
+def test_b4_passes_only_for_fully_decided_enriched_delivery(tmp_path):
+    rows = _base_rows(status="decided")
+    db = _create_db(tmp_path, rows)
+    artifact = _artifact([row["handle"] for row in rows])
+    validated_state = barriers._read_batch_snapshot(db, BATCH)[
+        "delivery_state_sha256"
+    ]
+
+    result = barriers.evaluate_b4(
+        db,
+        stage1_artifact=artifact,
+        failure_counts={
+            "pricing": 0,
+            "translation": 0,
+            "audit": 0,
+            "modash": 0,
+            "storefront": 0,
+            "sponsorship": 0,
+        },
+        validated_delivery_state_sha256=validated_state,
+    )
+
+    assert result.passed is True
+    assert result.barrier == "B4"
+    assert result.failures == ()
+    assert _check(result, "all_candidates_decided").passed is True
+
+
+def test_b4_fails_closed_for_unknown_enrichment_and_non_decided_rows(tmp_path):
+    rows = _base_rows(status="decided")
+    rows[0]["status"] = "collected"
+    rows[1]["stage_error"] = "storefront_unresolved"
+    rows[2]["locked_at"] = "delivery-worker-token"
+    db = _create_db(tmp_path, rows)
+    artifact = _artifact([row["handle"] for row in rows])
+
+    result = barriers.evaluate_b4(
+        db,
+        stage1_artifact=artifact,
+        failure_counts={"pricing": 0, "translation": 0, "audit": 0},
+        validated_delivery_state_sha256=None,
+    )
+
+    assert result.passed is False
+    assert {
+        "all_candidates_decided",
+        "non_decided_statuses_zero",
+        "batch_stage_errors_zero",
+        "batch_locks_zero",
+        "external_modash_failures_zero",
+        "external_storefront_failures_zero",
+        "external_sponsorship_failures_zero",
+        "validated_delivery_state_matches_current",
+    }.issubset(result.failures)
+
+
+def test_b4_rejects_stale_external_validation_snapshot(tmp_path):
+    rows = _base_rows(status="decided")
+    db = _create_db(tmp_path, rows)
+    artifact = _artifact([row["handle"] for row in rows])
+    validated_state = barriers._read_batch_snapshot(db, BATCH)[
+        "delivery_state_sha256"
+    ]
+
+    conn = sqlite3.connect(db)
+    stage = json.loads(
+        conn.execute(
+            "SELECT stage_json FROM creator_profiles WHERE handle='golden_one'"
+        ).fetchone()[0]
+    )
+    stage["storefront_status"] = "confirmed_yes"
+    conn.execute(
+        "UPDATE creator_profiles SET stage_json=? WHERE handle='golden_one'",
+        (json.dumps(stage),),
+    )
+    conn.commit()
+    conn.close()
+
+    result = barriers.evaluate_b4(
+        db,
+        stage1_artifact=artifact,
+        validated_delivery_state_sha256=validated_state,
+        failure_counts={key: 0 for key in barriers.REQUIRED_B4_FAILURE_KEYS},
+    )
+
+    assert result.passed is False
+    assert "validated_delivery_state_matches_current" in result.failures
+
+
 def test_all_evaluators_leave_database_bytes_unchanged(tmp_path):
     rows = _base_rows(status="collected")
     db = _create_db(tmp_path, rows)
@@ -306,6 +395,21 @@ def test_all_evaluators_leave_database_bytes_unchanged(tmp_path):
         db,
         stage1_artifact=artifact,
         failure_counts={"pricing": 0, "translation": 0, "audit": 0},
+    )
+    barriers.evaluate_b4(
+        db,
+        stage1_artifact=artifact,
+        failure_counts={
+            "pricing": 0,
+            "translation": 0,
+            "audit": 0,
+            "modash": 0,
+            "storefront": 0,
+            "sponsorship": 0,
+        },
+        validated_delivery_state_sha256=barriers._read_batch_snapshot(db, BATCH)[
+            "delivery_state_sha256"
+        ],
     )
 
     assert hashlib.sha256(db.read_bytes()).hexdigest() == before

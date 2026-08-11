@@ -857,3 +857,380 @@ def test_stage4_rejects_negative_modash_cap(tmp_path, monkeypatch):
     with pytest.raises(SystemExit) as exc:
         stage4_decide.main()
     assert exc.value.code == 2
+
+
+def _enrichment_ready(handle: str, **overrides):
+    sampled_posts = [
+        {"caption": "#ad skincare routine"},
+        {"caption_text": "Paid partnership skincare routine"},
+        *[{"caption": "organic skincare routine"} for _ in range(8)],
+    ]
+    candidate = clean_full(
+        handle=handle,
+        modash_report=True,
+        promotional_post_count=2,
+        sponsorship_saturation=20.0,
+        sampled_posts=sampled_posts,
+        deep_target_posts=10,
+        deep_available_posts=10,
+        _status="collected",
+        _reject_reason=None,
+        _discovery_batch="NEW",
+    )
+    candidate.update(overrides)
+    return candidate
+
+
+def _run_strict_enrichment(tmp_path, monkeypatch, candidates, advances):
+    monkeypatch.setattr(
+        stage4_decide.cc,
+        "export_all_with_data",
+        lambda _scope: candidates,
+    )
+    monkeypatch.setattr(
+        stage4_decide.cc,
+        "advance",
+        lambda *args: advances.append(args),
+    )
+    monkeypatch.setattr(stage4_decide.cc, "status_dist", lambda _batch: {})
+    out = tmp_path / "strict-enrichment.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stage4_decide",
+            "--batch-id", "NEW",
+            "--track", "paid",
+            "--strict-enrichment-completeness",
+            "--out", str(out),
+            "--no-xlsx",
+        ],
+    )
+    return stage4_decide.main(), out
+
+
+def test_stage4_strict_enrichment_blocks_r1_gap_before_db_or_output(
+    tmp_path, monkeypatch, capsys
+):
+    candidates = [
+        _enrichment_ready("complete"),
+        _enrichment_ready("r1_missing_modash", modash_report=False),
+    ]
+    advances = []
+
+    rc, out = _run_strict_enrichment(
+        tmp_path, monkeypatch, candidates, advances
+    )
+
+    assert rc == 1
+    assert advances == []
+    assert not out.exists()
+    output = capsys.readouterr().out
+    assert "@r1_missing_modash" in output
+    assert "modash_report未完成" in output
+
+
+def test_stage4_strict_enrichment_complete_cohort_passes_and_manifests_stats(
+    tmp_path, monkeypatch
+):
+    candidates = [
+        _enrichment_ready("with_storefront"),
+        _enrichment_ready(
+            "without_storefront",
+            storefront_status="confirmed_no",
+            promotional_post_count=0,
+            sponsorship_saturation=0.0,
+            sampled_posts=[
+                {"caption": "organic skincare routine"}
+                for _ in range(10)
+            ],
+        ),
+    ]
+    advances = []
+
+    rc, out = _run_strict_enrichment(
+        tmp_path, monkeypatch, candidates, advances
+    )
+
+    assert rc == 0
+    assert out.exists()
+    assert [args[0] for args in advances] == [
+        "with_storefront",
+        "without_storefront",
+    ]
+    manifest = json.loads(out.read_text(encoding="utf-8"))["manifest"]
+    assert manifest["strict_enrichment_completeness"] is True
+    assert manifest["enrichment_completeness"] == {
+        "candidate_count": 2,
+        "complete_count": 2,
+        "incomplete_count": 0,
+        "modash_report_complete_count": 2,
+        "modash_report_missing_count": 0,
+        "storefront_complete_count": 2,
+        "storefront_incomplete_count": 0,
+        "sponsorship_complete_count": 2,
+        "sponsorship_incomplete_count": 0,
+    }
+
+
+def test_stage4_strict_enrichment_accepts_report_with_source_field_gaps(
+    tmp_path, monkeypatch
+):
+    candidate = _enrichment_ready(
+        "report_has_source_gaps",
+        fake_pct=None,
+        creator_country=None,
+        top_audience_country=None,
+        general_er=None,
+        target_countries_audience_pct=None,
+        top_language_pct=None,
+    )
+    advances = []
+
+    rc, out = _run_strict_enrichment(
+        tmp_path, monkeypatch, [candidate], advances
+    )
+
+    assert rc == 0
+    assert out.exists()
+    assert [args[0] for args in advances] == ["report_has_source_gaps"]
+
+
+def test_stage4_modash_all_missing_covers_rejected_and_skips_existing_report(
+    tmp_path, monkeypatch
+):
+    active = _enrichment_ready("active_missing", modash_report=False)
+    rejected = _enrichment_ready(
+        "rejected_missing",
+        modash_report=False,
+        _status="rejected",
+        _reject_reason="off_niche",
+    )
+    existing = _enrichment_ready(
+        "existing_report",
+        fake_pct=None,
+        creator_country=None,
+    )
+    candidates = [active, rejected, existing]
+    received = []
+    advances = []
+    monkeypatch.setattr(
+        stage4_decide.cc,
+        "export_all_with_data",
+        lambda _scope: candidates,
+    )
+    monkeypatch.setattr(
+        stage4_decide.cc,
+        "advance",
+        lambda *args: advances.append(args),
+    )
+    monkeypatch.setattr(stage4_decide.cc, "status_dist", lambda _batch: {})
+
+    def fake_enrich(shortlist, *_args, **_kwargs):
+        received.extend(candidate["handle"] for candidate in shortlist)
+        for candidate in shortlist:
+            candidate["modash_report"] = True
+        return {"matched": len(shortlist), "total": len(shortlist)}
+
+    monkeypatch.setattr(modash_cdp, "enrich_via_cdp", fake_enrich)
+    out = tmp_path / "all-missing.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stage4_decide",
+            "--batch-id", "NEW",
+            "--track", "paid",
+            "--modash-all-missing",
+            "--modash-cap", "0",
+            "--strict-enrichment-completeness",
+            "--out", str(out),
+            "--no-xlsx",
+        ],
+    )
+
+    assert stage4_decide.main() == 0
+    assert received == ["active_missing", "rejected_missing"]
+    assert [args[0] for args in advances] == ["active_missing", "existing_report"]
+    manifest = json.loads(out.read_text(encoding="utf-8"))["manifest"]
+    assert manifest["modash_enrichment"]["mode"] == "all_missing_reports"
+    assert manifest["modash_enrichment"]["cap"] == 0
+    assert manifest["modash_enrichment"]["shortlist"]["selected"] == 2
+
+
+def test_stage4_modash_all_missing_requires_strict_gate_before_runtime_load(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        stage4_decide,
+        "load_config",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("invalid startup flags must fail before runtime load")
+        ),
+    )
+    out = tmp_path / "never.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stage4_decide",
+            "--batch-id", "NEW",
+            "--track", "paid",
+            "--modash-all-missing",
+            "--out", str(out),
+            "--no-xlsx",
+        ],
+    )
+
+    assert stage4_decide.main() == 1
+    assert not out.exists()
+    assert "--strict-enrichment-completeness" in capsys.readouterr().out
+
+
+def test_stage4_modash_all_missing_requires_explicit_unlimited_cap(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        stage4_decide,
+        "load_config",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("invalid startup flags must fail before runtime load")
+        ),
+    )
+    out = tmp_path / "never.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stage4_decide",
+            "--batch-id", "NEW",
+            "--track", "paid",
+            "--modash-all-missing",
+            "--strict-enrichment-completeness",
+            "--modash-cap", "20",
+            "--out", str(out),
+            "--no-xlsx",
+        ],
+    )
+
+    assert stage4_decide.main() == 1
+    assert not out.exists()
+    assert "--modash-cap 0" in capsys.readouterr().out
+
+
+def test_stage4_modash_runtime_failure_never_writes_db_or_output(
+    tmp_path, monkeypatch, capsys
+):
+    candidate = _enrichment_ready("runtime_failure", modash_report=False)
+    advances = []
+    monkeypatch.setattr(
+        stage4_decide.cc,
+        "export_all_with_data",
+        lambda _scope: [candidate],
+    )
+    monkeypatch.setattr(
+        stage4_decide.cc,
+        "advance",
+        lambda *args: advances.append(args),
+    )
+    monkeypatch.setattr(
+        modash_cdp,
+        "enrich_via_cdp",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("cache unavailable")
+        ),
+    )
+    out = tmp_path / "never.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stage4_decide",
+            "--batch-id", "NEW",
+            "--track", "paid",
+            "--modash-all-missing",
+            "--strict-enrichment-completeness",
+            "--modash-cap", "0",
+            "--out", str(out),
+            "--no-xlsx",
+        ],
+    )
+
+    assert stage4_decide.main() == 1
+    assert advances == []
+    assert not out.exists()
+    assert "OSError" in capsys.readouterr().out
+
+
+def test_sponsorship_gate_recomputes_caption_window_not_promotional_count():
+    candidate = _enrichment_ready(
+        "independent_signals",
+        promotional_post_count=9,
+    )
+
+    assert stage4_decide._sponsorship_window_is_consistent(  # noqa: SLF001
+        candidate
+    )
+    candidate["sponsorship_saturation"] = 10.0
+    assert not stage4_decide._sponsorship_window_is_consistent(  # noqa: SLF001
+        candidate
+    )
+
+
+@pytest.mark.parametrize(
+    "sampled_posts",
+    [None, [], ["not-an-object"], [{"caption": 123}]],
+)
+def test_sponsorship_gate_fails_closed_for_invalid_caption_window(
+    sampled_posts,
+):
+    candidate = _enrichment_ready(
+        "invalid_sponsorship_window",
+        sampled_posts=sampled_posts,
+    )
+
+    assert not stage4_decide._sponsorship_window_is_consistent(  # noqa: SLF001
+        candidate
+    )
+
+
+def test_sponsorship_gate_counts_missing_caption_as_empty_window_row():
+    candidate = _enrichment_ready(
+        "missing_caption_is_valid",
+        sampled_posts=[{}, {"caption": None}, {"caption_text": "#ad"}],
+        sponsorship_saturation=33.3,
+    )
+
+    assert stage4_decide._sponsorship_window_is_consistent(  # noqa: SLF001
+        candidate
+    )
+
+
+@pytest.mark.parametrize(
+    "saturation",
+    [None, True, "20.0", -0.1, 100.1, float("nan")],
+)
+def test_sponsorship_gate_fails_closed_for_invalid_percentage(saturation):
+    candidate = _enrichment_ready(
+        "invalid_sponsorship_percentage",
+        sponsorship_saturation=saturation,
+    )
+
+    assert not stage4_decide._sponsorship_window_is_consistent(  # noqa: SLF001
+        candidate
+    )
+
+
+def test_sponsorship_gate_uses_at_most_first_fifteen_sampled_posts():
+    candidate = _enrichment_ready(
+        "fifteen_post_window",
+        sampled_posts=[
+            *[{"caption": "organic skincare routine"} for _ in range(15)],
+            {"caption": "#ad outside the target window"},
+        ],
+        sponsorship_saturation=0.0,
+    )
+
+    assert stage4_decide._sponsorship_window_is_consistent(  # noqa: SLF001
+        candidate
+    )

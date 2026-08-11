@@ -110,21 +110,33 @@ Amazon 只是可用电商信号之一，不是 Storefront 白名单。候选出�
   ordinal`，resume 不归零。
 - **报价独立入账**：短总体/无 Reels 报价只通过 pricing-only ledger finalizer 追加 attempt 并
   单调选择 pricing owner；不得推进 deep canonical 或评论 retry state。
-- **Modash 只买可行动报告**：只对“乐观补齐缺失 Modash-owned 字段后最终池严格晋级”的
-  候选消费 Profile credit；既有值不覆盖，非 Modash blocker 不假设修复。cap 是上限，不凑数。
+- **Modash 草稿预算与正式补数分离**：默认 `route_actionable` / `--modash-cap 20` 只为预算草稿
+  购买“可能改变路由”的报告，不能证明正式字段完整。正式交付必须使用
+  `--modash-all-missing --modash-cap 0 --strict-enrichment-completeness`，覆盖全部尚无
+  `modash_report=true` 的候选；报告已存在但某个源字段为空时交付显示“Modash无”，不得重买。
+  一份全新 120 人 cohort 约需 120 个 Profile credit；当前 SKIN6 已有 4 份身份校验缓存，增量为
+  116。结构化搜索与 Golden Lookalike 列表浏览不消耗 Profile Report credit。
+- **Storefront 独立补证**：B3 后只对 `effective_status=unknown` 的精确 cohort 运行
+  `storefront_backfill collect`，人工复核不可覆盖 plan 后再 `apply`；人数、Handle SHA、代理、
+  账号/Profile lease、跨账号 unknown 重试、计划 SHA 与逐行 CAS 任一不闭合均整批拒绝。该流程
+  只补 Storefront allowlist，不重跑或改写 Stage 3 深采、报价、翻译和 attempt ledger。
 - **评论证据不截断**：XLSX“评论证据”表导出决策数据中的全部结构化评论译文/原文行；HTML
   或摘要可展示代表样本，但不能代替全量表。
 - **翻译 owner 固定在 Stage 3**：LLM 翻译在 canonical attempt 落库和 B3 前完成。正式
   Stage 4 的 `--strict-comment-translations` 只读校验已存行/摘要/语义，不调用 LLM、不截断、
   不重算或改写 candidate/ledger；`--translate-comments` 只允许草稿/补译，round contract 或
   strict/full-deep 正式模式必须拒绝。
-- **正式交付**：deep/pricing/translation 三项新鲜计数与 cohort 对账共同通过 B3 后，才运行
-  Modash/Stage 4；保存 B3 工件、JSON/XLSX/HTML 和 SHA-256。已交付 revision 永不覆盖。
+- **正式交付**：deep/pricing/translation 三项新鲜计数与 cohort 对账共同通过 B3 后，按
+  “Storefront/Modash enrichment → strict Stage 4 → B4 → export”执行。B4 必须绑定当前 exact
+  delivery-state SHA，要求全体 `decided`，并令 `audit/pricing/translation/modash/storefront/
+  sponsorship` 六项失败计数全部为 0。B3/B4 工件只供内部审计，不交客户；客户只收到由同一
+  决策基线生成的 JSON/XLSX/HTML。已发出的 `formal-...-r1` 永不覆盖，任何修复生成新的 r2。
 
-## 6. 硬门槛（不依赖 Modash 的先行）→ 通过者才 Modash 补数
+## 6. 硬门槛与 Modash 预算边界
 followers 档 / 赞助饱和 / **Storefront 三态留证（yes/no 都不早淘汰）** / 排品牌号 / 赛道 /
-实算 ER（帖量足够大才准）→
-过硬门槛 → 才用 Modash 补 fake%/受众（客户既有业务流程，走本机已登录 yibo Chrome CDP）。
+实算 ER（帖量足够大才准）仍先以 Instagram 证据计算。预算草稿只为通过本地阻断、且补齐后可能
+改变路由的候选购买 Modash fake%/受众报告；正式交付则不以“是否可能晋级”缩小购买集合，必须
+按 all-missing 补齐全部尚无报告候选，再由 strict enrichment 与 B4 统一验收。
 
 ## 7. 数据库飞轮（见 DB_FLYWHEEL_DESIGN.md）
 机器自动沉淀浅扫/采集（库①②）；客户审核门控优质红人进金种子库③、拒绝进负向库④；

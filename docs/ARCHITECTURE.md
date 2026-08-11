@@ -16,7 +16,8 @@ Stage 1 atomic discovery → graph_runner verifies B1
     → graph_runner verifies B2 + drains qualified
     → public reject tail → graph_runner Stage 3 resume
     → explicit B3 full deep/pricing/translation barrier
-    → Modash enrich → offline gates/scoring/routing
+    → Storefront / Modash enrichment → strict Stage 4
+    → B4 exact-state post-enrichment barrier
     → JSON/XLSX/HTML delivery → client feedback
 ```
 
@@ -70,7 +71,7 @@ flowchart TB
 
     subgraph ORCHESTRATE["生产编排与审计"]
         GRAPH["graph_runner<br/>B1/B2 / 自动 consumer 波次<br/>互斥切片 / 动态均分 claim cap"]
-        BARRIER["barriers.py<br/>B1 / B2 / B3 只读断言"]
+        BARRIER["barriers.py<br/>B1 / B2 / B3 / B4 只读断言"]
         SCHEDULE["graph_schedule.json<br/>冻结运行合同 + append-only waves"]
         EVENTS["graph_events.jsonl<br/>append-only hash chain"]
         LEASEDB[("resource_leases.db<br/>账号/Profile bundle lease")]
@@ -93,11 +94,13 @@ flowchart TB
     end
 
     subgraph DECIDE["离线决策层"]
-        ENRICH["Modash CSV/CDP + Manual merge<br/>actual-change shortlist / cap 仅上限"]
+        SF["Storefront collect-plan/apply<br/>exact cohort / proxy + lease / 全批 CAS"]
+        ENRICH["Modash enrichment<br/>草稿 route_actionable / 正式 all-missing"]
         PRICE["展示型预估报价<br/>非置顶 Reels 均播 × CPM 35–40"]
         GATE["Hard Gates"]
         SCORE["A-F scoring<br/>N/A normalization"]
         ROUTE["Fixed Review + five-pool routing"]
+        B4["B4 post-enrichment<br/>exact state hash + 六项失败为 0"]
     end
 
     subgraph OUTPUT["交付与反馈"]
@@ -129,18 +132,24 @@ flowchart TB
     DB -->|"qualified + unlocked"| DEEP
     PROXY --> DEEP
     DEEP --> COMMENT -->|"collected"| DB
+    DB --> SF
+    SHALLOW_POOL --> SF
+    DEEP_POOL --> SF
+    PROXY --> SF
+    SF --> LEASEDB
+    SF --> DB
     DB --> ENRICH
     MSESSION --> ENRICH
     MANUAL --> ENRICH
     ENRICH --> PRICE
     ENRICH --> GATE --> SCORE --> ROUTE
     PRICE -->|"只展示，不参与决策"| DECISIONS
-    PRICE --> XLSX
-    PRICE --> HTML
     ROUTE --> DECISIONS
-    ROUTE --> XLSX
-    ROUTE --> HTML
     ROUTE -->|"status=decided"| DB
+    DB --> B4
+    DECISIONS --> B4
+    B4 --> XLSX
+    B4 --> HTML
     CLIENT --> DB
     DB --- LOCK
     DB --- JSON
@@ -169,8 +178,10 @@ flowchart LR
     S3 --> B3{"B3 · 全量证据 Barrier<br/>deep / pricing / translation<br/>cohort 全量对账"}
     B2 --> B3
     PRIV -. "当前无合同例外：存在即阻断" .-> B3
-    B3 --> MODASH["Modash enrich"]
-    MODASH --> S4["Stage 4<br/>严格决策与交付"]
+    B3 --> ENRICH["Storefront collect-plan/apply<br/>+ Modash all-missing enrichment"]
+    ENRICH --> S4["strict Stage 4<br/>内部 decisions 基线"]
+    S4 --> B4{"B4 · post-enrichment<br/>exact state hash / 全 decided<br/>六项失败为 0"}
+    B4 --> EXPORT["版本化客户导出<br/>JSON / XLSX / HTML"]
 ```
 
 Barrier 是持久状态与工件的断言，不是进程先后顺序，也不是退出码：
@@ -194,8 +205,12 @@ Barrier 是持久状态与工件的断言，不是进程先后顺序，也不是
   精确 requeue 后，必须用同一冻结合同执行 `--resume --resume-from-stage3`；随后显式 B3 要求
   生产端已闭合、公开 cohort 全部严格深采完成、报价状态逐项对账、全部已存评论
   翻译完成或明确不需要，且包括 B2 时允许存在的深采错误和锁在内，失败/覆盖不足/锁/漏数
-  均为零。`audit/pricing/translation` 外部计数缺失也按失败处理。越过 B3 后才能消耗 Modash
-  Profile credit，随后才能做 Stage 4。
+  均为零。`audit/pricing/translation` 外部计数缺失也按失败处理。越过 B3 后才依次执行
+  Storefront/Modash enrichment 与 strict Stage 4。
+- **B4**：Stage 4 后由 `delivery_audit` 从一个只读 SQLite 快照重算 exact delivery-state SHA，
+  并与 `barriers.evaluate_b4` 当前快照绑定；Stage 1 cohort/Handle 指纹必须不变，全体状态必须为
+  `decided`，错误和锁为 0，`audit/pricing/translation/modash/storefront/sponsorship` 六项
+  新鲜失败计数必须全部为 0。B4 前的 decisions 只是内部基线，B4 通过后才允许客户导出。
 
 禁止跨 Barrier，禁止把默认拓扑临时改成全串行，禁止同账号/Profile 的并发访问。手工多终端
 Stage 2/3 清单与全串行 `run_pipeline` 都只能用于另行标记的历史复现/开发诊断，不能继承正式
@@ -339,6 +354,26 @@ canonical 指针/质量对象和评论重试状态；客户 JSON/XLSX/HTML 只�
 非空，且至少有一个可观察互动指标。该边界用于证明旧记录已做过等价深采，不是降低标准；
 任一条件不满足仍进入精确补采。
 
+#### 4.3.1 B3 后 Storefront 独立补证
+
+入口：[`storefront_backfill.py`](../scripts/extensions/sop_v2/pipeline/storefront_backfill.py)
+
+Storefront `unknown` 不需要重跑 Stage 3。补证使用严格的 collect-plan/apply 两阶段：
+
+1. `collect` 以 SQLite `mode=ro` 读取指定 batch、`expected_status` 下的 unknown 精确 cohort；调用方
+   必须同时给出 expected-count 与大小写无关 Handle 集合 SHA-256，任一不一致在浏览器前阻断；
+2. 预检浅/深账号池和 Chrome Profile 无交集、无活动 Profile 标记，强制使用公开代理，并在
+   `resource_leases.db` 获取全部浅扫账号/Profile 与批次 singleton 的 bundle lease/heartbeat；
+3. 每个账号按固定块处理；第一次仍为 `unknown` 时必须换另一个浅扫账号重试。只有 Profile 身份、
+   Bio 链展开和全部目标页核验均闭合，才能判 `confirmed_yes/confirmed_no`；剩余 unknown 会令
+   plan `apply_allowed=false`，需要新建 plan revision 重采，禁止手改；
+4. `apply` 要求人工复核后的 plan SHA、精确人数和完整 Handle 集合，在一个
+   `BEGIN IMMEDIATE` 内重验每行原始 `stage_json` SHA、受保护内容 SHA、状态/客户状态/错误/锁/
+   更新时间/批次/Storefront 热列 CAS。写集合被限制在 Storefront allowlist，任一行漂移整批回滚；
+5. 新批 B3 后通常显式使用 `--expected-status collected`；修复已完成旧 Stage 4 的 r1 时使用
+   `decided`。plan 与 apply 审计都不可覆盖。该工具不改深采、报价、翻译、canonical 指针或
+   attempt ledger。
+
 ### 4.4 Stage 4：Decide
 
 入口：[`stage4_decide.py`](../scripts/extensions/sop_v2/pipeline/stage4_decide.py)
@@ -346,32 +381,43 @@ canonical 指针/质量对象和评论重试状态；客户 JSON/XLSX/HTML 只�
 Stage 4 不再访问 Instagram：
 
 1. 导出同批次的 `qualified/collected/decided/rejected`；
-2. 合并 Modash CSV，或仅为可实际改变最终路由的 shortlist 获取 CDP Profile Report；
+2. 合并 Modash CSV/CDP；草稿可用 route-actionable shortlist，正式交付则为全部缺报告候选获取
+   Profile Report；
 3. 合并人工 Raw Skin、VO、报价和品牌合作证据；
 4. 从严格原生 Reels 证据派生展示型 `pricing_estimate`；Modash 均播不作报价 fallback；
 5. 对机器 rejected 直接生成 Exclude 决策；
 6. 对其余候选执行 Gates、A-F Scoring 和 Routing；
-7. 写 `decisions.json`、XLSX，并推进 `collected → decided`。
+7. 写内部 `decisions.json` 基线并推进 `collected → decided`；B4 通过后才生成客户 XLSX/HTML。
 
 补数采用“已有非空值不被低优先级来源静默覆盖”的原则；人工 CSV 为最高优先级。
 Modash 原始报告会做本地缓存，缓存命中时不重复消耗 Profile credit。
 
-CDP shortlist 是路由差分，而不是“缺字段就抓”或固定人数配额。系统先以当前事实执行一次
-决策，再只对缺失的 Modash-owned 报告字段填入最乐观的合同内值执行第二次决策；只有
-`final_pool` 严格晋级的候选才可购买报告。已有 `fake_pct`、国家、地区或 ER 等非空观测值
-不会在投影中被覆盖，评论完整性、Storefront unknown、低实算 ER、赞助饱和、图谱审计和
-Lifestyle 封顶等非 Modash blocker 也保持原状。因此 `--modash-cap=N` 只是 shortlist 截断上限，
-不会为了达到 N 而消费无行动价值的 credit；`N=0` 表示不设上限。排序和截断均为确定性的。
+CDP 有两个不可混淆的模式：
+
+- 默认 `route_actionable` 是路由差分预算草稿。系统以当前事实和只乐观补齐 Modash-owned
+  缺失字段的事实各决策一次，只有 `final_pool` 严格晋级的候选进入 shortlist；
+  `--modash-cap 20` 只是最多购买 20 份，不凑数，也不证明正式字段完整；
+- 正式交付固定使用
+  `--modash-all-missing --modash-cap 0 --strict-enrichment-completeness`。选择条件只看
+  `modash_report is not True`，不以单个源字段是否为空判断。已有报告但字段为空是 Modash
+  源不可用，交付显示“Modash无”且不得重买。完整新批 120 人约需 120 个 Profile credit；
+  当前 SKIN6 已有 4 份合法缓存，增量为 116。结构化搜索与 Golden Lookalike 列表不消耗
+  Profile Report credit。
 
 当前 Modash CDP 兼容层绑定已登录的
 `https://marketer.modash.io/discovery/instagram`：先以 Creator 模式
 `filters.username` 精确查找并核对 Handle，解析当前 `serviceSdId`，同时兼容旧
 `servicePlatformId`。短暂空响应做有限重试；旧 bulk discovery 只是兜底，不能用于模糊配对。
+raw report 必须先通过 `parse_report(data, handle)` 身份校验，随后才以同目录临时文件、文件/
+目录 fsync 和 `os.replace` 原子缓存；合法缓存全命中时不连接 CDP，坏缓存可被新的合法报告
+替换，错身份响应不得落盘。
 
-正式交付必须使用
-`--strict-completeness --full-deep-all-candidates --deep-target-posts 10`；Stage 4 会在
-补数、决策和导出前复核全部候选的核心深采契约，任一缺口都会阻断正式产物。内部草稿需
-显式采用相应的放宽开关，不能冒充正式交付。
+正式交付必须同时使用
+`--strict-completeness --full-deep-all-candidates --deep-target-posts 10` 和
+`--strict-enrichment-completeness --modash-all-missing --modash-cap 0`。enrichment 门禁要求全部
+候选存在 Modash report、Storefront effective status 为 `confirmed_yes/confirmed_no`，并从
+`sampled_posts[:15]` caption 按同一 `content.SPONSOR` 口径重算赞助饱和度；无 caption 合法地
+作为空字符串进入实际窗口分母。任一缺口都会在候选库推进和客户导出前阻断。
 
 评论翻译的生产 owner 是 Stage 3：LLM 只处理已采原文，结果在 strict deep 检查和 canonical
 attempt finalizer 之前进入同一候选快照，并由 B3 对覆盖/失败计数闭环。正式 Stage 4 的
@@ -387,6 +433,27 @@ Carryover 的 Stage 4 复跑按当前证据幂等判断：`needs_pipeline_retry=
 `collected/rejected` 可继续处理；历史行即使已是 `decided`，也只有在 `_stage_error`
 为空且 `strict_deep_reasons` 通过时才能复用。这样既允许已完成记录安全续跑，也防止旧的
 不完整 `decided` 穿门；相同 manifest 成功复跑后必须保持 `retry_pending_count=0`。
+
+### 4.5 B4：Post-enrichment Delivery Barrier
+
+入口：[`delivery_audit.py`](../scripts/extensions/sop_v2/pipeline/delivery_audit.py) 与
+[`barriers.py`](../scripts/extensions/sop_v2/pipeline/barriers.py)
+
+B3 证明付费 enrichment 前的采集闭合；Storefront/Modash 与 Stage 4 会合法改变已持久状态，
+因此不能倒回 `collected` 重放 B3。B4 从一个只读 SQLite transaction 读取全部 Stage 4 候选，
+计算包含 Handle、status、stage_error、lock 与原始 `stage_json` 的 exact delivery-state SHA，
+同时重跑严格 deep audit、报价派生、翻译验收和 enrichment 完整性。随后
+`barriers.evaluate_b4` 再读取当前快照并要求：
+
+- Stage 1 batch、总数、唯一 Handle 与 Handle 指纹完全一致；
+- 全体状态为 `decided`，不存在其他状态、错误、锁或无效 `stage_json`；
+- 验证器读取的 delivery-state SHA 与 Barrier 当前状态完全一致，消除审计后竞态；
+- `audit`、`pricing`、`translation`、`modash`、`storefront`、`sponsorship` 六项失败计数
+  全部显式提供且等于 0。
+
+`delivery_audit --out` 使用不可覆盖的新文件语义。B4 artifact、B3、Storefront plan 和原始
+Modash cache 都只供内部审计，不进入客户包；B4 通过后，才从同一 decisions 基线生成并发布
+客户 JSON/XLSX/HTML。
 
 ## 5. 数据与状态设计
 
@@ -636,8 +703,9 @@ batch、种子指纹和来源归因；人工填写同一模板仅作为 UI 契�
 
 正式产物写入
 `reports/deliveries/<batch_id>/formal-<YYYYMMDD>-r<N>/`。客户收到的版本立即冻结，不得原地
-覆盖；任何修复都递增 `rN`，同时保留该版本 `decisions.json` 基线、XLSX、HTML、原始第三方
-报告缓存和 SHA-256。当前 `SKIN4-20260723/formal-20260729-r2` 的审计快照为：
+覆盖；正式 r1 有问题也必须保留原目录，任何修复都生成新的 r2/更高 revision，同时保留该版本
+`decisions.json` 基线、XLSX、HTML 和 SHA-256。原始第三方报告、B3/B4 与 Storefront plan 是
+内部工件，不复制给客户。当前 `SKIN4-20260723/formal-20260729-r2` 的审计快照为：
 
 - 157 个唯一 Handle，精确由 89 个 carryover 与 68 个本轮新账号组成；
 - `retry_pending_count=0`，严格深采门禁通过；
@@ -648,10 +716,11 @@ batch、种子指纹和来源归因；人工填写同一模板仅作为 UI 契�
 
 发布门禁的输入必须同源且新鲜：严格 deep audit、pricing-only `--audit-only` 和全量翻译复核
 分别给出失败计数，再由 `barriers.evaluate_b3` 对 Stage 1 工件对应 cohort 校验总数、唯一
-Handle、指纹、全部 `collected`、零错误和零锁。缺失计数按 unknown 失败。通过结果保存为本地
-`b3_barrier.json` 并记录 SHA-256；越过 B3 后才运行实际可消耗 credit 的 Modash enrich 和
-Stage 4。JSON、XLSX、HTML 必须由同一决策基线生成，并和 `SHA256SUMS` 一起进入全新的 formal
-revision；代码、配置、轮次合同或导出逻辑一旦变化，必须重做 B3/Stage 4 并递增 revision。
+Handle、指纹、全部 `collected`、零错误和零锁。缺失计数按 unknown 失败。B3 通过后执行
+Storefront collect-plan/apply、Modash all-missing 与 strict Stage 4；随后 `delivery_audit` 以
+exact delivery-state SHA 把六项零失败计数绑定到全 `decided` 当前状态。只有 B4 通过，才从
+同一 decisions 基线生成 JSON/XLSX/HTML，并和 `SHA256SUMS` 一起进入全新的 formal revision；
+代码、配置、轮次合同、enrichment 或导出逻辑一旦变化，必须重新审计并递增 revision。
 
 ## 9. 安全与数据边界
 
@@ -681,7 +750,10 @@ Barrier 1 后：1 个 graph_runner
               └─ Stage 3 consumer group（深采池，W1…Wn）
 Barrier 2 + 初始 drain 后：reject 快照 / 公开 deep tail
                            → 同一 graph_runner run 仅恢复 Stage 3
-Barrier 3 后：Instagram worker 为 0；1 个 Modash enrich / Stage 4 进程
+Barrier 3 后：Instagram graph worker 为 0
+                → 独立 Storefront collect（受代理/账号/Profile lease 保护）/ apply
+                → 1 个 Modash all-missing / strict Stage 4 进程
+                → 1 个只读 B4 audit → 客户导出
 ```
 
 Stage 2 始终只有一个 producer。Stage 3 可以水平扩为多个 consumer worker，安全边界由

@@ -182,9 +182,29 @@ _PROFILE_JS = r"""() => {
   const codes=post_refs.map(x=>x.url);
   const challenge=/verify you'?re a real person|请验证你是真人|confirm you'?re human|suspicious|unusual activity/i.test(body.slice(0,400));
   const loginForm=!!document.querySelector('input[name="username"],input[name="password"]');
+  let surfaceHandle=null;
+  let surfaceHandleSource=null;
+  const rejectedSurfaceHandles=new Set();
+  const pathHandle=decodeURIComponent((location.pathname.split('/').filter(Boolean)[0]||'')).toLowerCase();
+  for(const el of document.querySelectorAll('main header h1,main header h2,main header [role="heading"],main section h1,main section h2,main section [role="heading"],main header a[href]')){
+    const t=(el.innerText||el.textContent||'').trim().replace(/^@/,'');
+    if(el.tagName==='A'){
+      try{
+        const selfPath=decodeURIComponent((new URL(el.getAttribute('href')||'',location.href)).pathname.split('/').filter(Boolean)[0]||'').toLowerCase();
+        if(selfPath===pathHandle){ surfaceHandle=pathHandle; surfaceHandleSource='self_link_path'; break; }
+      }catch(e){}
+    }
+    if(!/^[A-Za-z0-9._]{1,30}$/.test(t)) continue;
+    if(t.toLowerCase()===pathHandle){ surfaceHandle=t; surfaceHandleSource='heading_text'; break; }
+    rejectedSurfaceHandles.add(t);
+  }
   return {
     ogdesc: meta('og:description')||'', ogtitle: meta('og:title')||'',
+    ogurl: meta('og:url')||'', surface_handle: surfaceHandle,
+    surface_handle_source: surfaceHandleSource,
+    rejected_surface_handles: [...rejectedSurfaceHandles],
     header: body.slice(0, 900), external_url: ext, bio_link_text: biolink, biz_buttons: biz,
+    body_text_length: body.trim().length,
     codes: [...new Set(codes)].slice(0,30),
     post_refs: post_refs.filter((x,i,a)=>a.findIndex(y=>y.url===x.url)===i).slice(0,30),
     challenge, login_form: loginForm,
@@ -205,18 +225,40 @@ def _first_url_from_bio(text):
     return u if u.lower().startswith("http") else "https://" + u
 
 
+_BIO_MORE_PATTERNS = (
+    re.compile(r"\band\s+(\d+)\s+more\b", re.I),
+    re.compile(r"\by\s+(\d+)\s+m[aá]s\b", re.I),
+    re.compile(r"\bet\s+(\d+)\s+autres?\b", re.I),
+    re.compile(r"\be\s+mais\s+(\d+)\b", re.I),
+    re.compile(r"\bи\s+ещ[её]\s+(\d+)\b", re.I),
+    re.compile(r"(\d+)\s*개\s*더\s*보기"),
+    re.compile(r"(?:还有|另有|另外|以及另外)\s*(\d+)\s*个?"),
+)
+
+
 def _bio_has_more(text):
-    return bool(text and re.search(r"\band\s+\d+\s+more\b", text, re.I))
+    return _bio_more_count(text) is not None
 
 
-def _expand_bio_links(pg):
+def _bio_more_count(text):
+    """Return Instagram's declared hidden-link count across known UI locales."""
+    raw = str(text or "")
+    for pattern in _BIO_MORE_PATTERNS:
+        match = pattern.search(raw)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _expand_bio_links(pg, *, include_social=False):
     """点开 bio 链接（'and N more'）→ 读弹层里全部链接 URL。返回列表（去 IG/threads）。
     实测可点击祖先是 <button>（链路 DIV→DIV→BUTTON）；JS .click() 不触发 IG 的 React 处理，
     故先给该 button 打标，再用 Playwright 真点击。"""
     try:
         tagged = pg.evaluate(r"""() => {
+          const more=/(?:and\s+\d+\s+more|y\s+\d+\s+m[aá]s|et\s+\d+\s+autres?|e\s+mais\s+\d+|и\s+ещ[её]\s+\d+|\d+\s*개\s*더\s*보기|(?:还有|另有|另外|以及另外)\s*\d+\s*个?)/i;
           const el=[...document.querySelectorAll('div,span')].find(e=>
-            e.children.length===0 && /\band \d+ more\b/i.test(e.innerText||''));
+            e.children.length===0 && more.test(e.innerText||''));
           if(!el) return false;
           let t=el; for(let i=0;i<6&&t;i++){ if(t.tagName==='BUTTON'||t.getAttribute('role')==='button'){break;} t=t.parentElement; }
           (t||el).setAttribute('data-bioexpand','1'); return true;
@@ -241,6 +283,8 @@ def _expand_bio_links(pg):
             pg.keyboard.press("Escape")
         except Exception:  # noqa: BLE001
             pass
+        if include_social:
+            return list(urls or [])
         return [u for u in (urls or []) if not re.search(r"instagram\.com|threads\.", u, re.I)]
     except Exception:  # noqa: BLE001
         return []
@@ -256,6 +300,8 @@ _BIO_LINK_DOMS = [
     r"linktree\.com/[\w.\-]+", r"lnk\.bio/[\w.\-]+", r"msha\.ke/[\w.\-]+", r"tapl\.ink/[\w.\-]+",
     r"desty\.page/[\w.\-]+", r"desty\.link/[\w.\-]+", r"carrd\.co/[\w.\-]+", r"znap\.link/[\w.\-]+",
     r"hoo\.be/[\w.\-]+", r"solo\.to/[\w.\-]+", r"allmylinks\.com/[\w.\-]+",
+    r"atom\.bio/[\w.\-]+", r"linkbio\.co/[\w.\-]+", r"linktw\.in/[\w.\-]+",
+    r"paa\.ge/[\w.\-]+", r"taplink\.cc/[\w.\-]+", r"zez\.am/[\w.\-]+",
 ]
 
 
@@ -307,6 +353,19 @@ def fetch_profile_browser(pg, handle):
     if not bio:                                    # og 无 bio → 退回头部文本
         bio = d.get("header") or ""
     name = (d.get("ogtitle") or "").split("(@")[0].strip() or None
+    og_handle_match = re.search(
+        r"\(@([A-Za-z0-9._]{1,30})\)", d.get("ogtitle") or ""
+    )
+    og_handle = og_handle_match.group(1) if og_handle_match else None
+    canonical_handle = None
+    try:
+        canonical_parts = [
+            part for part in urlparse(d.get("ogurl") or "").path.split("/") if part
+        ]
+        if canonical_parts and re.fullmatch(r"[A-Za-z0-9._]{1,30}", canonical_parts[0]):
+            canonical_handle = canonical_parts[0]
+    except ValueError:
+        canonical_handle = None
     # 外链三级取：① 锚点(l.instagram 包装) ② bio 链接 div 文字(现代 IG 主要形态) ③ 原始 HTML 兜底
     ext = d.get("external_url") or _first_url_from_bio(d.get("bio_link_text"))
     if not ext:
@@ -325,6 +384,21 @@ def fetch_profile_browser(pg, handle):
         "category": None, "brand_account_type": "brand" if is_brand else "personal",
         "_scan_source": "browser", "codes": codes, "post_refs": d.get("post_refs") or [],
         "_bio_has_more": _bio_has_more(d.get("bio_link_text")),   # 多链接号：Amazon 可能藏在 "and N more"
+        "_bio_more_count": _bio_more_count(d.get("bio_link_text")),
+        "_bio_link_label": d.get("bio_link_text") or None,
+        "_profile_identity_evidence": {
+            "og_handle": og_handle,
+            "canonical_handle": canonical_handle,
+            "surface_handle": d.get("surface_handle"),
+            "surface_handle_source": d.get("surface_handle_source"),
+            "rejected_surface_handles": d.get("rejected_surface_handles") or [],
+        },
+        "_profile_surface_evidence": {
+            "body_text_length": int(d.get("body_text_length") or 0),
+            "has_follower_count": followers is not None,
+            "post_reference_count": len(codes),
+            "is_private": bool(d.get("private")),
+        },
     }
     pf["core_niche_key"] = content_mod.derive_niche(bio, name)
     return pf
