@@ -954,19 +954,19 @@ def _cold_bio_dialog_html(
     storefront_anchors = [
         (
             "https://l.instagram.com/?u=https%3A%2F%2Fwww.tiktok.com%2F"
-            "%40kusumghising5",
-            "www.tiktok.com/@kusumghising5",
+            "%40fixture_tiktok_creator",
+            "www.tiktok.com/@fixture_tiktok_creator",
         ),
-        ("https://www.facebook.com/577440038780390", "Facebook"),
+        ("https://www.facebook.com/000000000000000", "Facebook"),
         (
             "https://l.instagram.com/?u=https%3A%2F%2Fwww.youtube.com%2F"
-            "%40Roseksum",
-            "www.youtube.com/@Roseksum",
+            "%40fixture_youtube_creator",
+            "www.youtube.com/@fixture_youtube_creator",
         ),
         (
             "https://l.instagram.com/?u=https%3A%2F%2Fwww.myyshop.com%2Fp%2F"
-            "d5397b5b",
-            "www.myyshop.com/p/d5397b5b",
+            "fixture-shop",
+            "www.myyshop.com/p/fixture-shop",
         ),
     ]
     ordinary_anchors = [
@@ -983,10 +983,10 @@ def _cold_bio_dialog_html(
     return f"""
       <main><header>
         <div style="display:none">
-          www.tiktok.com/@kusumghising5 and 3 more
+          www.tiktok.com/@fixture_tiktok_creator and 3 more
         </div>
         <button id="real-bio-control" onclick="openBioDialog()">
-          <div><div>www.tiktok.com/@kusumghising5 and 3 more</div></div>
+          <div><div>www.tiktok.com/@fixture_tiktok_creator and 3 more</div></div>
         </button>
       </header></main>
       <div id="bio-dialog" role="dialog" aria-modal="true" style="display:none"></div>
@@ -1024,7 +1024,7 @@ def test_real_chrome_bio_expansion_ignores_hidden_clone_and_polls_cold_links():
 
             assert 2.0 < elapsed < 4.0
             assert len(links) == 7
-            assert "https://www.myyshop.com/p/d5397b5b" in links
+            assert "https://www.myyshop.com/p/fixture-shop" in links
             assert diagnostics["reason"] == "success"
             assert diagnostics["max_http_href_count"] == 4
             terminal_links = {
@@ -1036,7 +1036,7 @@ def test_real_chrome_bio_expansion_ignores_hidden_clone_and_polls_cold_links():
             }
             assert len(terminal_links) == 4
             assert backfill.storefront_policy.classify_url(
-                "https://www.myyshop.com/p/d5397b5b"
+                "https://www.myyshop.com/p/fixture-shop"
             ) == "链接聚合"
             assert page.locator('[data-sop-bioexpand="1"]').evaluate(
                 "element => element.tagName"
@@ -1275,20 +1275,20 @@ def test_known_locale_declared_count_remains_authoritative_without_dom_control()
     [
         (
             {
-                "_bio_link_label": "youtube.com/@blondiemoustache",
+                "_bio_link_label": "youtube.com/@fixture_video_creator",
                 "_bio_has_more": False,
                 "_bio_more_count": None,
             },
             [
                 {
-                    "text": "mi trucco tanto (+350k) un nuovo video... more youtube.com/@blondiemoustache",
+                    "text": "fixture creator (+350k) un nuovo video... more youtube.com/@fixture_video_creator",
                     "popup": "",
                     "expanded": "",
                     "interactive": False,
                     "trusted_surface": False,
                 },
                 {
-                    "text": "LINK Bambi Vol 3 Bambi vol. 2 Bambi Vol 1",
+                    "text": "LINK Fixture Vol 3 Fixture vol. 2 Fixture Vol 1",
                     "popup": "",
                     "expanded": "",
                     "interactive": False,
@@ -1300,7 +1300,7 @@ def test_known_locale_declared_count_remains_authoritative_without_dom_control()
             {"_bio_has_more": False, "_bio_more_count": None},
             [
                 {
-                    "text": "more glow-up: TikTok csilla.zs 93k CSILLA4000 CSILLA10... more",
+                    "text": "more fixture glow: TikTok fixture.glow.creator 93k FIXTURE4000 FIXTURE10... more",
                     "popup": "",
                     "expanded": "",
                     "interactive": True,
@@ -1312,7 +1312,7 @@ def test_known_locale_declared_count_remains_authoritative_without_dom_control()
             {"_bio_has_more": False, "_bio_more_count": None},
             [
                 {
-                    "text": "TikTok pesukarhukissa 160k essileppanen@gmail... more",
+                    "text": "TikTok fixture_tiktok_bio 160k fixture.creator@example... more",
                     "popup": "",
                     "expanded": "",
                     "interactive": False,
@@ -1322,13 +1322,13 @@ def test_known_locale_declared_count_remains_authoritative_without_dom_control()
         ),
         (
             {
-                "_bio_link_label": "skin-constructor.sitepulse.com.ua",
+                "_bio_link_label": "links.fixture.example",
                 "_bio_has_more": False,
                 "_bio_more_count": None,
             },
             [
                 {
-                    "text": "Pravik10 korean_story_official... more skin-constructor.sitepulse.com.ua",
+                    "text": "FIXTURE10 fixture_story_channel... more links.fixture.example",
                     "popup": "",
                     "expanded": "",
                     "interactive": False,
@@ -1340,14 +1340,14 @@ def test_known_locale_declared_count_remains_authoritative_without_dom_control()
             {"_bio_has_more": False, "_bio_more_count": None},
             [
                 {
-                    "text": "Avis 100% honnêtes vallymary@hotmail.fr... more",
+                    "text": "Fixture reviews fixture.reviews@example... more",
                     "popup": "",
                     "expanded": "",
                     "interactive": True,
                     "trusted_surface": False,
                 },
                 {
-                    "text": "hellofresh.fr florame.com 2025 nouveauté",
+                    "text": "brand-one.example brand-two.example 2025 nouveauté",
                     "popup": "",
                     "expanded": "",
                     "interactive": False,
@@ -1357,14 +1357,14 @@ def test_known_locale_declared_count_remains_authoritative_without_dom_control()
         ),
     ],
     ids=[
-        "blondiemoustache",
-        "csilla-zs",
-        "pesukarhukissa",
-        "pravik-kateryna",
-        "vallymary00",
+        "fixture-video-creator",
+        "fixture-glow-creator",
+        "fixture-tiktok-bio",
+        "fixture-story-creator",
+        "fixture-reviews-creator",
     ],
 )
-def test_real_biography_show_more_and_highlight_shapes_are_not_link_declarations(
+def test_captured_shape_biography_show_more_and_highlights_are_not_link_declarations(
     profile, dom_items
 ):
     import browser_collect_v2 as browser_collect
@@ -1387,12 +1387,12 @@ def test_real_biography_show_more_and_highlight_shapes_are_not_link_declarations
     assert evidence["interactive_generic_signal"] is False
 
 
-def test_bykusum_domain_leading_and_n_more_control_remains_authoritative():
+def test_fixture_domain_leading_and_n_more_control_remains_authoritative():
     import browser_collect_v2 as browser_collect
 
-    label = "www.tiktok.com/@kusumghising5 and 3 more"
+    label = "www.tiktok.com/@fixture_tiktok_creator and 3 more"
 
-    class ByKusumBioLinkPage:
+    class FixtureBioLinkPage:
         def evaluate(self, _script):
             return [
                 {
@@ -1405,7 +1405,7 @@ def test_bykusum_domain_leading_and_n_more_control_remains_authoritative():
             ]
 
     has_more, declared, evidence = backfill._bio_more_declaration(
-        ByKusumBioLinkPage(),
+        FixtureBioLinkPage(),
         {
             "_bio_link_label": label,
             "_bio_has_more": True,
@@ -1427,36 +1427,36 @@ def test_real_dom_bio_link_boundary_rejects_show_more_and_story_surfaces():
     negative_cases = [
         (
             {
-                "_bio_link_label": "youtube.com/@blondiemoustache",
+                "_bio_link_label": "youtube.com/@fixture_video_creator",
                 "_bio_has_more": False,
                 "_bio_more_count": None,
             },
             """
-            <div>mi trucco tanto (+350k) un nuovo video... more</div>
-            <div role="menu"><button>LINK Bambi Vol 3 Bambi vol. 2</button></div>
+            <div>fixture creator (+350k) un nuovo video... more</div>
+            <div role="menu"><button>LINK Fixture Vol 3 Fixture vol. 2</button></div>
             """,
         ),
         (
             {"_bio_has_more": False, "_bio_more_count": None},
-            '<div role="button">more glow-up: csilla.zs 93k CSILLA4000... more</div>',
+            '<div role="button">more fixture glow: fixture.glow.creator 93k FIXTURE4000... more</div>',
         ),
         (
             {"_bio_has_more": False, "_bio_more_count": None},
-            '<div>TikTok pesukarhukissa 160k essileppanen@gmail... more</div>',
+            '<div>TikTok fixture_tiktok_bio 160k fixture.creator@example... more</div>',
         ),
         (
             {
-                "_bio_link_label": "skin-constructor.sitepulse.com.ua",
+                "_bio_link_label": "links.fixture.example",
                 "_bio_has_more": False,
                 "_bio_more_count": None,
             },
-            '<div>Pravik10 korean_story_official... more</div>',
+            '<div>FIXTURE10 fixture_story_channel... more</div>',
         ),
         (
             {"_bio_has_more": False, "_bio_more_count": None},
             """
-            <div role="button">Avis 100% honnêtes vallymary@hotmail.fr... more</div>
-            <div role="presentation"><button>hellofresh.fr links 2025</button></div>
+            <div role="button">Fixture reviews fixture.reviews@example... more</div>
+            <div role="presentation"><button>brand-one.example links 2025</button></div>
             """,
         ),
         (
@@ -1486,7 +1486,7 @@ def test_real_dom_bio_link_boundary_rejects_show_more_and_story_surfaces():
 
             page.set_content(
                 "<main><header><button>"
-                "www.tiktok.com/@kusumghising5 and 3 more"
+                "www.tiktok.com/@fixture_tiktok_creator and 3 more"
                 "</button></header></main>"
             )
             has_more, declared, evidence = backfill._bio_more_declaration(
@@ -1833,9 +1833,9 @@ class _NeutralOnlyPage:
 @pytest.mark.parametrize(
     ("direct_url", "kind"),
     [
-        ("https://www.myyshop.com/p/d5397b5b", "链接聚合"),
-        ("https://creator.myyfinds.io/skin-picks", "链接聚合"),
-        ("https://angies.sumupstore.com/", "自营店"),
+        ("https://www.myyshop.com/p/fixture-shop", "链接聚合"),
+        ("https://fixture.myyfinds.io/example", "链接聚合"),
+        ("https://fixture-shop.sumupstore.com/", "自营店"),
     ],
 )
 def test_verified_direct_storefront_is_existential_without_target_navigation(

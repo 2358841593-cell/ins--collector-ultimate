@@ -42,7 +42,7 @@ from extensions.sop_v2.pipeline.stage2_qualify import qualify_one  # noqa: E402
         ("https://creator.myyfinds.io/example", "链接聚合"),
         ("https://stan.store/example", "自营店"),
         ("https://sumupstore.com/", "自营店"),
-        ("https://angies.sumupstore.com/", "自营店"),
+        ("https://fixture-shop.sumupstore.com/", "自营店"),
         ("https://evilmyyshop.com/p/example", None),
         ("https://evilmyyfinds.io/example", None),
         ("https://evilsumupstore.com/", None),
