@@ -43,6 +43,18 @@ PLAN_SCHEMA = "sop-v2-storefront-backfill-plan-v1"
 EVIDENCE_SCHEMA = "sop-v2-storefront-backfill-evidence-v1"
 _HANDLE_RE = re.compile(r"[A-Za-z0-9._]{1,30}\Z")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+_PROXY_SYNTHETIC_DNS_NETWORK = ipaddress.ip_network("198.18.0.0/15")
+_TRUSTED_PROXY_ENDPOINTS = frozenset(
+    {("overseas.tunnel.qg.net", 11404)}
+)
+_LOCAL_HOST_SUFFIXES = (
+    ".local",
+    ".localdomain",
+    ".internal",
+    ".lan",
+    ".home.arpa",
+    ".localhost",
+)
 _NONCOMMERCE_SOCIAL_HOSTS = (
     "instagram.com",
     "tiktok.com",
@@ -380,21 +392,74 @@ def _read_plan(path: Path) -> dict[str, Any]:
 def _public_proxy_check(proxy: object) -> None:
     if not isinstance(proxy, Mapping):
         raise StorefrontBackfillError("proxy is required but unavailable")
+    unknown_keys = set(proxy) - {"server", "username", "password"}
+    if unknown_keys:
+        raise StorefrontBackfillError("proxy contains unsupported or bypass options")
     server = str(proxy.get("server") or "").strip()
     try:
         parsed = urlsplit(server)
+        port = parsed.port
     except ValueError as exc:
         raise StorefrontBackfillError("proxy server is invalid") from exc
-    if parsed.scheme not in {"http", "https", "socks5"} or not parsed.hostname:
+    if parsed.scheme.casefold() not in {"http", "https"} or not parsed.hostname:
         raise StorefrontBackfillError("proxy server is invalid")
     if parsed.username is not None or parsed.password is not None:
         raise StorefrontBackfillError(
             "proxy credentials must not be embedded in the server URL"
         )
+    if parsed.path or parsed.query or parsed.fragment:
+        raise StorefrontBackfillError("proxy server must be an origin without URL extras")
+    host = parsed.hostname.rstrip(".").casefold()
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        raise StorefrontBackfillError("proxy server must use the trusted domain")
+    if (host, port) not in _TRUSTED_PROXY_ENDPOINTS:
+        raise StorefrontBackfillError("proxy server endpoint is not trusted")
     username = proxy.get("username")
     password = proxy.get("password")
-    if (username is None) != (password is None):
-        raise StorefrontBackfillError("proxy username/password must be a pair")
+    if (
+        not isinstance(username, str)
+        or not username.strip()
+        or not isinstance(password, str)
+        or not password.strip()
+    ):
+        raise StorefrontBackfillError("authenticated proxy credentials are required")
+
+
+def _forbidden_domain_hostname(host: str) -> bool:
+    """Reject local namespaces and browser-ambiguous numeric host spellings."""
+
+    folded = str(host or "").rstrip(".").casefold()
+    if not folded or "." not in folded:
+        return True
+    if folded in {"localhost", "localhost.localdomain"} or folded.endswith(
+        _LOCAL_HOST_SUFFIXES
+    ):
+        return True
+    return bool(
+        re.fullmatch(
+            r"(?:0x[0-9a-f]+|[0-9]+)(?:\.(?:0x[0-9a-f]+|[0-9]+))*",
+            folded,
+            re.I,
+        )
+    )
+
+
+def _is_public_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Use a stricter public predicate than ``is_global`` (which includes multicast)."""
+
+    return bool(
+        ip.is_global
+        and not ip.is_private
+        and not ip.is_loopback
+        and not ip.is_link_local
+        and not ip.is_multicast
+        and not ip.is_reserved
+        and not ip.is_unspecified
+    )
 
 
 def _default_resolver(host: str) -> tuple[str, ...]:
@@ -429,6 +494,7 @@ def safe_external_url(
     value: object,
     *,
     resolver: Callable[[str], Iterable[str]] | None = None,
+    _allow_proxy_synthetic_dns: bool = False,
 ) -> str:
     """Validate an external navigation target against SSRF/credential hazards."""
 
@@ -447,6 +513,14 @@ def safe_external_url(
     host = parsed.hostname.rstrip(".").casefold()
     if host in {"localhost", "localhost.localdomain"} or host.endswith(".local"):
         raise StorefrontBackfillError("external URL resolves locally")
+    try:
+        literal_host = ipaddress.ip_address(host.split("%", 1)[0])
+    except ValueError:
+        literal_host = None
+    if literal_host is not None and not _is_public_ip(literal_host):
+        raise StorefrontBackfillError("external URL resolves to a non-public address")
+    if literal_host is None and _forbidden_domain_hostname(host):
+        raise StorefrontBackfillError("external URL uses a local or ambiguous hostname")
     resolve = resolver or _default_resolver
     addresses = tuple(resolve(host))
     if not addresses:
@@ -456,7 +530,19 @@ def safe_external_url(
             ip = ipaddress.ip_address(str(address).split("%")[0])
         except ValueError as exc:
             raise StorefrontBackfillError("resolver returned an invalid address") from exc
-        if not ip.is_global:
+        # Some system-wide TUN configurations intentionally return RFC 2544's
+        # benchmarking range as a synthetic DNS answer and recover the real
+        # destination inside the mandatory browser proxy.  The exception is
+        # deliberately private, opt-in, IPv4-only, and valid only for a domain
+        # resolution result: an input URL containing a 198.18/15 IP literal is
+        # still rejected.  Every other non-global range remains fail-closed.
+        proxy_synthetic_dns = bool(
+            _allow_proxy_synthetic_dns
+            and literal_host is None
+            and isinstance(ip, ipaddress.IPv4Address)
+            and ip in _PROXY_SYNTHETIC_DNS_NETWORK
+        )
+        if not _is_public_ip(ip) and not proxy_synthetic_dns:
             raise StorefrontBackfillError("external URL resolves to a non-public address")
     netloc = host
     if ":" in host:
@@ -1244,18 +1330,26 @@ def _bio_more_declaration(
     parse_count: Callable[[object], int | None],
 ) -> tuple[bool, int | None, dict[str, Any]]:
     labels: list[str] = []
+    interactive_labels: set[str] = set()
     if isinstance(profile, Mapping) and profile.get("_bio_link_label"):
         labels.append(str(profile["_bio_link_label"]))
     try:
         dom_labels = page.evaluate(
             r"""() => [...document.querySelectorAll('main header button,main header div,main header span,main section button,main section div,main section span')]
-              .map(e=>({
-                text:(e.innerText||e.textContent||'').replace(/\s+/g,' ').trim(),
-                popup:e.getAttribute('aria-haspopup')||'',
-                expanded:e.getAttribute('aria-expanded')||''
-              }))
+              .map(e=>{
+                const control=e.closest('button,[role="button"],[aria-haspopup="dialog"],[aria-expanded]');
+                const popup=(control?.getAttribute('aria-haspopup')||e.getAttribute('aria-haspopup')||'').toLowerCase();
+                const expanded=(control?.getAttribute('aria-expanded')||e.getAttribute('aria-expanded')||'').toLowerCase();
+                return {
+                  text:(e.innerText||e.textContent||'').replace(/\s+/g,' ').trim(),
+                  popup,
+                  expanded,
+                  interactive:!!control
+                };
+              })
               .filter(x=>x.text && x.text.length<240 && (
-                (/\d/.test(x.text) && /(?:\.|more|m[aá]s|autres?|mais|ещ[её]|더|还有|另有|另外|链接|links?|enlaces?|liens?)/i.test(x.text)) ||
+                (/\d/.test(x.text) && /(?:more|m[aá]s|autres?|mais|ещ[её]|더|还有|另有|另外|链接|links?|enlaces?|liens?)/i.test(x.text)) ||
+                (x.interactive && /\d/.test(x.text) && /(?:[a-z0-9-]+\.)+[a-z]{2,}/i.test(x.text)) ||
                 (x.popup==='dialog' && /(?:links?|链接|enlaces?|liens?)/i.test(x.text))
               ));"""
         )
@@ -1268,6 +1362,12 @@ def _bio_more_declaration(
         text = str(item.get("text") or "").strip()
         if text:
             labels.append(text)
+            if (
+                item.get("interactive") is True
+                or item.get("popup") == "dialog"
+                or item.get("expanded") in {"true", "false"}
+            ):
+                interactive_labels.add(text)
         if item.get("popup") == "dialog" or item.get("expanded") in {"true", "false"}:
             popup_signal = True
     labels = list(dict.fromkeys(labels))
@@ -1277,19 +1377,26 @@ def _bio_more_declaration(
         isinstance(profile, Mapping)
         and (profile.get("_bio_has_more") or profile.get("_bio_more_count") is not None)
     )
-    generic_signal = any(
+    known_language_signal = any(
         re.search(
             r"(?:\d.*(?:more|m[aá]s|autres?|mais|ещ[её]|더|还有|另有|另外|链接|links?|enlaces?|liens?))",
             label,
             re.I,
         )
-        or re.search(
+        for label in labels
+    )
+    # The domain+number fallback exists for unknown locales, but ordinary bio
+    # text often contains a domain next to a follower/year count.  Treat that
+    # shape as hidden-link evidence only when the DOM ties it to a real control.
+    interactive_generic_signal = any(
+        re.search(
             r"(?:[a-z0-9-]+\.)+[a-z]{2,}(?:/\S+)?\s+\D{0,40}\d+",
             label,
             re.I,
         )
-        for label in labels
+        for label in interactive_labels
     )
+    generic_signal = bool(known_language_signal or interactive_generic_signal)
     has_more_signal = bool(counts or profile_signal or popup_signal or generic_signal)
     declared = next(iter(counts)) if len(counts) == 1 else None
     ambiguous = bool(has_more_signal and declared is None)
@@ -1300,6 +1407,8 @@ def _bio_more_declaration(
         "label_count": len(labels),
         "label_sha256": [_sha_text(label) for label in labels],
         "popup_signal": popup_signal,
+        "interactive_label_count": len(interactive_labels),
+        "interactive_generic_signal": bool(interactive_generic_signal),
     }
 
 
@@ -1323,6 +1432,12 @@ class _BrowserProbeRuntime:
         self._ctx: Any = None
         self._page: Any = None
         self._active_slot: int | None = None
+        self._proxy_enforced = False
+        self._context_guard_installed = False
+        self._context_request_guard: Callable[[Any, Any], None] | None = None
+        self._context_websocket_guard: Callable[[Any], None] | None = None
+        self._context_popup_guard: Callable[[Any], None] | None = None
+        self._active_blocked_requests: list[str] | None = None
         self._nonce = uuid.uuid4().hex[:8]
 
     def __enter__(self) -> "_BrowserProbeRuntime":
@@ -1338,6 +1453,9 @@ class _BrowserProbeRuntime:
             self._pw_manager.__exit__(exc_type, exc, traceback)
 
     def _close_context(self) -> None:
+        self._proxy_enforced = False
+        self._context_guard_installed = False
+        self._active_blocked_requests = None
         if self._ctx is None:
             return
         try:
@@ -1348,6 +1466,9 @@ class _BrowserProbeRuntime:
             self._ctx = None
             self._page = None
             self._active_slot = None
+            self._context_request_guard = None
+            self._context_websocket_guard = None
+            self._context_popup_guard = None
 
     def _open_account(self, account: Any, slot: int) -> None:
         import browser_collect_v2 as browser_collect
@@ -1397,11 +1518,100 @@ class _BrowserProbeRuntime:
         self._page = self._ctx.pages[0] if self._ctx.pages else self._ctx.new_page()
         self._page.set_default_timeout(20000)
         self._page.set_default_navigation_timeout(25000)
-        self._active_slot = slot
+        try:
+            self._install_context_network_guards(self._ctx)
+            self._active_slot = slot
+            # Enabled only after the validated proxy context and its permanent
+            # all-page guards were both installed successfully.
+            self._proxy_enforced = True
+        except Exception:  # noqa: BLE001
+            self._close_context()
+            raise
+
+    def _record_blocked_request(self, reason: str) -> None:
+        if self._active_blocked_requests is not None:
+            self._active_blocked_requests.append(reason)
+
+    def _external_request_guard(self, route: Any, request: Any) -> None:
+        request_url = str(request.url)
+        try:
+            scheme = urlsplit(request_url).scheme.casefold()
+        except ValueError:
+            scheme = ""
+        # data/blob/about cannot connect to a new network destination.
+        if scheme in {"data", "blob", "about"}:
+            route.fallback()
+            return
+        # WebSockets are blocked separately at BrowserContext level.  Every
+        # other non-HTTP scheme is rejected here; every HTTP(S) request,
+        # including popup first navigations, XHR, iframes, scripts and images,
+        # receives the same SSRF validation.
+        if scheme not in {"http", "https"}:
+            self._record_blocked_request("unsafe_request_scheme")
+            route.abort()
+            return
+        try:
+            self._safe_external_url(request_url)
+        except StorefrontBackfillError:
+            self._record_blocked_request("unsafe_external_request")
+            route.abort()
+            return
+        route.fallback()
+
+    def _install_context_network_guards(self, context: Any) -> None:
+        """Permanently guard every page, popup, subrequest and WebSocket."""
+
+        request_guard = self._external_request_guard
+
+        def block_websocket(websocket_route: Any) -> None:
+            self._record_blocked_request("external_websocket_blocked")
+            websocket_route.close(code=1008, reason="external websocket blocked")
+
+        def close_popup(popup: Any) -> None:
+            self._record_blocked_request("unexpected_popup")
+            try:
+                popup.close(run_before_unload=False)
+            except TypeError:
+                popup.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+        context.route("**/*", request_guard)
+        context.route_web_socket("**/*", block_websocket)
+        context.on("page", close_popup)
+        self._context_request_guard = request_guard
+        self._context_websocket_guard = block_websocket
+        self._context_popup_guard = close_popup
+        self._context_guard_installed = True
+
+    def _close_new_context_pages(self, baseline_page_ids: set[int]) -> None:
+        if self._ctx is None:
+            return
+        for popup in list(self._ctx.pages):
+            if id(popup) in baseline_page_ids:
+                continue
+            self._record_blocked_request("unexpected_popup")
+            try:
+                popup.close(run_before_unload=False)
+            except TypeError:
+                popup.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _safe_external_url(self, value: object) -> str:
+        return safe_external_url(
+            value,
+            resolver=self._resolver,
+            _allow_proxy_synthetic_dns=bool(
+                self._proxy_enforced
+                and self._context_guard_installed
+                and self._ctx is not None
+            ),
+        )
 
     def _target_check(self, page: Any, value: str) -> dict[str, Any]:
         try:
-            target = safe_external_url(value, resolver=self._resolver)
+            target = self._safe_external_url(value)
         except StorefrontBackfillError:
             return {
                 "source_url": str(value),
@@ -1433,27 +1643,26 @@ class _BrowserProbeRuntime:
                     "reason": "navigation_not_required_recognized_url",
                 },
             }
-        blocked_navigation: list[str] = []
-
-        def navigation_guard(route: Any, request: Any) -> None:
-            if not request.is_navigation_request():
-                route.fallback()
-                return
-            try:
-                safe_external_url(str(request.url), resolver=self._resolver)
-            except StorefrontBackfillError:
-                blocked_navigation.append("unsafe_redirect")
-                route.abort()
-                return
-            route.fallback()
-
-        page.route("**/*", navigation_guard)
+        if self._active_blocked_requests is not None:
+            raise StorefrontBackfillError("nested external target probe is forbidden")
+        blocked_requests: list[str] = []
+        self._active_blocked_requests = blocked_requests
+        baseline_page_ids = (
+            {id(item) for item in self._ctx.pages}
+            if self._ctx is not None and self._context_guard_installed
+            else set()
+        )
+        # A redundant page route keeps the helper fail-closed in isolated unit
+        # use.  Production security is provided by the permanent context route,
+        # which also sees popup first navigations and all other pages.
+        page_request_guard = self._external_request_guard
+        page.route("**/*", page_request_guard)
         try:
             response = page.goto(
                 target, wait_until="domcontentloaded", timeout=30000
             )
-            if blocked_navigation:
-                raise RuntimeError("unsafe_external_redirect")
+            if blocked_requests:
+                raise RuntimeError("unsafe_external_request")
             response_status = response.status if response is not None else None
             if response is None:
                 return {
@@ -1479,11 +1688,13 @@ class _BrowserProbeRuntime:
                         "reason": "external_http_error",
                     },
                 }
-            final_url = safe_external_url(str(page.url), resolver=self._resolver)
+            final_url = self._safe_external_url(str(page.url))
             page.wait_for_timeout(800)
             samples = [_ordinary_dom_sample(page)]
             page.wait_for_timeout(600)
             samples.append(_ordinary_dom_sample(page))
+            if blocked_requests:
+                raise RuntimeError("unsafe_external_request")
             page_health = _ordinary_page_health(samples)
             if not page_health["healthy"]:
                 return {
@@ -1506,11 +1717,14 @@ class _BrowserProbeRuntime:
                 kind = storefront_policy.classify_url(str(href))
                 if not kind:
                     continue
-                safe_href = safe_external_url(str(href), resolver=self._resolver)
+                safe_href = self._safe_external_url(str(href))
                 key = (safe_href.casefold(), kind)
                 if key not in seen:
                     seen.add(key)
                     commerce.append({"url": safe_href, "type": kind})
+            self._close_new_context_pages(baseline_page_ids)
+            if blocked_requests:
+                raise RuntimeError("unsafe_external_request")
             return {
                 "source_url": target,
                 "status": "succeeded",
@@ -1532,8 +1746,10 @@ class _BrowserProbeRuntime:
                 },
             }
         finally:
+            self._close_new_context_pages(baseline_page_ids)
+            self._active_blocked_requests = None
             try:
-                page.unroute("**/*", navigation_guard)
+                page.unroute("**/*", page_request_guard)
             except Exception:  # noqa: BLE001
                 pass
 

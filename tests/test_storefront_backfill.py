@@ -118,10 +118,44 @@ def _proxy(*, session: str, ttl: int) -> dict[str, str]:
     assert session
     assert ttl > 0
     return {
-        "server": "http://proxy.example:8080",
+        "server": "http://overseas.tunnel.qg.net:11404",
         "username": "proxy-user",
         "password": "proxy-password",
     }
+
+
+class _ActiveGuardContext:
+    def __init__(self, pages=()):
+        self.pages = list(pages)
+        self.request_handler = None
+        self.websocket_handler = None
+        self.page_handler = None
+
+    def route(self, pattern, handler):
+        self.request_pattern = pattern
+        self.request_handler = handler
+
+    def route_web_socket(self, pattern, handler):
+        self.websocket_pattern = pattern
+        self.websocket_handler = handler
+
+    def on(self, event, handler):
+        assert event == "page"
+        self.page_handler = handler
+
+    def unroute_all(self, **_kwargs):
+        return None
+
+    def close(self):
+        return None
+
+
+def _activate_proxy_runtime(runtime, *, pages=()):
+    context = _ActiveGuardContext(pages)
+    runtime._ctx = context
+    runtime._install_context_network_guards(context)
+    runtime._proxy_enforced = True
+    return context
 
 
 def _verified_flags(handle: str = "alpha") -> dict:
@@ -317,6 +351,73 @@ def test_collect_missing_proxy_fails_closed_before_lease_or_plan(tmp_path):
     assert _db_digest(db) == before
     assert spy.acquisitions == 0
     assert not (tmp_path / "storefront.plan.json").exists()
+
+
+@pytest.mark.parametrize(
+    "proxy",
+    [
+        {
+            "server": "http://localhost:11404",
+            "username": "user",
+            "password": "password",
+        },
+        {
+            "server": "http://127.0.0.1:11404",
+            "username": "user",
+            "password": "password",
+        },
+        {
+            "server": "http://10.0.0.1:11404",
+            "username": "user",
+            "password": "password",
+        },
+        {
+            "server": "http://evil.qg.net:11404",
+            "username": "user",
+            "password": "password",
+        },
+        {
+            "server": "http://overseas.tunnel.qg.net:8080",
+            "username": "user",
+            "password": "password",
+        },
+        {
+            "server": "http://overseas.tunnel.qg.net:99999",
+            "username": "user",
+            "password": "password",
+        },
+        {"server": "http://overseas.tunnel.qg.net:11404"},
+        {
+            "server": "http://overseas.tunnel.qg.net:11404",
+            "username": 123,
+            "password": "password",
+        },
+        {
+            "server": "http://overseas.tunnel.qg.net:11404/path",
+            "username": "user",
+            "password": "password",
+        },
+        {
+            "server": "http://overseas.tunnel.qg.net:11404",
+            "username": "user",
+            "password": "password",
+            "bypass": "<local>",
+        },
+    ],
+)
+def test_proxy_trust_boundary_rejects_local_untrusted_or_bypass_config(proxy):
+    with pytest.raises(backfill.StorefrontBackfillError, match="proxy"):
+        backfill._public_proxy_check(proxy)
+
+
+def test_proxy_trust_boundary_accepts_exact_authenticated_endpoint():
+    backfill._public_proxy_check(
+        {
+            "server": "http://overseas.tunnel.qg.net:11404",
+            "username": "user",
+            "password": "password",
+        }
+    )
 
 
 def test_collect_refuses_to_overwrite_formal_plan_before_acquiring_resources(tmp_path):
@@ -696,6 +797,83 @@ def test_multilingual_more_count_and_unfiltered_popup_links():
     assert evidence["ambiguous"] is True
 
 
+def test_plain_domain_and_number_text_is_not_hidden_link_evidence():
+    import browser_collect_v2 as browser_collect
+
+    class PlainBioTextPage:
+        def evaluate(self, _script):
+            return [
+                {
+                    "text": "creator.example 125K followers",
+                    "popup": "",
+                    "expanded": "",
+                    "interactive": False,
+                }
+            ]
+
+    has_more, declared, evidence = backfill._bio_more_declaration(
+        PlainBioTextPage(),
+        {"_bio_has_more": False, "_bio_more_count": None},
+        parse_count=browser_collect._bio_more_count,
+    )
+
+    assert has_more is False
+    assert declared is None
+    assert evidence["ambiguous"] is False
+    assert evidence["interactive_generic_signal"] is False
+
+
+def test_unknown_locale_domain_and_number_requires_a_real_control():
+    import browser_collect_v2 as browser_collect
+
+    class ClickableUnknownLocalePage:
+        def evaluate(self, _script):
+            return [
+                {
+                    "text": "creator.example und zusätzlich 2",
+                    "popup": "",
+                    "expanded": "",
+                    "interactive": True,
+                }
+            ]
+
+    has_more, declared, evidence = backfill._bio_more_declaration(
+        ClickableUnknownLocalePage(),
+        {"_bio_has_more": False, "_bio_more_count": None},
+        parse_count=browser_collect._bio_more_count,
+    )
+
+    assert has_more is True
+    assert declared is None
+    assert evidence["ambiguous"] is True
+    assert evidence["interactive_generic_signal"] is True
+
+
+def test_known_locale_declared_count_remains_authoritative_without_dom_control():
+    import browser_collect_v2 as browser_collect
+
+    class KnownLocalePage:
+        def evaluate(self, _script):
+            return [
+                {
+                    "text": "creator.example and 2 more",
+                    "popup": "",
+                    "expanded": "",
+                    "interactive": False,
+                }
+            ]
+
+    has_more, declared, evidence = backfill._bio_more_declaration(
+        KnownLocalePage(),
+        {"_bio_has_more": False, "_bio_more_count": None},
+        parse_count=browser_collect._bio_more_count,
+    )
+
+    assert has_more is True
+    assert declared == 2
+    assert evidence["ambiguous"] is False
+
+
 def test_probe_result_rejects_schema_and_internal_verdict_evidence_conflicts():
     invalid_schema = _no("alpha")
     invalid_schema["evidence"]["schema"] = "unexpected"
@@ -867,6 +1045,112 @@ def test_external_navigation_rejects_unsafe_targets(url):
         )
 
 
+def test_safe_external_url_default_rejects_proxy_synthetic_dns():
+    with pytest.raises(backfill.StorefrontBackfillError, match="non-public"):
+        backfill.safe_external_url(
+            "https://creator.example/shop",
+            resolver=lambda _host: ["198.18.12.34"],
+        )
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        "127.0.0.1",
+        "10.0.0.1",
+        "172.16.0.1",
+        "192.168.0.1",
+        "169.254.1.1",
+        "224.0.0.1",
+        "192.0.2.1",
+        "100.64.0.1",
+        "::1",
+        "fe80::1",
+        "ff02::1",
+    ],
+)
+def test_proxy_runtime_keeps_every_other_non_public_dns_range_closed(address):
+    class NoNavigationPage:
+        def __getattr__(self, name):
+            raise AssertionError(f"unsafe target must not use page.{name}")
+
+    runtime = backfill._BrowserProbeRuntime(
+        credentials={},
+        proxy_loader=_proxy,
+        headless=True,
+        resolver=lambda _host: [address],
+    )
+    _activate_proxy_runtime(runtime)
+
+    result = runtime._target_check(
+        NoNavigationPage(), "https://creator.example/about"
+    )
+
+    assert result["status"] == "unsafe"
+
+
+def test_proxy_runtime_rejects_rfc2544_ip_literal_even_with_fake_dns_answer():
+    class NoNavigationPage:
+        def __getattr__(self, name):
+            raise AssertionError(f"unsafe target must not use page.{name}")
+
+    runtime = backfill._BrowserProbeRuntime(
+        credentials={},
+        proxy_loader=_proxy,
+        headless=True,
+        resolver=lambda _host: ["198.18.0.9"],
+    )
+    _activate_proxy_runtime(runtime)
+
+    result = runtime._target_check(NoNavigationPage(), "https://198.18.0.9/shop")
+
+    assert result["status"] == "unsafe"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://metadata.google.internal/latest",
+        "https://printer.lan/status",
+        "https://service.local/admin",
+        "https://singlelabel/path",
+        "https://0177.0.0.1/admin",
+    ],
+)
+def test_proxy_runtime_rejects_local_or_ambiguous_domain_names(url):
+    class NoNavigationPage:
+        def __getattr__(self, name):
+            raise AssertionError(f"unsafe target must not use page.{name}")
+
+    runtime = backfill._BrowserProbeRuntime(
+        credentials={},
+        proxy_loader=_proxy,
+        headless=True,
+        resolver=lambda _host: ["198.18.0.9"],
+    )
+    _activate_proxy_runtime(runtime)
+
+    assert runtime._target_check(NoNavigationPage(), url)["status"] == "unsafe"
+
+
+def test_proxy_runtime_rejects_mixed_synthetic_and_private_dns_answers():
+    class NoNavigationPage:
+        def __getattr__(self, name):
+            raise AssertionError(f"unsafe target must not use page.{name}")
+
+    runtime = backfill._BrowserProbeRuntime(
+        credentials={},
+        proxy_loader=_proxy,
+        headless=True,
+        resolver=lambda _host: ["198.18.0.9", "10.0.0.9"],
+    )
+    _activate_proxy_runtime(runtime)
+
+    assert runtime._target_check(
+        NoNavigationPage(), "https://creator.example/about"
+    )["status"] == "unsafe"
+
+
 def test_social_contact_target_is_successful_noncommerce_without_navigation():
     class NoNavigationPage:
         def __getattr__(self, name):
@@ -929,6 +1213,69 @@ class _OrdinaryPage:
 
     def eval_on_selector_all(self, *_args):
         return []
+
+
+class _NavigationRoute:
+    def __init__(self):
+        self.fallback_calls = 0
+        self.abort_calls = 0
+
+    def fallback(self):
+        self.fallback_calls += 1
+
+    def abort(self):
+        self.abort_calls += 1
+
+
+class _NavigationRequest:
+    def __init__(self, url: str, *, navigation: bool = True):
+        self.url = url
+        self._navigation = navigation
+
+    def is_navigation_request(self):
+        return self._navigation
+
+
+class _ProxySyntheticDnsPage(_OrdinaryPage):
+    def __init__(self, response, samples, *, redirect_url: str):
+        super().__init__(response, samples)
+        self.url = redirect_url
+        self._redirect_url = redirect_url
+        self._guard = None
+        self.navigation_route = _NavigationRoute()
+
+    def route(self, _pattern, guard):
+        self._guard = guard
+
+    def goto(self, *_args, **_kwargs):
+        assert self._guard is not None
+        self._guard(
+            self.navigation_route,
+            _NavigationRequest(self._redirect_url),
+        )
+        return self._response
+
+    def eval_on_selector_all(self, *_args):
+        return ["https://amazon.com/shop/alpha"]
+
+
+class _GuardedSubresourcePage(_OrdinaryPage):
+    def __init__(self, response, samples, *, resource_url: str):
+        super().__init__(response, samples)
+        self._resource_url = resource_url
+        self._guard = None
+        self.resource_route = _NavigationRoute()
+
+    def route(self, _pattern, guard):
+        self._guard = guard
+
+    def goto(self, *_args, **_kwargs):
+        assert self._guard is not None
+        self._guard(
+            self.resource_route,
+            _NavigationRequest(self._resource_url, navigation=False),
+        )
+        return self._response
 
 
 def _dom_sample(text: str, *, elements: int = 12) -> dict:
@@ -1004,6 +1351,354 @@ def test_ordinary_target_with_real_response_and_stable_content_succeeds():
     assert result["http_status"] == 200
     assert result["page_health"]["healthy"] is True
     assert result["page_health"]["stable"] is True
+
+
+def test_proxy_runtime_allows_only_domain_fake_dns_across_navigation_final_and_href():
+    text = (
+        "Welcome to the creator's official website. Read the biography, "
+        "recent projects, and contact information here."
+    )
+    page = _ProxySyntheticDnsPage(
+        _FakeResponse(200),
+        [_dom_sample(text), _dom_sample(text)],
+        redirect_url="https://redirect.creator.example/about",
+    )
+    runtime = backfill._BrowserProbeRuntime(
+        credentials={},
+        proxy_loader=_proxy,
+        headless=True,
+        resolver=lambda _host: ["198.19.255.254"],
+    )
+
+    # The same TUN answer is unsafe until a validated proxy-backed context has
+    # been established by _open_account.
+    assert runtime._target_check(page, "https://creator.example/about")["status"] == (
+        "unsafe"
+    )
+    _activate_proxy_runtime(runtime)
+    result = runtime._target_check(page, "https://creator.example/about")
+
+    assert result["status"] == "succeeded"
+    assert result["final_url"] == "https://redirect.creator.example/about"
+    assert result["commerce_links"] == [
+        {"url": "https://amazon.com/shop/alpha", "type": "Amazon"}
+    ]
+    assert page.navigation_route.fallback_calls == 1
+    assert page.navigation_route.abort_calls == 0
+
+    runtime._close_context()
+    assert runtime._target_check(page, "https://creator.example/about")["status"] == (
+        "unsafe"
+    )
+
+
+def test_proxy_runtime_still_aborts_private_navigation_redirect():
+    text = (
+        "Welcome to the creator's official website. Read the biography, "
+        "recent projects, and contact information here."
+    )
+    page = _ProxySyntheticDnsPage(
+        _FakeResponse(200),
+        [_dom_sample(text), _dom_sample(text)],
+        redirect_url="https://internal.creator.example/admin",
+    )
+
+    def resolver(host):
+        if host == "internal.creator.example":
+            return ["10.20.30.40"]
+        return ["198.18.1.2"]
+
+    runtime = backfill._BrowserProbeRuntime(
+        credentials={},
+        proxy_loader=_proxy,
+        headless=True,
+        resolver=resolver,
+    )
+    _activate_proxy_runtime(runtime)
+
+    result = runtime._target_check(page, "https://creator.example/about")
+
+    assert result["status"] == "failed"
+    assert result["page_health"]["reason"] == "navigation_or_dom_exception"
+    assert page.navigation_route.abort_calls == 1
+
+
+@pytest.mark.parametrize(
+    "resource_url",
+    [
+        "http://127.0.0.1/admin",
+        "http://169.254.169.254/latest/meta-data/",
+        "https://metadata.google.internal/computeMetadata/v1/",
+        "ws://creator.example/socket",
+    ],
+)
+def test_proxy_runtime_aborts_unsafe_xhr_iframe_or_websocket(resource_url):
+    text = (
+        "Welcome to the creator's official website. Read the biography, "
+        "recent projects, and contact information here."
+    )
+    page = _GuardedSubresourcePage(
+        _FakeResponse(200),
+        [_dom_sample(text), _dom_sample(text)],
+        resource_url=resource_url,
+    )
+    runtime = backfill._BrowserProbeRuntime(
+        credentials={},
+        proxy_loader=_proxy,
+        headless=True,
+        resolver=lambda _host: ["198.18.2.3"],
+    )
+    _activate_proxy_runtime(runtime)
+
+    result = runtime._target_check(page, "https://creator.example/about")
+
+    assert result["status"] == "failed"
+    assert result["page_health"]["reason"] == "navigation_or_dom_exception"
+    assert page.resource_route.abort_calls == 1
+    assert page.resource_route.fallback_calls == 0
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "ws://127.0.0.1/socket",
+        "ws://169.254.169.254/latest/meta-data/",
+        "wss://creator.example/socket",
+    ],
+)
+def test_proxy_context_websocket_route_closes_before_connection(url):
+    class FakeWebSocketRoute:
+        def __init__(self, route_url):
+            self.url = route_url
+            self.closed = None
+
+        def close(self, **kwargs):
+            self.closed = kwargs
+
+    runtime = backfill._BrowserProbeRuntime(
+        credentials={},
+        proxy_loader=_proxy,
+        headless=True,
+        resolver=lambda _host: ["198.18.2.3"],
+    )
+    context = _activate_proxy_runtime(runtime)
+    websocket = FakeWebSocketRoute(url)
+
+    context.websocket_handler(websocket)
+
+    assert context.websocket_pattern == "**/*"
+    assert websocket.closed == {
+        "code": 1008,
+        "reason": "external websocket blocked",
+    }
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1/admin",
+        "http://169.254.169.254/latest/meta-data/",
+        "https://metadata.google.internal/computeMetadata/v1/",
+    ],
+)
+def test_context_guard_aborts_popup_first_private_navigation(url):
+    runtime = backfill._BrowserProbeRuntime(
+        credentials={},
+        proxy_loader=_proxy,
+        headless=True,
+        resolver=lambda _host: ["198.18.2.3"],
+    )
+    context = _activate_proxy_runtime(runtime)
+    runtime._active_blocked_requests = []
+    route = _NavigationRoute()
+
+    context.request_handler(route, _NavigationRequest(url, navigation=True))
+
+    assert context.request_pattern == "**/*"
+    assert route.abort_calls == 1
+    assert route.fallback_calls == 0
+    assert runtime._active_blocked_requests == ["unsafe_external_request"]
+
+
+def test_context_guard_allows_public_popup_first_navigation_through_proxy_fake_dns():
+    runtime = backfill._BrowserProbeRuntime(
+        credentials={},
+        proxy_loader=_proxy,
+        headless=True,
+        resolver=lambda _host: ["198.18.2.3"],
+    )
+    context = _activate_proxy_runtime(runtime)
+    runtime._active_blocked_requests = []
+    route = _NavigationRoute()
+
+    context.request_handler(
+        route,
+        _NavigationRequest("https://public.creator.example/popup", navigation=True),
+    )
+
+    assert route.fallback_calls == 1
+    assert route.abort_calls == 0
+    assert runtime._active_blocked_requests == []
+
+
+def test_target_probe_closes_new_popup_before_clearing_active_guard():
+    text = (
+        "Welcome to the creator's official website. Read the biography, "
+        "recent projects, and contact information here."
+    )
+
+    class Popup:
+        def __init__(self):
+            self.closed = False
+            self.context = None
+
+        def close(self, **_kwargs):
+            self.closed = True
+            self.context.pages.remove(self)
+
+    class PopupOpeningPage(_OrdinaryPage):
+        def __init__(self, response, samples):
+            super().__init__(response, samples)
+            self.context = None
+            self.popup = Popup()
+
+        def goto(self, *_args, **_kwargs):
+            self.popup.context = self.context
+            self.context.pages.append(self.popup)
+            return self._response
+
+    page = PopupOpeningPage(
+        _FakeResponse(200), [_dom_sample(text), _dom_sample(text)]
+    )
+    runtime = backfill._BrowserProbeRuntime(
+        credentials={},
+        proxy_loader=_proxy,
+        headless=True,
+        resolver=lambda _host: ["198.18.2.3"],
+    )
+    context = _activate_proxy_runtime(runtime, pages=(page,))
+    page.context = context
+
+    result = runtime._target_check(page, "https://creator.example/about")
+
+    assert result["status"] == "failed"
+    assert page.popup.closed is True
+    assert context.pages == [page]
+    assert runtime._active_blocked_requests is None
+    assert runtime._context_guard_installed is True
+
+
+def test_proxy_synthetic_dns_lifetime_binds_to_successful_context_launch(tmp_path):
+    class FakePage:
+        def set_default_timeout(self, _value):
+            return None
+
+        def set_default_navigation_timeout(self, _value):
+            return None
+
+        def close(self, **_kwargs):
+            return None
+
+    class FakeContext:
+        def __init__(self):
+            self.pages = [FakePage()]
+
+        def route(self, *_args):
+            return None
+
+        def route_web_socket(self, pattern, handler):
+            self.websocket_pattern = pattern
+            self.websocket_handler = handler
+
+        def on(self, event, handler):
+            assert event == "page"
+            self.page_handler = handler
+
+        def add_cookies(self, cookies):
+            self.cookies = cookies
+
+        def unroute_all(self, **_kwargs):
+            return None
+
+        def close(self):
+            return None
+
+    class FakeChromium:
+        def __init__(self, *, fail=False):
+            self.fail = fail
+            self.options = None
+            self.context = FakeContext()
+
+        def launch_persistent_context(self, **options):
+            self.options = options
+            if self.fail:
+                raise RuntimeError("launch failed")
+            return self.context
+
+    account = type(
+        "Account",
+        (),
+        {"username": "shallow_one", "profile_path": tmp_path / "profile"},
+    )()
+    credentials = {
+        "shallow_one": {"sessionid": "session", "ds_user_id": "123"}
+    }
+
+    chromium = FakeChromium()
+    runtime = backfill._BrowserProbeRuntime(
+        credentials=credentials,
+        proxy_loader=_proxy,
+        headless=True,
+        resolver=lambda _host: ["198.18.1.2"],
+    )
+    runtime._pw = type("Playwright", (), {"chromium": chromium})()
+    runtime._open_account(account, 0)
+
+    assert runtime._proxy_enforced is True
+    assert chromium.options["proxy"] == _proxy(session="ignored", ttl=1)
+    assert chromium.context.websocket_pattern == "**/*"
+
+    runtime._close_context()
+    assert runtime._proxy_enforced is False
+
+    failing_runtime = backfill._BrowserProbeRuntime(
+        credentials=credentials,
+        proxy_loader=_proxy,
+        headless=True,
+        resolver=lambda _host: ["198.18.1.2"],
+    )
+    failing_runtime._pw = type(
+        "Playwright", (), {"chromium": FakeChromium(fail=True)}
+    )()
+    with pytest.raises(RuntimeError, match="launch failed"):
+        failing_runtime._open_account(account, 0)
+    assert failing_runtime._proxy_enforced is False
+
+
+@pytest.mark.parametrize("resource_url", ["data:text/plain,ok", "blob:https://creator.example/id", "about:blank"])
+def test_proxy_runtime_allows_only_non_network_subresource_schemes(resource_url):
+    text = (
+        "Welcome to the creator's official website. Read the biography, "
+        "recent projects, and contact information here."
+    )
+    page = _GuardedSubresourcePage(
+        _FakeResponse(200),
+        [_dom_sample(text), _dom_sample(text)],
+        resource_url=resource_url,
+    )
+    runtime = backfill._BrowserProbeRuntime(
+        credentials={},
+        proxy_loader=_proxy,
+        headless=True,
+        resolver=lambda _host: ["198.18.2.3"],
+    )
+    _activate_proxy_runtime(runtime)
+
+    result = runtime._target_check(page, "https://creator.example/about")
+
+    assert result["status"] == "succeeded"
+    assert page.resource_route.abort_calls == 0
+    assert page.resource_route.fallback_calls == 1
 
 
 class _BodyLocator:
