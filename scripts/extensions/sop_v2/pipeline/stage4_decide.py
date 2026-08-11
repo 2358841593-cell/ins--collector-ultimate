@@ -219,11 +219,13 @@ def _enrichment_completeness(
             modash_complete += 1
         else:
             reasons.append("modash_report未完成")
-        status = storefront.effective_status(cand)
-        if status in {"confirmed_yes", "confirmed_no"}:
+        storefront_reasons = storefront.delivery_validation_reasons(cand)
+        if not storefront_reasons:
             storefront_complete += 1
         else:
-            reasons.append(f"storefront未确认(effective_status={status})")
+            reasons.append(
+                "storefront不完整(" + ",".join(storefront_reasons) + ")"
+            )
         if _sponsorship_window_is_consistent(cand):
             sponsorship_complete += 1
         else:

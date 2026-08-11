@@ -21,9 +21,14 @@ from extensions.sop_v2.pipeline.stage2_qualify import qualify_one  # noqa: E402
     ("url", "kind"),
     [
         ("https://amazon.com/shop/example", "Amazon"),
+        ("https://www.amazon.co.uk/shop/example", "Amazon"),
+        ("https://creator.amazon.de/profile", "Amazon"),
         ("https://amzn.to/abc", "Amazon"),
         ("https://shopltk.com/explore/example", "LTK"),
+        ("https://creator.shopltk.com/explore/example", "LTK"),
+        ("https://www.liketoknow.it/example", "LTK"),
         ("https://shopmy.us/example", "ShopMy"),
+        ("https://go.shopmy.us/example", "ShopMy"),
         ("https://brand.example/shop/products", "自营店"),
         ("https://brand.myshopify.com/", "自营店"),
         ("https://linktr.ee/example", "链接聚合"),
@@ -41,12 +46,73 @@ from extensions.sop_v2.pipeline.stage2_qualify import qualify_one  # noqa: E402
         ("https://evilmyyshop.com/p/example", None),
         ("https://evilmyyfinds.io/example", None),
         ("https://evilsumupstore.com/", None),
+        ("https://amazon.com.evil.example/profile", None),
+        ("https://amazon.evil.example/profile", None),
+        ("https://x.amazon.com.evil.example/profile", None),
+        ("https://shopmy.us.evil.example/profile", None),
+        ("https://evilshopmy.example/profile", None),
+        ("https://shopltk.com.evil.example/profile", None),
+        ("https://evilshopltk.example/profile", None),
+        ("https://liketoknow.it.evil.example/profile", None),
+        ("https://evilliketoknow.example/profile", None),
         ("https://calendly.com/example", None),
         ("https://instagram.com/example", None),
     ],
 )
 def test_classify_storefront_url(url, kind):
     assert storefront.classify_url(url) == kind
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://amazon.com/shop/example", True),
+        ("http://brand.myshopify.com/products/example", True),
+        ("javascript://amazon.com/shop/example", False),
+        ("file://amazon.com/shop/example", False),
+        ("amazon.com/shop/example", False),
+        ("https://user:secret@amazon.com/shop/example", False),
+        ("https://localhost/shop/example", False),
+        ("https://127.0.0.1/shop/example", False),
+        ("https://8.8.8.8/shop/example", False),
+        ("https://amazon.com:444/shop/example", False),
+    ],
+)
+def test_safe_absolute_storefront_http_url_contract(url, expected):
+    assert storefront.is_safe_absolute_http_url(url) is expected
+
+
+def test_delivery_validation_allows_confirmed_no_with_ordinary_bio_links():
+    assert storefront.delivery_validation_reasons(
+        {
+            "storefront_status": "confirmed_no",
+            "bio_links": ["https://example.com/about"],
+        }
+    ) == []
+
+
+@pytest.mark.parametrize(
+    ("url", "declared_type"),
+    [
+        ("https://amazon.com.evil.example/profile", "Amazon"),
+        ("https://amazon.evil.example/profile", "Amazon"),
+        ("https://shopmy.us.evil.example/profile", "ShopMy"),
+        ("https://evilshopmy.example/profile", "ShopMy"),
+        ("https://shopltk.com.evil.example/profile", "LTK"),
+        ("https://evilshopltk.example/profile", "LTK"),
+    ],
+)
+def test_delivery_validation_rejects_storefront_lookalike_domains(
+    url, declared_type
+):
+    reasons = storefront.delivery_validation_reasons(
+        {
+            "storefront_status": "confirmed_yes",
+            "storefront_url": url,
+            "storefront_type": declared_type,
+        }
+    )
+    assert "storefront_url_unrecognized" in reasons
 
 
 def test_non_amazon_shop_path_is_not_mislabeled_amazon():

@@ -23,6 +23,7 @@ from typing import Any
 from extensions.sop_v2 import comment_translation
 from extensions.sop_v2 import creator_cache as cc
 from extensions.sop_v2 import pricing
+from extensions.sop_v2 import storefront
 from extensions.sop_v2.config import config_sha256, load_config
 from extensions.sop_v2.pipeline import barriers
 from extensions.sop_v2.pipeline.stage4_decide import (
@@ -134,14 +135,12 @@ def _candidate_failure_report(
             details["modash"].append(
                 {"handle": handle, "reasons": ["modash_report_missing"]}
             )
-        from extensions.sop_v2 import storefront
-
-        effective_storefront = storefront.effective_status(cand)
-        if effective_storefront not in {"confirmed_yes", "confirmed_no"}:
+        storefront_reasons = storefront.delivery_validation_reasons(cand)
+        if storefront_reasons:
             details["storefront"].append(
                 {
                     "handle": handle,
-                    "reasons": [f"effective_status={effective_storefront}"],
+                    "reasons": storefront_reasons,
                 }
             )
         if any(reason.startswith("赞助") for reason in reasons):

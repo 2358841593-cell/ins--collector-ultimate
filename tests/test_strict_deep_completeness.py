@@ -878,6 +878,9 @@ def _enrichment_ready(handle: str, **overrides):
         _discovery_batch="NEW",
     )
     candidate.update(overrides)
+    if candidate.get("storefront_status") == "confirmed_yes":
+        candidate.setdefault("storefront_url", f"https://shopmy.us/{handle}")
+        candidate.setdefault("storefront_type", "ShopMy")
     return candidate
 
 
@@ -938,6 +941,7 @@ def test_stage4_strict_enrichment_complete_cohort_passes_and_manifests_stats(
         _enrichment_ready(
             "without_storefront",
             storefront_status="confirmed_no",
+            bio_links=["https://example.com/about"],
             promotional_post_count=0,
             sponsorship_saturation=0.0,
             sampled_posts=[
@@ -971,6 +975,80 @@ def test_stage4_strict_enrichment_complete_cohort_passes_and_manifests_stats(
         "sponsorship_complete_count": 2,
         "sponsorship_incomplete_count": 0,
     }
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_reason"),
+    [
+        (
+            {"storefront_url": None},
+            "confirmed_yes_storefront_url_missing",
+        ),
+        (
+            {
+                "storefront_url": "javascript://amazon.com/shop/unsafe",
+                "storefront_type": "Amazon",
+            },
+            "storefront_url_not_safe_absolute_http",
+        ),
+        (
+            {
+                "storefront_url": "https://amazon.com/shop/type-conflict",
+                "storefront_type": "ShopMy",
+            },
+            "storefront_url_type_conflict",
+        ),
+        (
+            {"storefront_type": None},
+            "confirmed_yes_storefront_type_missing_or_invalid",
+        ),
+        (
+            {
+                "storefront_status": "confirmed_no",
+                "storefront_url": "https://shopmy.us/stale",
+                "storefront_type": "ShopMy",
+            },
+            "status_conflict",
+        ),
+        (
+            {
+                "storefront_status": "confirmed_no",
+                "amazon_storefront_link": "https://amazon.com/shop/stale",
+            },
+            "confirmed_no_amazon_storefront_link_present",
+        ),
+        (
+            {"storefront_status": "confirmed_no", "storefront_type": "Amazon"},
+            "confirmed_no_storefront_type_present",
+        ),
+        (
+            {"storefront_status": "unknown"},
+            "status_unknown",
+        ),
+        (
+            {
+                "storefront_url": "https://shopmy.us/current",
+                "storefront_type": "ShopMy",
+                "amazon_storefront_link": "https://amazon.com/shop/stale",
+            },
+            "amazon_storefront_link_conflict",
+        ),
+    ],
+)
+def test_stage4_strict_enrichment_rejects_invalid_storefront_contract_before_write(
+    tmp_path, monkeypatch, capsys, overrides, expected_reason
+):
+    candidate = _enrichment_ready("invalid_storefront", **overrides)
+    advances = []
+
+    rc, out = _run_strict_enrichment(
+        tmp_path, monkeypatch, [candidate], advances
+    )
+
+    assert rc == 1
+    assert advances == []
+    assert not out.exists()
+    assert expected_reason in capsys.readouterr().out
 
 
 def test_stage4_strict_enrichment_accepts_report_with_source_field_gaps(

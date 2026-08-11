@@ -12,12 +12,23 @@
 """
 from __future__ import annotations
 
+import ipaddress
 import re
 from urllib.parse import urlsplit
 
 
 AMAZON_TYPES = frozenset({"Amazon"})
 STOREFRONT_TYPES = frozenset({"Amazon", "LTK", "ShopMy", "自营店", "链接聚合"})
+
+_AMAZON_HOSTS = (
+    "amazon.com", "amazon.ca", "amazon.com.mx", "amazon.com.br", "amazon.co.uk",
+    "amazon.de", "amazon.fr", "amazon.it", "amazon.es", "amazon.nl", "amazon.se",
+    "amazon.pl", "amazon.com.be", "amazon.ie", "amazon.co.jp", "amazon.in",
+    "amazon.com.au", "amazon.sg", "amazon.ae", "amazon.sa", "amazon.com.tr",
+    "amazon.eg", "amazon.co.za", "amazon.cn", "amzn.to",
+)
+_LTK_HOSTS = ("liketoknow.it", "shopltk.com", "ltk.app", "ltk.to")
+_SHOPMY_HOSTS = ("shopmy.us",)
 
 _SOCIAL_HOSTS = (
     "instagram.com", "tiktok.com", "youtube.com", "youtu.be", "twitter.com",
@@ -65,11 +76,11 @@ def classify_url(url: str) -> str | None:
     host, path = _host_path(url)
     if not host:
         return None
-    if host == "amzn.to" or host.startswith("amazon.") or ".amazon." in host:
+    if any(_host_matches(host, recognized) for recognized in _AMAZON_HOSTS):
         return "Amazon"
-    if any(x in host for x in ("liketoknow", "shopltk")) or host in {"ltk.app", "ltk.to"}:
+    if any(_host_matches(host, recognized) for recognized in _LTK_HOSTS):
         return "LTK"
-    if "shopmy" in host:
+    if any(_host_matches(host, recognized) for recognized in _SHOPMY_HOSTS):
         return "ShopMy"
     if any(_host_matches(host, h) for h in _AGGREGATOR_HOSTS):
         return "链接聚合"
@@ -92,7 +103,7 @@ def storefront_type(cand: dict) -> str | None:
     explicit = cand.get("storefront_type")
     if inferred:
         return inferred
-    if url and explicit in STOREFRONT_TYPES:
+    if url and isinstance(explicit, str) and explicit in STOREFRONT_TYPES:
         return explicit
     if cand.get("amazon_storefront_link"):
         return "Amazon"
@@ -107,6 +118,133 @@ def effective_status(cand: dict) -> str:
     if raw in ("confirmed_yes", "confirmed_no", "unknown"):
         return raw
     return "unknown"
+
+
+def is_safe_absolute_http_url(value: object) -> bool:
+    """Return whether ``value`` is a safe, absolute delivery hyperlink.
+
+    This is deliberately a side-effect-free validator: formal acceptance must
+    not perform DNS lookups.  It nevertheless rejects active-content/custom
+    schemes, credentials, local/IP-literal targets and non-web ports before a
+    URL can reach the HTML/XLSX deliverables.
+    """
+    if not isinstance(value, str) or not value or value != value.strip():
+        return False
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return False
+    if (
+        parsed.scheme.casefold() not in {"http", "https"}
+        or not parsed.netloc
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in {None, 80, 443}
+    ):
+        return False
+    host = parsed.hostname.rstrip(".").casefold()
+    if (
+        not host
+        or host in {"localhost", "localhost.localdomain"}
+        or host.endswith(".local")
+        or "." not in host
+    ):
+        return False
+    try:
+        literal = ipaddress.ip_address(host.split("%", 1)[0])
+    except ValueError:
+        # Reject browser-ambiguous numeric spellings such as 0177.0.0.1.
+        if re.fullmatch(
+            r"(?:0x[0-9a-f]+|[0-9]+)(?:\.(?:0x[0-9a-f]+|[0-9]+))*",
+            host,
+            re.I,
+        ):
+            return False
+    else:
+        # A Storefront is an external named service, never an IP-literal link.
+        return False
+    return True
+
+
+def delivery_validation_reasons(cand: dict) -> list[str]:
+    """Validate the fail-closed Storefront contract for formal delivery.
+
+    ``effective_status`` remains intentionally forgiving for historical
+    routing.  Formal acceptance is stricter: the raw three-state declaration
+    must agree with that normalized status, and its fields must be internally
+    consistent.  Ordinary ``bio_links`` are evidence, not Storefront claims,
+    and are therefore intentionally ignored for ``confirmed_no``.
+    """
+    reasons: list[str] = []
+    raw_status = cand.get("storefront_status")
+    normalized_status = effective_status(cand)
+    valid_statuses = ("confirmed_yes", "confirmed_no", "unknown")
+
+    if raw_status not in valid_statuses:
+        reasons.append("raw_status_invalid")
+    if raw_status != normalized_status:
+        reasons.append(
+            f"status_conflict(raw={raw_status!r},effective={normalized_status!r})"
+        )
+
+    if raw_status == "unknown":
+        reasons.append("status_unknown")
+        return reasons
+
+    if raw_status == "confirmed_no":
+        if cand.get("storefront_url") is not None and cand.get("storefront_url") != "":
+            reasons.append("confirmed_no_storefront_url_present")
+        if (
+            cand.get("amazon_storefront_link") is not None
+            and cand.get("amazon_storefront_link") != ""
+        ):
+            reasons.append("confirmed_no_amazon_storefront_link_present")
+        if cand.get("storefront_type") is not None and cand.get("storefront_type") != "":
+            reasons.append("confirmed_no_storefront_type_present")
+        return reasons
+
+    if raw_status != "confirmed_yes":
+        return reasons
+
+    raw_url = cand.get("storefront_url")
+    raw_type = cand.get("storefront_type")
+    if not isinstance(raw_url, str) or not raw_url:
+        reasons.append("confirmed_yes_storefront_url_missing")
+        return reasons
+    if not is_safe_absolute_http_url(raw_url):
+        reasons.append("storefront_url_not_safe_absolute_http")
+
+    recognized_type = classify_url(raw_url)
+    if recognized_type is None:
+        reasons.append("storefront_url_unrecognized")
+    raw_type_valid = isinstance(raw_type, str) and raw_type in STOREFRONT_TYPES
+    if not raw_type_valid:
+        reasons.append("confirmed_yes_storefront_type_missing_or_invalid")
+    elif recognized_type is not None and raw_type != recognized_type:
+        reasons.append(
+            f"storefront_url_type_conflict(declared={raw_type!r},recognized={recognized_type!r})"
+        )
+
+    # The compatibility accessors prefer the legacy Amazon field.  A stale
+    # legacy value must not silently override the formal storefront_url/type.
+    normalized_url = storefront_url(cand)
+    normalized_type = storefront_type(cand)
+    if normalized_url != raw_url:
+        reasons.append("storefront_url_conflict")
+    if raw_type_valid and normalized_type != raw_type:
+        reasons.append("storefront_type_conflict")
+
+    amazon_url = cand.get("amazon_storefront_link")
+    if amazon_url is not None and amazon_url != "":
+        if not is_safe_absolute_http_url(amazon_url):
+            reasons.append("amazon_storefront_link_not_safe_absolute_http")
+        if classify_url(amazon_url) != "Amazon":
+            reasons.append("amazon_storefront_link_not_amazon")
+        if raw_type != "Amazon" or amazon_url != raw_url:
+            reasons.append("amazon_storefront_link_conflict")
+    return reasons
 
 
 def has_storefront(cand: dict) -> bool:
