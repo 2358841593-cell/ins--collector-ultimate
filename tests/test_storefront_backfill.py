@@ -887,8 +887,22 @@ def test_multilingual_more_count_and_unfiltered_popup_links():
         def evaluate(self, _script):
             self.calls += 1
             if self.calls == 1:
-                return True
-            return ["https://instagram.com/alpha", "https://example.com/shop"]
+                return {
+                    "tagged": True,
+                    "candidate_count": 1,
+                    "declared_more_count": 1,
+                }
+            return {
+                "dialog_seen": True,
+                "http_hrefs": [
+                    "https://instagram.com/alpha",
+                    "https://example.com/shop",
+                ],
+                "urls": [
+                    "https://instagram.com/alpha",
+                    "https://example.com/shop",
+                ],
+            }
 
         def click(self, *_args, **_kwargs):
             return None
@@ -896,9 +910,17 @@ def test_multilingual_more_count_and_unfiltered_popup_links():
         def wait_for_timeout(self, _milliseconds):
             return None
 
+    diagnostics = {}
     assert browser_collect._expand_bio_links(
-        PopupPage(), include_social=True
+        PopupPage(),
+        include_social=True,
+        expected_more_count=1,
+        diagnostics=diagnostics,
     ) == ["https://instagram.com/alpha", "https://example.com/shop"]
+    assert diagnostics["reason"] == "success"
+    assert browser_collect._expand_bio_links(
+        PopupPage(), include_social=False, expected_more_count=1
+    ) == ["https://example.com/shop"]
 
     class AmbiguousDeclarationPage:
         def evaluate(self, _script):
@@ -920,6 +942,252 @@ def test_multilingual_more_count_and_unfiltered_popup_links():
     assert has_more is True
     assert declared is None
     assert evidence["ambiguous"] is True
+
+
+def _cold_bio_dialog_html(
+    *,
+    hydrate_delay_ms: int,
+    href_count: int = 4,
+    ordinary_links: bool = False,
+    dialog_extra_html: str = "",
+) -> str:
+    storefront_anchors = [
+        (
+            "https://l.instagram.com/?u=https%3A%2F%2Fwww.tiktok.com%2F"
+            "%40kusumghising5",
+            "www.tiktok.com/@kusumghising5",
+        ),
+        ("https://www.facebook.com/577440038780390", "Facebook"),
+        (
+            "https://l.instagram.com/?u=https%3A%2F%2Fwww.youtube.com%2F"
+            "%40Roseksum",
+            "www.youtube.com/@Roseksum",
+        ),
+        (
+            "https://l.instagram.com/?u=https%3A%2F%2Fwww.myyshop.com%2Fp%2F"
+            "d5397b5b",
+            "www.myyshop.com/p/d5397b5b",
+        ),
+    ]
+    ordinary_anchors = [
+        (f"https://ordinary-{index}.example/about", f"Ordinary {index}")
+        for index in range(1, 5)
+    ]
+    anchors = (ordinary_anchors if ordinary_links else storefront_anchors)[:href_count]
+    encoded = json.dumps(
+        "".join(
+            f'<a href="{href}"><span>{text}</span></a>' for href, text in anchors
+        )
+        + dialog_extra_html
+    )
+    return f"""
+      <main><header>
+        <div style="display:none">
+          www.tiktok.com/@kusumghising5 and 3 more
+        </div>
+        <button id="real-bio-control" onclick="openBioDialog()">
+          <div><div>www.tiktok.com/@kusumghising5 and 3 more</div></div>
+        </button>
+      </header></main>
+      <div id="bio-dialog" role="dialog" aria-modal="true" style="display:none"></div>
+      <script>
+        function openBioDialog() {{
+          const dialog=document.getElementById('bio-dialog');
+          dialog.style.display='block';
+          setTimeout(() => {{ dialog.innerHTML={encoded}; }}, {hydrate_delay_ms});
+        }}
+      </script>
+    """
+
+
+def test_real_chrome_bio_expansion_ignores_hidden_clone_and_polls_cold_links():
+    import time
+
+    import browser_collect_v2 as browser_collect
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(channel="chrome", headless=True)
+        page = browser.new_page()
+        try:
+            # Deliberately hydrate after the legacy helper's fixed 2-second wait.
+            page.set_content(_cold_bio_dialog_html(hydrate_delay_ms=2200))
+            diagnostics = {}
+            started = time.monotonic()
+            links = browser_collect._expand_bio_links(
+                page,
+                include_social=True,
+                expected_more_count=3,
+                diagnostics=diagnostics,
+            )
+            elapsed = time.monotonic() - started
+
+            assert 2.0 < elapsed < 4.0
+            assert len(links) == 7
+            assert "https://www.myyshop.com/p/d5397b5b" in links
+            assert diagnostics["reason"] == "success"
+            assert diagnostics["max_http_href_count"] == 4
+            terminal_links = {
+                backfill.safe_external_url(
+                    link,
+                    resolver=lambda _host: ["8.8.8.8"],
+                )
+                for link in links
+            }
+            assert len(terminal_links) == 4
+            assert backfill.storefront_policy.classify_url(
+                "https://www.myyshop.com/p/d5397b5b"
+            ) == "链接聚合"
+            assert page.locator('[data-sop-bioexpand="1"]').evaluate(
+                "element => element.tagName"
+            ) == "BUTTON"
+            assert page.locator("main header > div").get_attribute(
+                "data-sop-bioexpand"
+            ) is None
+        finally:
+            browser.close()
+
+
+def test_real_chrome_bio_expansion_retries_one_transient_click(
+    monkeypatch,
+):
+    import browser_collect_v2 as browser_collect
+    from playwright.sync_api import sync_playwright
+
+    monkeypatch.setattr(browser_collect, "_BIO_EXPAND_ATTEMPT_TIMEOUT_MS", 150)
+    monkeypatch.setattr(browser_collect, "_BIO_EXPAND_POLL_INTERVAL_MS", 20)
+
+    class FirstClickFails:
+        def __init__(self, page):
+            self._page = page
+            self.click_calls = 0
+
+        def __getattr__(self, name):
+            return getattr(self._page, name)
+
+        def click(self, *args, **kwargs):
+            self.click_calls += 1
+            if self.click_calls == 1:
+                raise RuntimeError("transient detached control")
+            return self._page.click(*args, **kwargs)
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(channel="chrome", headless=True)
+        page = browser.new_page()
+        try:
+            page.set_content(_cold_bio_dialog_html(hydrate_delay_ms=0))
+            wrapped = FirstClickFails(page)
+            diagnostics = {}
+            links = browser_collect._expand_bio_links(
+                wrapped,
+                include_social=True,
+                expected_more_count=3,
+                diagnostics=diagnostics,
+            )
+
+            assert wrapped.click_calls == 2
+            assert len(links) == 7
+            assert diagnostics["attempts"] == 2
+            assert diagnostics["click_error"] == "RuntimeError"
+            assert diagnostics["reason"] == "success"
+        finally:
+            browser.close()
+
+
+def test_real_chrome_bio_expansion_rejects_dialog_that_never_reaches_n_plus_one(
+    monkeypatch,
+):
+    import browser_collect_v2 as browser_collect
+    from playwright.sync_api import sync_playwright
+
+    monkeypatch.setattr(browser_collect, "_BIO_EXPAND_ATTEMPT_TIMEOUT_MS", 250)
+    monkeypatch.setattr(browser_collect, "_BIO_EXPAND_POLL_INTERVAL_MS", 20)
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(channel="chrome", headless=True)
+        page = browser.new_page()
+        try:
+            page.set_content(
+                _cold_bio_dialog_html(hydrate_delay_ms=0, href_count=3)
+            )
+            diagnostics = {}
+            links = browser_collect._expand_bio_links(
+                page,
+                include_social=True,
+                expected_more_count=3,
+                diagnostics=diagnostics,
+            )
+
+            assert links == []
+            assert diagnostics["dialog_seen"] is True
+            assert diagnostics["max_http_href_count"] == 3
+            assert diagnostics["reason"] == "count_mismatch"
+        finally:
+            browser.close()
+
+
+def test_real_chrome_bio_expansion_ignores_hidden_dialog_anchors_and_text(
+    monkeypatch,
+):
+    import browser_collect_v2 as browser_collect
+    from playwright.sync_api import sync_playwright
+
+    monkeypatch.setattr(browser_collect, "_BIO_EXPAND_ATTEMPT_TIMEOUT_MS", 250)
+    monkeypatch.setattr(browser_collect, "_BIO_EXPAND_POLL_INTERVAL_MS", 20)
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(channel="chrome", headless=True)
+        page = browser.new_page()
+        try:
+            # Three visible ordinary hrefs plus one hidden Amazon anchor must
+            # not satisfy Instagram's declared total of four.
+            page.set_content(
+                _cold_bio_dialog_html(
+                    hydrate_delay_ms=0,
+                    href_count=3,
+                    ordinary_links=True,
+                    dialog_extra_html=(
+                        '<a href="https://amazon.com/shop/hidden" '
+                        'style="display:none">Hidden Amazon</a>'
+                    ),
+                )
+            )
+            diagnostics = {}
+            assert browser_collect._expand_bio_links(
+                page,
+                include_social=True,
+                expected_more_count=3,
+                diagnostics=diagnostics,
+            ) == []
+            assert diagnostics["max_http_href_count"] == 3
+            assert diagnostics["reason"] == "count_mismatch"
+
+            # Four visible ordinary hrefs are complete, but a hidden text-only
+            # storefront clone must never enter the returned evidence.
+            page.set_content(
+                _cold_bio_dialog_html(
+                    hydrate_delay_ms=0,
+                    ordinary_links=True,
+                    dialog_extra_html=(
+                        '<span style="visibility:hidden">'
+                        "amazon.com/shop/hidden-text</span>"
+                    ),
+                )
+            )
+            diagnostics = {}
+            links = browser_collect._expand_bio_links(
+                page,
+                include_social=True,
+                expected_more_count=3,
+                diagnostics=diagnostics,
+            )
+            assert len(links) == 4
+            assert not any("amazon.com" in link for link in links)
+            assert diagnostics["max_http_href_count"] == 4
+            assert diagnostics["max_extracted_url_count"] == 4
+            assert diagnostics["reason"] == "success"
+        finally:
+            browser.close()
 
 
 def test_plain_domain_and_number_text_is_not_hidden_link_evidence():

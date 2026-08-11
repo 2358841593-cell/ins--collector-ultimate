@@ -235,6 +235,10 @@ _BIO_MORE_PATTERNS = (
     re.compile(r"(?:还有|另有|另外|以及另外)\s*(\d+)\s*个?"),
 )
 
+_BIO_EXPAND_MAX_ATTEMPTS = 2
+_BIO_EXPAND_ATTEMPT_TIMEOUT_MS = 4000
+_BIO_EXPAND_POLL_INTERVAL_MS = 100
+
 
 def _bio_has_more(text):
     return _bio_more_count(text) is not None
@@ -250,44 +254,260 @@ def _bio_more_count(text):
     return None
 
 
-def _expand_bio_links(pg, *, include_social=False):
-    """点开 bio 链接（'and N more'）→ 读弹层里全部链接 URL。返回列表（去 IG/threads）。
-    实测可点击祖先是 <button>（链路 DIV→DIV→BUTTON）；JS .click() 不触发 IG 的 React 处理，
-    故先给该 button 打标，再用 Playwright 真点击。"""
-    try:
-        tagged = pg.evaluate(r"""() => {
-          const more=/(?:and\s+\d+\s+more|y\s+\d+\s+m[aá]s|et\s+\d+\s+autres?|e\s+mais\s+\d+|и\s+ещ[её]\s+\d+|\d+\s*개\s*더\s*보기|(?:还有|另有|另外|以及另外)\s*\d+\s*个?)/i;
-          const el=[...document.querySelectorAll('div,span')].find(e=>
-            e.children.length===0 && more.test(e.innerText||''));
-          if(!el) return false;
-          let t=el; for(let i=0;i<6&&t;i++){ if(t.tagName==='BUTTON'||t.getAttribute('role')==='button'){break;} t=t.parentElement; }
-          (t||el).setAttribute('data-bioexpand','1'); return true;
-        }""")
-        if not tagged:
-            return []
-        try:
-            pg.click('[data-bioexpand="1"]', timeout=4000)
-        except Exception:  # noqa: BLE001
-            return []
-        pg.wait_for_timeout(2000)
-        urls = pg.evaluate(r"""() => {
-          const dlgs=[...document.querySelectorAll('div[role="dialog"]')];
-          const dlg=dlgs[dlgs.length-1]; if(!dlg) return [];
-          const out=new Set();
-          dlg.querySelectorAll('a[href]').forEach(a=>{const h=a.getAttribute('href')||''; if(/^https?:/.test(h)) out.add(h);});
-          dlg.querySelectorAll('div,span').forEach(e=>{ if(e.children.length===0){
-            const m=(e.innerText||'').match(/(?:[a-z0-9-]+\.)+[a-z]{2,}\/[^\s]*/i); if(m) out.add('https://'+m[0]); }});
-          return [...out];
-        }""")
-        try:
-            pg.keyboard.press("Escape")
-        except Exception:  # noqa: BLE001
-            pass
+def _expand_bio_links(
+    pg,
+    *,
+    include_social=False,
+    expected_more_count=None,
+    diagnostics=None,
+):
+    """Open Instagram's strict ``N more`` bio control and read its dialog URLs.
+
+    The evidence boundary stays fail-closed: a real, visible bio-link control
+    must be clicked with Playwright, and the visible dialog must expose at least
+    ``N + 1`` distinct HTTP(S) anchor targets.  Cold React hydration is polled
+    with a fixed deadline; hidden text clones and partial dialogs return no
+    links.  ``diagnostics`` receives counts/reason codes only (never DOM or URL
+    contents) so a later unknown is attributable without weakening the result.
+    """
+
+    trace = {
+        "attempts": 0,
+        "control_found": False,
+        "click_succeeded": False,
+        "dialog_seen": False,
+        "max_http_href_count": 0,
+        "max_extracted_url_count": 0,
+        "expected_total": None,
+        "reason": "not_started",
+    }
+
+    def finish(reason, urls=()):
+        trace["reason"] = reason
+        if diagnostics is not None:
+            diagnostics.clear()
+            diagnostics.update(trace)
+        values = list(urls or [])
         if include_social:
-            return list(urls or [])
-        return [u for u in (urls or []) if not re.search(r"instagram\.com|threads\.", u, re.I)]
-    except Exception:  # noqa: BLE001
-        return []
+            return values
+        return [
+            value
+            for value in values
+            if not re.search(r"instagram\.com|threads\.", value, re.I)
+        ]
+
+    supplied_count = (
+        int(expected_more_count)
+        if isinstance(expected_more_count, int)
+        and not isinstance(expected_more_count, bool)
+        and expected_more_count >= 1
+        else None
+    )
+    expected_total = supplied_count + 1 if supplied_count is not None else None
+    trace["expected_total"] = expected_total
+    dialog_was_seen = False
+
+    for attempt in range(1, _BIO_EXPAND_MAX_ATTEMPTS + 1):
+        trace["attempts"] = attempt
+        try:
+            tagged = pg.evaluate(
+                r"""() => {
+                  const patterns=[
+                    /\band\s+(\d+)\s+more\b/i,
+                    /\by\s+(\d+)\s+m[aá]s\b/i,
+                    /\bet\s+(\d+)\s+autres?\b/i,
+                    /\be\s+mais\s+(\d+)\b/i,
+                    /\bи\s+ещ[её]\s+(\d+)\b/i,
+                    /(\d+)\s*개\s*더\s*보기/,
+                    /(?:还有|另有|另外|以及另外)\s*(\d+)\s*个?/
+                  ];
+                  const domainStart=/^[\s\p{Emoji}\p{So}👉➡🔗•·|]*(?:(?:https?:\/\/)?(?:[a-z0-9-]+\.)+[a-z]{2,})(?:\/|\s|$)/iu;
+                  const selector=[
+                    'main header button','main header [role="button"]',
+                    'main header [aria-haspopup="dialog"]',
+                    'main section button','main section [role="button"]',
+                    'main section [aria-haspopup="dialog"]'
+                  ].join(',');
+                  const visible=(element)=>{
+                    const rect=element.getBoundingClientRect();
+                    if(rect.width<=0 || rect.height<=0) return false;
+                    for(let current=element; current; current=current.parentElement){
+                      const style=getComputedStyle(current);
+                      if(style.display==='none' || style.visibility==='hidden' ||
+                         style.visibility==='collapse' || Number(style.opacity)===0){
+                        return false;
+                      }
+                    }
+                    return true;
+                  };
+                  document.querySelectorAll('[data-sop-bioexpand]')
+                    .forEach(element=>element.removeAttribute('data-sop-bioexpand'));
+                  const controls=[];
+                  const seen=new Set();
+                  for(const control of document.querySelectorAll(selector)){
+                    if(seen.has(control) || !visible(control) ||
+                       control.closest('[role="menu"],[role="presentation"]')) continue;
+                    seen.add(control);
+                    const text=(control.innerText||control.textContent||'')
+                      .replace(/\s+/g,' ').trim();
+                    if(!text || text.length>=240 || !domainStart.test(text)) continue;
+                    let declared=null;
+                    for(const pattern of patterns){
+                      const match=text.match(pattern);
+                      if(match){ declared=Number(match[1]); break; }
+                    }
+                    if(Number.isInteger(declared) && declared>=1){
+                      controls.push({control,declared});
+                    }
+                  }
+                  if(controls.length!==1){
+                    return {tagged:false,candidate_count:controls.length,
+                            declared_more_count:null};
+                  }
+                  const selected=controls[0];
+                  selected.control.setAttribute('data-sop-bioexpand','1');
+                  return {tagged:true,candidate_count:1,
+                          declared_more_count:selected.declared};
+                }"""
+            )
+        except Exception as exc:  # noqa: BLE001
+            trace["tag_error"] = type(exc).__name__
+            if attempt == _BIO_EXPAND_MAX_ATTEMPTS:
+                return finish("control_probe_failed")
+            pg.wait_for_timeout(_BIO_EXPAND_POLL_INTERVAL_MS)
+            continue
+
+        # A bool is tolerated for small legacy test doubles, but production JS
+        # always returns the structured object above.
+        tagged_ok = bool(
+            tagged is True
+            or (isinstance(tagged, dict) and tagged.get("tagged") is True)
+        )
+        if not tagged_ok:
+            trace["candidate_count"] = (
+                tagged.get("candidate_count") if isinstance(tagged, dict) else 0
+            )
+            if attempt == _BIO_EXPAND_MAX_ATTEMPTS:
+                return finish("control_not_found")
+            pg.wait_for_timeout(_BIO_EXPAND_POLL_INTERVAL_MS)
+            continue
+        trace["control_found"] = True
+        tagged_count = (
+            tagged.get("declared_more_count") if isinstance(tagged, dict) else None
+        )
+        if isinstance(tagged_count, bool) or not isinstance(tagged_count, int):
+            tagged_count = None
+        if supplied_count is not None and tagged_count != supplied_count:
+            return finish("declared_count_mismatch")
+        if expected_total is None and tagged_count is not None and tagged_count >= 1:
+            expected_total = tagged_count + 1
+            trace["expected_total"] = expected_total
+        if expected_total is None:
+            return finish("declared_count_missing")
+
+        # The click and the dialog/link wait share one attempt budget.  Two
+        # attempts therefore remain bounded by 8 seconds with production
+        # defaults rather than stacking separate click and hydration waits.
+        deadline = time.monotonic() + (_BIO_EXPAND_ATTEMPT_TIMEOUT_MS / 1000)
+        click_failed = False
+        try:
+            pg.click(
+                '[data-sop-bioexpand="1"]',
+                timeout=_BIO_EXPAND_ATTEMPT_TIMEOUT_MS,
+            )
+            trace["click_succeeded"] = True
+        except Exception as exc:  # noqa: BLE001
+            click_failed = True
+            trace["click_error"] = type(exc).__name__
+
+        while True:
+            try:
+                sample = pg.evaluate(
+                    r"""() => {
+                      const visible=(element)=>{
+                        const rect=element.getBoundingClientRect();
+                        if(rect.width<=0 || rect.height<=0) return false;
+                        for(let current=element; current; current=current.parentElement){
+                          const style=getComputedStyle(current);
+                          if(style.display==='none' || style.visibility==='hidden' ||
+                             style.visibility==='collapse' || Number(style.opacity)===0){
+                            return false;
+                          }
+                        }
+                        return true;
+                      };
+                      const dialogs=[...document.querySelectorAll(
+                        '[role="dialog"],dialog,[aria-modal="true"]'
+                      )].filter(visible);
+                      const dialog=dialogs[dialogs.length-1];
+                      if(!dialog) return {dialog_seen:false,http_hrefs:[],urls:[]};
+                      const hrefs=new Set();
+                      for(const anchor of dialog.querySelectorAll('a[href]')){
+                        if(!visible(anchor)) continue;
+                        const href=anchor.getAttribute('href')||anchor.href||'';
+                        if(/^https?:/i.test(href)) hrefs.add(href);
+                      }
+                      const urls=new Set(hrefs);
+                      for(const element of dialog.querySelectorAll(
+                        '[role="link"],div,span'
+                      )){
+                        if(element.children.length>0 || !visible(element)) continue;
+                        const text=(element.innerText||element.textContent||'').trim();
+                        const match=text.match(
+                          /(?:(?:https?:\/\/)?(?:[a-z0-9-]+\.)+[a-z]{2,}\/[^\s]*)/i
+                        );
+                        if(!match) continue;
+                        const value=match[0].replace(/[),.;]+$/,'');
+                        urls.add(/^https?:/i.test(value) ? value : 'https://'+value);
+                      }
+                      return {dialog_seen:true,http_hrefs:[...hrefs],urls:[...urls]};
+                    }"""
+                )
+            except Exception as exc:  # noqa: BLE001
+                trace["dialog_probe_error"] = type(exc).__name__
+                sample = None
+            if isinstance(sample, dict):
+                dialog_seen = sample.get("dialog_seen") is True
+                dialog_was_seen = dialog_was_seen or dialog_seen
+                trace["dialog_seen"] = dialog_was_seen
+                hrefs = list(sample.get("http_hrefs") or [])
+                urls = list(sample.get("urls") or [])
+                trace["max_http_href_count"] = max(
+                    trace["max_http_href_count"], len(hrefs)
+                )
+                trace["max_extracted_url_count"] = max(
+                    trace["max_extracted_url_count"], len(urls)
+                )
+                if dialog_seen and len(hrefs) >= expected_total:
+                    try:
+                        pg.keyboard.press("Escape")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    return finish("success", urls)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            pg.wait_for_timeout(
+                min(_BIO_EXPAND_POLL_INTERVAL_MS, max(1, int(remaining * 1000)))
+            )
+
+        # Once the intended dialog exists, a second click could toggle it
+        # closed.  Keep the observed partial state and fail closed instead.
+        if dialog_was_seen:
+            reason = (
+                "link_hydration_timeout"
+                if trace["max_http_href_count"] == 0
+                else "count_mismatch"
+            )
+            try:
+                pg.keyboard.press("Escape")
+            except Exception:  # noqa: BLE001
+                pass
+            return finish(reason)
+        if attempt == _BIO_EXPAND_MAX_ATTEMPTS:
+            return finish("click_failed" if click_failed else "dialog_timeout")
+
+    return finish("unexpected_terminal_state")
 
 
 # bio 外链在现代 IG profile 页常不是 <a href>，而是 JS 点击的截断文字——但真实 URL 仍在

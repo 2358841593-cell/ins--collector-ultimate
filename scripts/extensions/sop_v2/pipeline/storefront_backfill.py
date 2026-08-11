@@ -1977,10 +1977,18 @@ class _BrowserProbeRuntime:
             expanded: list[str] = []
             expansion_succeeded = True
             if has_more:
+                expansion_runtime: dict[str, Any] = {}
                 expanded = browser_collect._expand_bio_links(
-                    self._page, include_social=True
+                    self._page,
+                    include_social=True,
+                    expected_more_count=declared_more,
+                    diagnostics=expansion_runtime,
                 )
                 expansion_succeeded = declared_more is not None and bool(expanded)
+                declaration_check = {
+                    **dict(declaration_check or {}),
+                    "expansion_runtime": expansion_runtime,
+                }
             profile_copy = dict(profile or {})
             profile_copy["_identity_verified"] = identity
             profile_copy["_profile_healthy"] = healthy
