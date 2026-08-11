@@ -55,6 +55,36 @@ _LOCAL_HOST_SUFFIXES = (
     ".home.arpa",
     ".localhost",
 )
+_EXTERNAL_TARGET_INIT_SCRIPT = r"""(() => {
+  const guardState = { websocket_blocked: 0, popup_blocked: 0 };
+  Object.defineProperty(globalThis, '__sopStorefrontGuardState', {
+    get: () => Object.freeze({
+      websocket_blocked: guardState.websocket_blocked,
+      popup_blocked: guardState.popup_blocked
+    }),
+    configurable: false
+  });
+  class BlockedExternalWebSocket {
+    constructor() {
+      guardState.websocket_blocked += 1;
+      throw new DOMException('external WebSocket blocked', 'SecurityError');
+    }
+  }
+  try {
+    Object.defineProperty(globalThis, 'WebSocket', {
+      value: BlockedExternalWebSocket, writable: false, configurable: false
+    });
+  } catch (_) {}
+  try {
+    Object.defineProperty(globalThis, 'open', {
+      value: () => {
+        guardState.popup_blocked += 1;
+        return null;
+      },
+      writable: false, configurable: false
+    });
+  } catch (_) {}
+})()"""
 _NONCOMMERCE_SOCIAL_HOSTS = (
     "instagram.com",
     "tiktok.com",
@@ -1518,18 +1548,19 @@ class _BrowserProbeRuntime:
         self._page = self._ctx.pages[0] if self._ctx.pages else self._ctx.new_page()
         self._page.set_default_timeout(20000)
         self._page.set_default_navigation_timeout(25000)
-        try:
-            self._install_context_network_guards(self._ctx)
-            self._active_slot = slot
-            # Enabled only after the validated proxy context and its permanent
-            # all-page guards were both installed successfully.
-            self._proxy_enforced = True
-        except Exception:  # noqa: BLE001
-            self._close_context()
-            raise
+        self._active_slot = slot
+        # IG profile and hidden-bio expansion run without the external-target
+        # guards.  Blocking IG's existing WebSocket here can trigger an
+        # unbounded reconnect/event loop in Playwright.  The guards are added
+        # lazily, immediately before the first external target is validated.
+        self._proxy_enforced = True
 
     def _record_blocked_request(self, reason: str) -> None:
-        if self._active_blocked_requests is not None:
+        if (
+            self._active_blocked_requests is not None
+            and reason not in self._active_blocked_requests
+            and len(self._active_blocked_requests) < 8
+        ):
             self._active_blocked_requests.append(reason)
 
     def _external_request_guard(self, route: Any, request: Any) -> None:
@@ -1559,7 +1590,7 @@ class _BrowserProbeRuntime:
         route.fallback()
 
     def _install_context_network_guards(self, context: Any) -> None:
-        """Permanently guard every page, popup, subrequest and WebSocket."""
+        """Guard every external-target page, popup, subrequest and WebSocket."""
 
         request_guard = self._external_request_guard
 
@@ -1568,21 +1599,45 @@ class _BrowserProbeRuntime:
             websocket_route.close(code=1008, reason="external websocket blocked")
 
         def close_popup(popup: Any) -> None:
+            # Do not synchronously close from Playwright's page event callback:
+            # re-entering the sync greenlet here can starve the caller during a
+            # popup/reconnect storm.  Context HTTP/WS guards already protect
+            # the first request; the target flow closes every new page before
+            # deciding the result and again in its finally block.
             self._record_blocked_request("unexpected_popup")
-            try:
-                popup.close(run_before_unload=False)
-            except TypeError:
-                popup.close()
-            except Exception:  # noqa: BLE001
-                pass
 
         context.route("**/*", request_guard)
         context.route_web_socket("**/*", block_websocket)
         context.on("page", close_popup)
+        # This runs only in future external-target documents; the IG profile
+        # document was already replaced with about:blank.  It prevents page
+        # scripts from generating a high-rate popup/WebSocket callback storm,
+        # while the context routes remain the non-bypassable safety boundary.
+        context.add_init_script(_EXTERNAL_TARGET_INIT_SCRIPT)
         self._context_request_guard = request_guard
         self._context_websocket_guard = block_websocket
         self._context_popup_guard = close_popup
         self._context_guard_installed = True
+
+    def _ensure_external_target_guards(self, page: Any) -> None:
+        if self._context_guard_installed:
+            return
+        if not self._proxy_enforced or self._ctx is None:
+            raise StorefrontBackfillError(
+                "external target requires a launched proxy context"
+            )
+        try:
+            # Leave the IG document (and its established realtime socket)
+            # before installing a context WebSocket guard.  Otherwise IG can
+            # reconnect in a tight loop and starve Playwright's sync API before
+            # the external navigation timeout is able to fire.
+            page.goto("about:blank", wait_until="commit", timeout=5000)
+            self._install_context_network_guards(self._ctx)
+        except Exception:  # noqa: BLE001
+            # A partially guarded context must never be reused for IG or an
+            # external target.  Closing it also revokes synthetic-DNS access.
+            self._close_context()
+            raise
 
     def _close_new_context_pages(self, baseline_page_ids: set[int]) -> None:
         if self._ctx is None:
@@ -1609,8 +1664,28 @@ class _BrowserProbeRuntime:
             ),
         )
 
+    def _record_external_script_blocks(self, page: Any) -> None:
+        try:
+            state = page.evaluate(
+                "() => globalThis.__sopStorefrontGuardState || null"
+            )
+        except Exception:  # noqa: BLE001
+            self._record_blocked_request("external_script_guard_unreadable")
+            return
+        if not isinstance(state, Mapping):
+            self._record_blocked_request("external_script_guard_missing")
+            return
+        if int(state.get("websocket_blocked") or 0) > 0:
+            self._record_blocked_request("external_script_websocket_blocked")
+        if int(state.get("popup_blocked") or 0) > 0:
+            self._record_blocked_request("external_script_popup_blocked")
+
     def _target_check(self, page: Any, value: str) -> dict[str, Any]:
         try:
+            # Install context-wide guards before validating the first target so
+            # RFC 2544 synthetic DNS is never enabled without popup/subresource
+            # and WebSocket protection already in force.
+            self._ensure_external_target_guards(page)
             target = self._safe_external_url(value)
         except StorefrontBackfillError:
             return {
@@ -1643,20 +1718,17 @@ class _BrowserProbeRuntime:
                     "reason": "navigation_not_required_recognized_url",
                 },
             }
-        if self._active_blocked_requests is not None:
-            raise StorefrontBackfillError("nested external target probe is forbidden")
-        blocked_requests: list[str] = []
-        self._active_blocked_requests = blocked_requests
+        owns_blocked_sink = self._active_blocked_requests is None
+        if owns_blocked_sink:
+            self._active_blocked_requests = []
+        assert self._active_blocked_requests is not None
+        blocked_requests = self._active_blocked_requests
         baseline_page_ids = (
             {id(item) for item in self._ctx.pages}
             if self._ctx is not None and self._context_guard_installed
             else set()
         )
-        # A redundant page route keeps the helper fail-closed in isolated unit
-        # use.  Production security is provided by the permanent context route,
-        # which also sees popup first navigations and all other pages.
-        page_request_guard = self._external_request_guard
-        page.route("**/*", page_request_guard)
+        result: dict[str, Any] | None = None
         try:
             response = page.goto(
                 target, wait_until="domcontentloaded", timeout=30000
@@ -1665,7 +1737,7 @@ class _BrowserProbeRuntime:
                 raise RuntimeError("unsafe_external_request")
             response_status = response.status if response is not None else None
             if response is None:
-                return {
+                result = {
                     "source_url": target,
                     "status": "failed",
                     "http_status": None,
@@ -1676,8 +1748,9 @@ class _BrowserProbeRuntime:
                         "reason": "missing_navigation_response",
                     },
                 }
+                return result
             if not 200 <= int(response_status) < 400:
-                return {
+                result = {
                     "source_url": target,
                     "status": "failed",
                     "http_status": response_status,
@@ -1688,16 +1761,18 @@ class _BrowserProbeRuntime:
                         "reason": "external_http_error",
                     },
                 }
+                return result
             final_url = self._safe_external_url(str(page.url))
             page.wait_for_timeout(800)
             samples = [_ordinary_dom_sample(page)]
             page.wait_for_timeout(600)
             samples.append(_ordinary_dom_sample(page))
+            self._record_external_script_blocks(page)
             if blocked_requests:
                 raise RuntimeError("unsafe_external_request")
             page_health = _ordinary_page_health(samples)
             if not page_health["healthy"]:
-                return {
+                result = {
                     "source_url": target,
                     "status": "failed",
                     "final_url": final_url,
@@ -1706,6 +1781,7 @@ class _BrowserProbeRuntime:
                     "note": "external_page_unhealthy",
                     "page_health": page_health,
                 }
+                return result
             hrefs = page.eval_on_selector_all(
                 "a[href]", "els => els.map(e => e.href)"
             ) or []
@@ -1725,7 +1801,7 @@ class _BrowserProbeRuntime:
             self._close_new_context_pages(baseline_page_ids)
             if blocked_requests:
                 raise RuntimeError("unsafe_external_request")
-            return {
+            result = {
                 "source_url": target,
                 "status": "succeeded",
                 "final_url": final_url,
@@ -1734,8 +1810,9 @@ class _BrowserProbeRuntime:
                 "note": "opened_external_target",
                 "page_health": page_health,
             }
+            return result
         except Exception as exc:  # noqa: BLE001
-            return {
+            result = {
                 "source_url": target,
                 "status": "failed",
                 "commerce_links": [],
@@ -1745,13 +1822,31 @@ class _BrowserProbeRuntime:
                     "reason": "navigation_or_dom_exception",
                 },
             }
+            return result
         finally:
-            self._close_new_context_pages(baseline_page_ids)
-            self._active_blocked_requests = None
+            if str(getattr(page, "url", "")) != "about:blank":
+                self._record_external_script_blocks(page)
             try:
-                page.unroute("**/*", page_request_guard)
+                page.goto("about:blank", wait_until="commit", timeout=5000)
             except Exception:  # noqa: BLE001
-                pass
+                self._record_blocked_request("target_cleanup_failed")
+            self._close_new_context_pages(baseline_page_ids)
+            if result is not None and blocked_requests:
+                result.clear()
+                result.update(
+                    {
+                        "source_url": target,
+                        "status": "failed",
+                        "commerce_links": [],
+                        "error": "UnsafeExternalRequest",
+                        "page_health": {
+                            "healthy": False,
+                            "reason": "navigation_or_dom_exception",
+                        },
+                    }
+                )
+            if owns_blocked_sink:
+                self._active_blocked_requests = None
 
     def probe(
         self, handle: str, account: Any, heartbeat: Callable[[], None], *, slot: int
@@ -1760,64 +1855,73 @@ class _BrowserProbeRuntime:
 
         if self._active_slot != slot:
             self._open_account(account, slot)
-        heartbeat()
-        profile = browser_collect.fetch_profile_browser(self._page, handle)
-        profile_url = str(self._page.url)
-        identity, identity_check = _profile_identity(self._page, handle, profile)
-        healthy, health_check = _profile_health(self._page, profile)
-        has_more, declared_more, declaration_check = _bio_more_declaration(
-            self._page,
-            profile,
-            parse_count=browser_collect._bio_more_count,
-        )
-        expanded: list[str] = []
-        expansion_succeeded = True
-        if has_more:
-            expanded = browser_collect._expand_bio_links(
-                self._page, include_social=True
-            )
-            expansion_succeeded = declared_more is not None and bool(expanded)
-        profile_copy = dict(profile or {})
-        profile_copy["_identity_verified"] = identity
-        profile_copy["_profile_healthy"] = healthy
-        profile_copy["_profile_identity_check"] = identity_check
-        profile_copy["_profile_health_check"] = health_check
-        profile_copy["_bio_has_more"] = has_more
-        profile_copy["_bio_more_count"] = declared_more
-        profile_copy["_bio_declaration_check"] = declaration_check
-        raw_links = _dedupe_urls([profile_copy.get("external_url"), *expanded])
-        checks: list[dict[str, Any]] = []
-        source_indexes: dict[str, int] = {}
-        for link in raw_links:
+        try:
             heartbeat()
-            check = self._target_check(self._page, link)
-            source = str(check.get("source_url") or "").strip()
-            folded = source.casefold()
-            if not source:
-                continue
-            if folded in source_indexes:
-                existing_index = source_indexes[folded]
-                if (
-                    checks[existing_index].get("status") != "succeeded"
-                    and check.get("status") == "succeeded"
-                ):
-                    checks[existing_index] = check
-                continue
-            source_indexes[folded] = len(checks)
-            checks.append(check)
-        observed_links = [str(check["source_url"]) for check in checks]
-        profile_copy["external_url"] = observed_links[0] if observed_links else None
-        return resolve_observation(
-            handle=handle,
-            profile=profile_copy,
-            profile_url=profile_url,
-            expanded_links=expanded,
-            expansion_succeeded=expansion_succeeded,
-            observed_links=observed_links,
-            raw_observed_link_count=len(raw_links),
-            terminal_observed_link_count=len(observed_links),
-            target_checks=checks,
-        )
+            profile = browser_collect.fetch_profile_browser(self._page, handle)
+            profile_url = str(self._page.url)
+            identity, identity_check = _profile_identity(self._page, handle, profile)
+            healthy, health_check = _profile_health(self._page, profile)
+            has_more, declared_more, declaration_check = _bio_more_declaration(
+                self._page,
+                profile,
+                parse_count=browser_collect._bio_more_count,
+            )
+            expanded: list[str] = []
+            expansion_succeeded = True
+            if has_more:
+                expanded = browser_collect._expand_bio_links(
+                    self._page, include_social=True
+                )
+                expansion_succeeded = declared_more is not None and bool(expanded)
+            profile_copy = dict(profile or {})
+            profile_copy["_identity_verified"] = identity
+            profile_copy["_profile_healthy"] = healthy
+            profile_copy["_profile_identity_check"] = identity_check
+            profile_copy["_profile_health_check"] = health_check
+            profile_copy["_bio_has_more"] = has_more
+            profile_copy["_bio_more_count"] = declared_more
+            profile_copy["_bio_declaration_check"] = declaration_check
+            raw_links = _dedupe_urls([profile_copy.get("external_url"), *expanded])
+            checks: list[dict[str, Any]] = []
+            source_indexes: dict[str, int] = {}
+            if raw_links:
+                self._active_blocked_requests = []
+            for link in raw_links:
+                heartbeat()
+                check = self._target_check(self._page, link)
+                source = str(check.get("source_url") or "").strip()
+                folded = source.casefold()
+                if not source:
+                    continue
+                if folded in source_indexes:
+                    existing_index = source_indexes[folded]
+                    if (
+                        checks[existing_index].get("status") != "succeeded"
+                        and check.get("status") == "succeeded"
+                    ):
+                        checks[existing_index] = check
+                    continue
+                source_indexes[folded] = len(checks)
+                checks.append(check)
+            observed_links = [str(check["source_url"]) for check in checks]
+            profile_copy["external_url"] = observed_links[0] if observed_links else None
+            return resolve_observation(
+                handle=handle,
+                profile=profile_copy,
+                profile_url=profile_url,
+                expanded_links=expanded,
+                expansion_succeeded=expansion_succeeded,
+                observed_links=observed_links,
+                raw_observed_link_count=len(raw_links),
+                terminal_observed_link_count=len(observed_links),
+                target_checks=checks,
+            )
+        finally:
+            # Once external guards are installed, this context has blocked the
+            # target document's HTTP/WS behavior.  Destroy it rather than
+            # returning to IG with reconnecting sockets under those guards.
+            # All raw links for this candidate are checked before this point.
+            self._close_context()
 
 
 def _account_credentials(

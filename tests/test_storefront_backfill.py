@@ -132,6 +132,7 @@ class _ActiveGuardContext:
         self.page_handler = None
 
     def route(self, pattern, handler):
+        self.route_calls = getattr(self, "route_calls", 0) + 1
         self.request_pattern = pattern
         self.request_handler = handler
 
@@ -143,18 +144,22 @@ class _ActiveGuardContext:
         assert event == "page"
         self.page_handler = handler
 
+    def add_init_script(self, script):
+        self.init_scripts = getattr(self, "init_scripts", []) + [script]
+
     def unroute_all(self, **_kwargs):
         return None
 
     def close(self):
-        return None
+        self.closed = True
 
 
 def _activate_proxy_runtime(runtime, *, pages=()):
     context = _ActiveGuardContext(pages)
     runtime._ctx = context
-    runtime._install_context_network_guards(context)
     runtime._proxy_enforced = True
+    for page in pages:
+        page.guard_context = context
     return context
 
 
@@ -1070,39 +1075,31 @@ def test_safe_external_url_default_rejects_proxy_synthetic_dns():
     ],
 )
 def test_proxy_runtime_keeps_every_other_non_public_dns_range_closed(address):
-    class NoNavigationPage:
-        def __getattr__(self, name):
-            raise AssertionError(f"unsafe target must not use page.{name}")
-
     runtime = backfill._BrowserProbeRuntime(
         credentials={},
         proxy_loader=_proxy,
         headless=True,
         resolver=lambda _host: [address],
     )
-    _activate_proxy_runtime(runtime)
+    page = _NeutralOnlyPage()
+    _activate_proxy_runtime(runtime, pages=(page,))
 
-    result = runtime._target_check(
-        NoNavigationPage(), "https://creator.example/about"
-    )
+    result = runtime._target_check(page, "https://creator.example/about")
 
     assert result["status"] == "unsafe"
 
 
 def test_proxy_runtime_rejects_rfc2544_ip_literal_even_with_fake_dns_answer():
-    class NoNavigationPage:
-        def __getattr__(self, name):
-            raise AssertionError(f"unsafe target must not use page.{name}")
-
     runtime = backfill._BrowserProbeRuntime(
         credentials={},
         proxy_loader=_proxy,
         headless=True,
         resolver=lambda _host: ["198.18.0.9"],
     )
-    _activate_proxy_runtime(runtime)
+    page = _NeutralOnlyPage()
+    _activate_proxy_runtime(runtime, pages=(page,))
 
-    result = runtime._target_check(NoNavigationPage(), "https://198.18.0.9/shop")
+    result = runtime._target_check(page, "https://198.18.0.9/shop")
 
     assert result["status"] == "unsafe"
 
@@ -1118,57 +1115,50 @@ def test_proxy_runtime_rejects_rfc2544_ip_literal_even_with_fake_dns_answer():
     ],
 )
 def test_proxy_runtime_rejects_local_or_ambiguous_domain_names(url):
-    class NoNavigationPage:
-        def __getattr__(self, name):
-            raise AssertionError(f"unsafe target must not use page.{name}")
-
     runtime = backfill._BrowserProbeRuntime(
         credentials={},
         proxy_loader=_proxy,
         headless=True,
         resolver=lambda _host: ["198.18.0.9"],
     )
-    _activate_proxy_runtime(runtime)
+    page = _NeutralOnlyPage()
+    _activate_proxy_runtime(runtime, pages=(page,))
 
-    assert runtime._target_check(NoNavigationPage(), url)["status"] == "unsafe"
+    assert runtime._target_check(page, url)["status"] == "unsafe"
 
 
 def test_proxy_runtime_rejects_mixed_synthetic_and_private_dns_answers():
-    class NoNavigationPage:
-        def __getattr__(self, name):
-            raise AssertionError(f"unsafe target must not use page.{name}")
-
     runtime = backfill._BrowserProbeRuntime(
         credentials={},
         proxy_loader=_proxy,
         headless=True,
         resolver=lambda _host: ["198.18.0.9", "10.0.0.9"],
     )
-    _activate_proxy_runtime(runtime)
+    page = _NeutralOnlyPage()
+    _activate_proxy_runtime(runtime, pages=(page,))
 
-    assert runtime._target_check(
-        NoNavigationPage(), "https://creator.example/about"
-    )["status"] == "unsafe"
+    assert runtime._target_check(page, "https://creator.example/about")["status"] == (
+        "unsafe"
+    )
 
 
 def test_social_contact_target_is_successful_noncommerce_without_navigation():
-    class NoNavigationPage:
-        def __getattr__(self, name):
-            raise AssertionError(f"social target must not use page.{name}")
-
     runtime = backfill._BrowserProbeRuntime(
         credentials={},
         proxy_loader=_proxy,
         headless=True,
         resolver=lambda _host: ["8.8.8.8"],
     )
+    page = _NeutralOnlyPage()
+    _activate_proxy_runtime(runtime, pages=(page,))
     result = runtime._target_check(
-        NoNavigationPage(), "https://instagram.com/shop/not-a-storefront"
+        page, "https://instagram.com/shop/not-a-storefront"
     )
 
     assert result["status"] == "succeeded"
     assert result["commerce_links"] == []
     assert result["note"] == "recognized_noncommerce_social"
+    assert page.external_navigation_calls == 0
     resolved = backfill.resolve_observation(
         handle="alpha",
         profile={
@@ -1190,11 +1180,31 @@ class _FakeResponse:
         self.status = status
 
 
+class _NeutralOnlyPage:
+    def __init__(self):
+        self.url = "https://instagram.com/alpha/"
+        self.neutral_navigation_calls = 0
+        self.external_navigation_calls = 0
+
+    def goto(self, url, **_kwargs):
+        if url != "about:blank":
+            self.external_navigation_calls += 1
+            raise AssertionError(f"unexpected external navigation: {url}")
+        self.neutral_navigation_calls += 1
+        self.url = "about:blank"
+        return _FakeResponse(200)
+
+
 class _OrdinaryPage:
     def __init__(self, response, samples):
         self.url = "https://example.com/about"
         self._response = response
         self._samples = iter(samples)
+        self.neutral_navigation_calls = 0
+        self.script_guard_state = {
+            "websocket_blocked": 0,
+            "popup_blocked": 0,
+        }
 
     def route(self, *_args):
         return None
@@ -1202,13 +1212,20 @@ class _OrdinaryPage:
     def unroute(self, *_args):
         return None
 
-    def goto(self, *_args, **_kwargs):
+    def goto(self, url, **_kwargs):
+        if url == "about:blank":
+            self.neutral_navigation_calls += 1
+            self.url = "about:blank"
+            return _FakeResponse(200)
+        self.url = "https://example.com/about"
         return self._response
 
     def wait_for_timeout(self, _milliseconds):
         return None
 
     def evaluate(self, _script):
+        if "__sopStorefrontGuardState" in _script:
+            return dict(self.script_guard_state)
         return next(self._samples)
 
     def eval_on_selector_all(self, *_args):
@@ -1241,15 +1258,13 @@ class _ProxySyntheticDnsPage(_OrdinaryPage):
         super().__init__(response, samples)
         self.url = redirect_url
         self._redirect_url = redirect_url
-        self._guard = None
         self.navigation_route = _NavigationRoute()
 
-    def route(self, _pattern, guard):
-        self._guard = guard
-
-    def goto(self, *_args, **_kwargs):
-        assert self._guard is not None
-        self._guard(
+    def goto(self, url, **kwargs):
+        if url == "about:blank":
+            return super().goto(url, **kwargs)
+        self.url = self._redirect_url
+        self.guard_context.request_handler(
             self.navigation_route,
             _NavigationRequest(self._redirect_url),
         )
@@ -1263,15 +1278,13 @@ class _GuardedSubresourcePage(_OrdinaryPage):
     def __init__(self, response, samples, *, resource_url: str):
         super().__init__(response, samples)
         self._resource_url = resource_url
-        self._guard = None
         self.resource_route = _NavigationRoute()
 
-    def route(self, _pattern, guard):
-        self._guard = guard
-
-    def goto(self, *_args, **_kwargs):
-        assert self._guard is not None
-        self._guard(
+    def goto(self, url, **kwargs):
+        if url == "about:blank":
+            return super().goto(url, **kwargs)
+        self.url = "https://example.com/about"
+        self.guard_context.request_handler(
             self.resource_route,
             _NavigationRequest(self._resource_url, navigation=False),
         )
@@ -1319,13 +1332,15 @@ def _dom_sample(text: str, *, elements: int = 12) -> dict:
 def test_ordinary_target_needs_response_and_healthy_substantive_stable_dom(
     response, samples, reason
 ):
+    page = _OrdinaryPage(response, samples)
     runtime = backfill._BrowserProbeRuntime(
         credentials={},
         proxy_loader=_proxy,
         headless=True,
         resolver=lambda _host: ["8.8.8.8"],
     )
-    result = runtime._target_check(_OrdinaryPage(response, samples), "https://example.com/about")
+    _activate_proxy_runtime(runtime, pages=(page,))
+    result = runtime._target_check(page, "https://example.com/about")
 
     assert result["status"] == "failed"
     assert result["note"] == reason
@@ -1344,6 +1359,7 @@ def test_ordinary_target_with_real_response_and_stable_content_succeeds():
         headless=True,
         resolver=lambda _host: ["8.8.8.8"],
     )
+    _activate_proxy_runtime(runtime, pages=(page,))
 
     result = runtime._target_check(page, "https://example.com/about")
 
@@ -1375,7 +1391,7 @@ def test_proxy_runtime_allows_only_domain_fake_dns_across_navigation_final_and_h
     assert runtime._target_check(page, "https://creator.example/about")["status"] == (
         "unsafe"
     )
-    _activate_proxy_runtime(runtime)
+    _activate_proxy_runtime(runtime, pages=(page,))
     result = runtime._target_check(page, "https://creator.example/about")
 
     assert result["status"] == "succeeded"
@@ -1390,6 +1406,39 @@ def test_proxy_runtime_allows_only_domain_fake_dns_across_navigation_final_and_h
     assert runtime._target_check(page, "https://creator.example/about")["status"] == (
         "unsafe"
     )
+
+
+def test_external_guards_are_lazy_reused_and_revoke_fake_dns_on_close():
+    runtime = backfill._BrowserProbeRuntime(
+        credentials={},
+        proxy_loader=_proxy,
+        headless=True,
+        resolver=lambda _host: ["198.18.4.5"],
+    )
+    page = _NeutralOnlyPage()
+    context = _activate_proxy_runtime(runtime, pages=(page,))
+
+    assert runtime._context_guard_installed is False
+    assert context.websocket_handler is None
+    with pytest.raises(backfill.StorefrontBackfillError, match="non-public"):
+        runtime._safe_external_url("https://creator.example/about")
+
+    runtime._ensure_external_target_guards(page)
+
+    assert page.neutral_navigation_calls == 1
+    assert context.route_calls == 1
+    assert context.websocket_handler is not None
+    assert runtime._safe_external_url("https://creator.example/about") == (
+        "https://creator.example/about"
+    )
+
+    runtime._ensure_external_target_guards(page)
+    assert page.neutral_navigation_calls == 1
+    assert context.route_calls == 1
+
+    runtime._close_context()
+    with pytest.raises(backfill.StorefrontBackfillError, match="non-public"):
+        runtime._safe_external_url("https://creator.example/about")
 
 
 def test_proxy_runtime_still_aborts_private_navigation_redirect():
@@ -1414,7 +1463,7 @@ def test_proxy_runtime_still_aborts_private_navigation_redirect():
         headless=True,
         resolver=resolver,
     )
-    _activate_proxy_runtime(runtime)
+    _activate_proxy_runtime(runtime, pages=(page,))
 
     result = runtime._target_check(page, "https://creator.example/about")
 
@@ -1448,7 +1497,7 @@ def test_proxy_runtime_aborts_unsafe_xhr_iframe_or_websocket(resource_url):
         headless=True,
         resolver=lambda _host: ["198.18.2.3"],
     )
-    _activate_proxy_runtime(runtime)
+    _activate_proxy_runtime(runtime, pages=(page,))
 
     result = runtime._target_check(page, "https://creator.example/about")
 
@@ -1482,6 +1531,10 @@ def test_proxy_context_websocket_route_closes_before_connection(url):
         resolver=lambda _host: ["198.18.2.3"],
     )
     context = _activate_proxy_runtime(runtime)
+    neutral_page = _NeutralOnlyPage()
+    context.pages.append(neutral_page)
+    neutral_page.guard_context = context
+    runtime._ensure_external_target_guards(neutral_page)
     websocket = FakeWebSocketRoute(url)
 
     context.websocket_handler(websocket)
@@ -1509,6 +1562,10 @@ def test_context_guard_aborts_popup_first_private_navigation(url):
         resolver=lambda _host: ["198.18.2.3"],
     )
     context = _activate_proxy_runtime(runtime)
+    neutral_page = _NeutralOnlyPage()
+    context.pages.append(neutral_page)
+    neutral_page.guard_context = context
+    runtime._ensure_external_target_guards(neutral_page)
     runtime._active_blocked_requests = []
     route = _NavigationRoute()
 
@@ -1528,6 +1585,10 @@ def test_context_guard_allows_public_popup_first_navigation_through_proxy_fake_d
         resolver=lambda _host: ["198.18.2.3"],
     )
     context = _activate_proxy_runtime(runtime)
+    neutral_page = _NeutralOnlyPage()
+    context.pages.append(neutral_page)
+    neutral_page.guard_context = context
+    runtime._ensure_external_target_guards(neutral_page)
     runtime._active_blocked_requests = []
     route = _NavigationRoute()
 
@@ -1550,6 +1611,7 @@ def test_target_probe_closes_new_popup_before_clearing_active_guard():
     class Popup:
         def __init__(self):
             self.closed = False
+            self.closed_in_page_event = None
             self.context = None
 
         def close(self, **_kwargs):
@@ -1563,8 +1625,12 @@ def test_target_probe_closes_new_popup_before_clearing_active_guard():
             self.popup = Popup()
 
         def goto(self, *_args, **_kwargs):
+            if _args and _args[0] == "about:blank":
+                return super().goto(*_args, **_kwargs)
             self.popup.context = self.context
             self.context.pages.append(self.popup)
+            self.context.page_handler(self.popup)
+            self.popup.closed_in_page_event = self.popup.closed
             return self._response
 
     page = PopupOpeningPage(
@@ -1582,10 +1648,219 @@ def test_target_probe_closes_new_popup_before_clearing_active_guard():
     result = runtime._target_check(page, "https://creator.example/about")
 
     assert result["status"] == "failed"
+    assert page.popup.closed_in_page_event is False
     assert page.popup.closed is True
     assert context.pages == [page]
     assert runtime._active_blocked_requests is None
     assert runtime._context_guard_installed is True
+
+
+def test_websocket_reconnect_storm_is_bounded_and_does_not_starve_waits():
+    class FakeWebSocketRoute:
+        close_calls = 0
+
+        def close(self, **_kwargs):
+            type(self).close_calls += 1
+
+    class ReconnectStormPage(_OrdinaryPage):
+        def __init__(self, response, samples):
+            super().__init__(response, samples)
+            self.wait_calls = 0
+
+        def wait_for_timeout(self, _milliseconds):
+            self.wait_calls += 1
+            for _ in range(2000):
+                self.guard_context.websocket_handler(FakeWebSocketRoute())
+
+    text = (
+        "Welcome to the creator's official website. Read the biography, "
+        "recent projects, and contact information here."
+    )
+    page = ReconnectStormPage(
+        _FakeResponse(200), [_dom_sample(text), _dom_sample(text)]
+    )
+    runtime = backfill._BrowserProbeRuntime(
+        credentials={},
+        proxy_loader=_proxy,
+        headless=True,
+        resolver=lambda _host: ["198.18.2.3"],
+    )
+    _activate_proxy_runtime(runtime, pages=(page,))
+    runtime._active_blocked_requests = []
+
+    result = runtime._target_check(page, "https://creator.example/about")
+
+    assert result["status"] == "failed"
+    assert page.wait_calls == 2
+    assert FakeWebSocketRoute.close_calls == 4000
+    assert runtime._active_blocked_requests == ["external_websocket_blocked"]
+
+
+def test_probe_closes_context_and_next_candidate_reopens(monkeypatch):
+    import browser_collect_v2 as browser_collect
+
+    class LifecyclePage(_NeutralOnlyPage):
+        def close(self, **_kwargs):
+            self.closed = True
+
+    runtime = backfill._BrowserProbeRuntime(
+        credentials={},
+        proxy_loader=_proxy,
+        headless=True,
+        resolver=lambda _host: ["198.18.2.3"],
+    )
+    opened_contexts = []
+
+    def fake_open_account(_account, slot):
+        runtime._close_context()
+        page = LifecyclePage()
+        context = _ActiveGuardContext((page,))
+        page.guard_context = context
+        runtime._ctx = context
+        runtime._page = page
+        runtime._active_slot = slot
+        runtime._proxy_enforced = True
+        opened_contexts.append(context)
+
+    runtime._open_account = fake_open_account
+
+    def fetch_profile(page, handle):
+        page.url = f"https://instagram.com/{handle}/"
+        return {
+            "handle": handle,
+            "external_url": (
+                f"https://instagram.com/{handle}/contact"
+                if handle == "alpha"
+                else None
+            ),
+        }
+
+    monkeypatch.setattr(browser_collect, "fetch_profile_browser", fetch_profile)
+    monkeypatch.setattr(
+        backfill,
+        "_profile_identity",
+        lambda _page, _handle, _profile: (True, {"reason": "verified"}),
+    )
+    monkeypatch.setattr(
+        backfill,
+        "_profile_health",
+        lambda _page, _profile: (True, {"reason": "healthy"}),
+    )
+    monkeypatch.setattr(
+        backfill,
+        "_bio_more_declaration",
+        lambda _page, _profile, **_kwargs: (
+            False,
+            None,
+            {"signal_detected": False},
+        ),
+    )
+    account = type("Account", (), {"username": "shallow_one"})()
+
+    first = runtime.probe("alpha", account, lambda: None, slot=0)
+    second = runtime.probe("beta", account, lambda: None, slot=0)
+
+    assert first["status"] == "confirmed_no"
+    assert second["status"] == "confirmed_no"
+    assert len(opened_contexts) == 2
+    assert opened_contexts[0].route_calls == 1
+    assert not hasattr(opened_contexts[1], "route_calls")
+    assert all(context.closed is True for context in opened_contexts)
+    assert runtime._ctx is None
+
+
+def test_real_playwright_external_init_guard_prevents_reconnect_starvation(tmp_path):
+    import time
+
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        context = playwright.chromium.launch_persistent_context(
+            str(tmp_path / "real-playwright-profile"),
+            channel="chrome",
+            headless=True,
+        )
+        page = context.pages[0] if context.pages else context.new_page()
+        runtime = backfill._BrowserProbeRuntime(
+            credentials={},
+            proxy_loader=_proxy,
+            headless=True,
+            resolver=lambda _host: ["198.18.2.3"],
+        )
+        runtime._ctx = context
+        runtime._page = page
+        runtime._proxy_enforced = True
+        runtime._active_blocked_requests = []
+        try:
+            page.goto("data:text/html,<title>IG profile phase</title>")
+            page.evaluate(
+                """() => {
+                  try {
+                    const socket = new WebSocket('ws://127.0.0.1:9/profile');
+                    socket.onerror = () => {};
+                  } catch (_) {}
+                }"""
+            )
+            started = time.monotonic()
+            page.wait_for_timeout(100)
+            assert time.monotonic() - started < 3
+            assert runtime._context_guard_installed is False
+            assert runtime._active_blocked_requests == []
+
+            runtime._ensure_external_target_guards(page)
+            page.goto("data:text/html,<title>external target phase</title>")
+            started = time.monotonic()
+            observed = page.evaluate(
+                """() => {
+                  let securityErrors = 0;
+                  for (let i = 0; i < 2000; i += 1) {
+                    try { new WebSocket('ws://127.0.0.1:9/reconnect'); }
+                    catch (error) {
+                      if (error && error.name === 'SecurityError') securityErrors += 1;
+                    }
+                  }
+                  const popup = window.open('http://127.0.0.1/private');
+                  const wsDescriptor = Object.getOwnPropertyDescriptor(
+                    globalThis, 'WebSocket'
+                  );
+                  const openDescriptor = Object.getOwnPropertyDescriptor(
+                    globalThis, 'open'
+                  );
+                  return {
+                    securityErrors,
+                    popupWasNull: popup === null,
+                    wsConfigurable: wsDescriptor.configurable,
+                    wsWritable: wsDescriptor.writable,
+                    openConfigurable: openDescriptor.configurable,
+                    openWritable: openDescriptor.writable,
+                    state: globalThis.__sopStorefrontGuardState
+                  };
+                }"""
+            )
+            page.wait_for_timeout(50)
+            assert time.monotonic() - started < 3
+            assert observed == {
+                "securityErrors": 2000,
+                "popupWasNull": True,
+                "wsConfigurable": False,
+                "wsWritable": False,
+                "openConfigurable": False,
+                "openWritable": False,
+                "state": {"websocket_blocked": 2000, "popup_blocked": 1},
+            }
+            # No constructor reached Playwright's native WS route; the marker
+            # is converted into bounded audit evidence explicitly.
+            assert runtime._active_blocked_requests == []
+            runtime._record_external_script_blocks(page)
+            assert runtime._active_blocked_requests == [
+                "external_script_websocket_blocked",
+                "external_script_popup_blocked",
+            ]
+        finally:
+            runtime._close_context()
+
+    assert runtime._proxy_enforced is False
+    assert runtime._context_guard_installed is False
 
 
 def test_proxy_synthetic_dns_lifetime_binds_to_successful_context_launch(tmp_path):
@@ -1613,6 +1888,9 @@ def test_proxy_synthetic_dns_lifetime_binds_to_successful_context_launch(tmp_pat
         def on(self, event, handler):
             assert event == "page"
             self.page_handler = handler
+
+        def add_init_script(self, script):
+            self.init_script = script
 
         def add_cookies(self, cookies):
             self.cookies = cookies
@@ -1656,10 +1934,20 @@ def test_proxy_synthetic_dns_lifetime_binds_to_successful_context_launch(tmp_pat
 
     assert runtime._proxy_enforced is True
     assert chromium.options["proxy"] == _proxy(session="ignored", ttl=1)
+    assert runtime._context_guard_installed is False
+    with pytest.raises(backfill.StorefrontBackfillError, match="non-public"):
+        runtime._safe_external_url("https://creator.example/about")
+    chromium.context.pages[0].goto = lambda *_args, **_kwargs: _FakeResponse(200)
+    runtime._ensure_external_target_guards(chromium.context.pages[0])
     assert chromium.context.websocket_pattern == "**/*"
+    assert runtime._safe_external_url("https://creator.example/about") == (
+        "https://creator.example/about"
+    )
 
     runtime._close_context()
     assert runtime._proxy_enforced is False
+    with pytest.raises(backfill.StorefrontBackfillError, match="non-public"):
+        runtime._safe_external_url("https://creator.example/about")
 
     failing_runtime = backfill._BrowserProbeRuntime(
         credentials=credentials,
@@ -1692,7 +1980,7 @@ def test_proxy_runtime_allows_only_non_network_subresource_schemes(resource_url)
         headless=True,
         resolver=lambda _host: ["198.18.2.3"],
     )
-    _activate_proxy_runtime(runtime)
+    _activate_proxy_runtime(runtime, pages=(page,))
 
     result = runtime._target_check(page, "https://creator.example/about")
 
