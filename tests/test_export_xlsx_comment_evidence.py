@@ -189,3 +189,25 @@ def test_handle_with_at_prefix_still_links_to_structured_evidence():
     )
 
     assert workbook["待复核"]["G2"].hyperlink.target == "#评论证据!A4"
+
+
+def test_long_identity_and_timestamp_cells_wrap_in_candidate_sheets():
+    workbook = export_v2_xlsx.build_workbook(
+        _delivery(
+            _candidate(
+                handle="fixture.creator.with.a.long.handle",
+                full_name="Fixture Creator With A Deliberately Long Display Name",
+                captured_at="2026-08-11T16:19:21+0800",
+            )
+        )
+    )
+
+    review = workbook["待复核"]
+    assert review["B2"].alignment.wrap_text is True
+    assert review["C2"].alignment.wrap_text is True
+    assert review["V2"].alignment.wrap_text is True
+    assert review.column_dimensions["B"].width == 28
+    assert review.column_dimensions["C"].width == 32
+    assert review.row_dimensions[2].height == 46
+    assert review["J1"].alignment.wrap_text is True
+    assert review.row_dimensions[1].height == 46

@@ -41,8 +41,8 @@ POOL_FONT = {"Include-With-Storefront": "1E7A47", "Include-Without-Storefront": 
 # 列定义：(标题, key, 宽, 是否wrap)
 COLS = [
     ("验收建议", "verdict", 12, False),
-    ("Handle", "handle_at", 20, False),
-    ("全名", "full_name", 22, False),
+    ("Handle", "handle_at", 28, True),
+    ("全名", "full_name", 32, True),
     ("粉丝", "follower_count", 9, False),
     ("赛道", "niche", 11, False),
     ("购买意向评论（中文 / 原文）", "intent_snippet", 40, True),
@@ -61,7 +61,7 @@ COLS = [
     ("结论", "summary", 30, True),
     ("待补/原因", "reasons", 34, True),
     ("主页", "profile", 8, False),
-    ("采集时间", "captured_at", 14, False),
+    ("采集时间", "captured_at", 14, True),
     ("Herman Approval", "_blank", 15, False),
     ("Herman's Feedback", "_blank", 15, False),
 ]
@@ -379,7 +379,7 @@ def build_workbook(decisions):
     thin = Side(style="thin", color="E0E4E2")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
     wrap = Alignment(wrap_text=True, vertical="top")
-    center = Alignment(horizontal="center", vertical="center")
+    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
     wb = Workbook()
 
@@ -543,7 +543,7 @@ def build_workbook(decisions):
             cell.alignment = center
             cell.border = border
             ws.column_dimensions[get_column_letter(j)].width = w
-        ws.row_dimensions[1].height = 30
+        ws.row_dimensions[1].height = 46
         for r, c in enumerate(by_pool.get(pool, []), 2):
             ws.row_dimensions[r].height = 46
             for j, (_, key, _w, do_wrap) in enumerate(COLS, 1):
