@@ -50,6 +50,13 @@ samples/*
 archive/
 docs/archive/
 docs/design-refs/
+# 竞赛内部审计、正式交付截图和发布素材（含真实客户交付证据）
+docs/competition/
+
+# 前端展示代码纳入主仓库；真实达人数据由 web/.gitignore 单独隔离
+
+# 历史批次一次性导出脚本（硬编码真实 batch，仅本地归档）
+scripts/dev/export_option_c.py
 
 # ── 账号凭证：仅本地，不入库（安全） ──
 #   凭证留在本机 .secrets/，运行时读取；克隆后用 scripts/import_pool.py 重新导入
